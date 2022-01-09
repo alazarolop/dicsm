@@ -1,0 +1,37 @@
+---
+title: "csm"
+author: "Alberto Lázaro-López"
+date: "11th March 2019"
+output: html_document
+---
+
+```{r include=FALSE}
+for (.i in paste0("src/", c("dbms", "core"), ".R" ) ) source(.i)
+
+knitr::opts_chunk$set(eval = FALSE)
+knitr::opts_chunk$set(connection = "con")
+```
+
+This schema connects with a database of a conventional soil mapping project and show relations holding soil map and taxonomic units.
+
+# Schema creation 
+
+```{sql, connection=con_odbc}
+BEGIN ; 
+
+CREATE SCHEMA IF NOT EXISTS csm ;
+COMMENT ON SCHEMA csm IS 'Conventional Soil Map' ;
+
+COMMIT ;
+```
+
+```{r}
+sql <- rstudioapi::getActiveDocumentContext()$path %>% 
+  path_dir() %>% 
+  dir_ls(recurse = TRUE, type = "file", regexp = ".sql")
+
+for (i in sql) {
+  glue("psql -d dicsm -U {keyring::key_list('psql-su')[1,2]} -f {i}") %>% 
+    system()
+}
+```

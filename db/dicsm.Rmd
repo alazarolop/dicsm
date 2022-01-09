@@ -1,0 +1,78 @@
+---
+title: "dicsm"
+author: "Alberto Lázaro-López"
+date: "11th March 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+knitr::opts_chunk$set(connection = "con")
+```
+
+# Creation of the database
+
+```{bash, eval=FALSE}
+createdb -T template1 -O _USER_ dicsm
+```
+
+
+# Testing the conection
+
+```{r}
+con <- DBI::dbConnect(odbc::odbc(), driver = "PostgreSQL Driver", 
+                      database = "dicsm", UID = keyring::key_list("psql-su")[1,2], PWD = keyring::key_get("psql-su"), host = "localhost", 
+                      port = 5432, bigint = "numeric")
+```
+
+
+# Comments
+
+```{sql}
+COMMENT ON DATABASE dicsm IS 'DiCSM. Disaggregation of Conventional Soil Maps methodology'
+```
+
+
+# Extensions
+
+```{sql}
+-- PostGIS version <3, as rasters are still included.
+BEGIN ;
+CREATE EXTENSION postgis	;
+CREATE EXTENSION postgis_sfcgal	;
+CREATE EXTENSION ogr_fdw	;
+COMMIT ;
+```
+
+
+# Schema path
+
+```{sql connection=con}
+ALTER DATABASE dicsm
+	SET search_path
+	TO public, csm, sources, covars, division, disagg;
+```
+
+
+# [Foreign connection][^fdw]
+
+[^fdw]: https://www.percona.com/blog/2018/08/21/foreign-data-wrappers-postgresql-postgres_fdw/
+
+```{sql}
+CREATE EXTENSION postgres_fdw ;
+```
+
+```{sql}
+CREATE SERVER tezisdb
+  FOREIGN DATA WRAPPER postgres_fdw
+  OPTIONS (dbname 'tezisdb', host 'localhost', port '5432');
+```
+
+```{r}
+glue::glue_sql(.con = con,
+               'CREATE USER MAPPING
+                FOR {keyring::key_list("psql-su")[1,2]}
+                SERVER tezisdb 
+                OPTIONS (user {keyring::key_list("psql-su")[1,2]}, password {keyring::key_get("psql-su")})') %>% 
+  DBI::dbExecute(conn = con)
+```

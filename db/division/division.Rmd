@@ -1,0 +1,33 @@
+---
+title: "division"
+author: "Alberto Lázaro-López"
+date: "1st August 2019"
+output: html_document
+---
+
+```{r include=FALSE}
+for (.i in paste0("src/", c("dbms", "core"), ".R" ) ) source(.i)
+```
+
+
+# Schema creation 
+
+```{sql, connection=con}
+BEGIN ;
+
+CREATE SCHEMA IF NOT EXISTS division ;
+COMMENT ON SCHEMA division IS 'Division' ;
+
+COMMIT ;
+```
+
+```{r}
+sql <- rstudioapi::getActiveDocumentContext()$path %>% 
+  path_dir() %>% 
+  dir_ls(recurse = TRUE, type = "file", regexp = ".sql")
+
+for (i in sql) {
+  glue("psql -d dicsm -U {keyring::key_list('psql-su')[1,2]} -f {i}") %>% 
+    system()
+}
+```

@@ -1,0 +1,34 @@
+---
+title: "Covars"
+author: "Alberto Lázaro-López"
+date: "15th February 2021"
+output: html_document
+---
+
+```{r include=FALSE}
+for (.i in paste0("src/", c("dbms", "core"), ".R" ) ) source(.i)
+```
+The schema collects all data sources for the project, which includes DEM and RS images.
+
+# Schema creation 
+
+```{sql, connection=con_odbc}
+BEGIN; 
+
+CREATE SCHEMA IF NOT EXISTS covars ;
+COMMENT ON SCHEMA covars IS 'Covariates' ;
+
+COMMIT ;
+```
+
+```{r}
+sql <- rstudioapi::getActiveDocumentContext()$path %>% 
+  path_dir() %>% 
+  dir_ls(recurse = TRUE, type = "file", regexp = ".sql")
+
+for (i in sql) {
+  glue("psql -d dicsm -U {keyring::key_list('psql-su')[1,2]} -f {i}") %>% 
+    system()
+}
+```
+
