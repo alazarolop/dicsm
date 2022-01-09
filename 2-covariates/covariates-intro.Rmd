@@ -1,0 +1,46 @@
+---
+title: "Disaggregation of polytaxic SMU: Analysis after divison for optimal Minimum Delineation Area and scale"
+author: "Alberto Lázaro-López"
+date: "10/14/2020"
+output:
+  html_document:
+    toc: yes
+    toc_depth: '3'
+    df_print: paged
+    number_sections: yes
+abstract: 
+bibliography: ../ref/dicsm.bib
+---
+
+```{r core, include=FALSE }
+for (.i in paste0("src/", c("dbms", "core"), ".R" ) ) source(.i)
+
+proj <- .proj_key("covar") 
+proj <- dir_ls(regexp = proj$key) %>% 
+  .proj_subdir() %>% 
+  append(proj, .)
+```
+
+
+# Introducción
+
+Las covariables son mediciones derivadas a partir de datos de la superficie de La Tierra que representan parámetros ambientales que abarcan un amplio rango, desde variables morfométricas del relieve hasta índices bioclimáticos.
+El cálculo de las covariables específicas de este estudio se hace desde las fuentes de datos procesadas generadas durante la fase de *"sources"*: el MDT y la imagen de teledetección.
+
+
+
+# Creación de la estructura de trabajo
+
+Los diferentes resultados de esta última etapa se alojarán en un schema propio en la base de datos.
+
+```{r}
+# Create the schema
+sql <- path_wd("db") %>% 
+  dir_ls(type = "directory", regexp = proj$key) %>% 
+  dir_walk(type = "file", fun = function(f) {pg_exec(db = "dicsm", sql = f)})
+
+# Create de rest of elements
+sql %>% 
+  dir_ls(type = "directory", recurse = TRUE) %>% 
+  dir_walk(type = "file", fun = function(f) {pg_exec(db = "dicsm", sql = f)})
+```

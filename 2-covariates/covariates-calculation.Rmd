@@ -1,0 +1,2394 @@
+---
+title: "Covariates calculation for DiCSM"
+author: "Alberto Lázaro-López"
+date: "13th May 2019"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+abstract: Covariates are derivated measures from data sources and represent a wide range of environmental variables, from land surface to bioclimatic indexes. This document develops a methodology for calculating a group of selected covariates.
+bibliography: ../ref/dicsm.bib
+---
+
+```{r core, include=FALSE }
+for (.i in paste0("src/", c("spatial", "dbms", "core", "raster"), ".R" ) ) source(.i)
+
+proj <- dir_ls(regexp = "covar") %>% 
+  .proj_subdir()
+```
+
+
+# Introducción
+
+Las covariables son mediciones derivadas a partir de datos de la superficie de La Tierra que representan parámetros ambientales que abarcan un amplio rango, desde variables morfométricas del relieve hasta índices bioclimáticos.
+El cálculo de las covariables específicas de este estudio se hace desde las fuentes de datos procesadas generadas durante la fase de *"sources"*: el MDT y la imagen de teledetección.
+
+
+# Paquetes de cálculo
+
+Con los primeros desarrollos de herramientas SIG para el almacenamiento y la gestión de datos espaciales en formato digital surgieron diversas iniciativas buscando su aprovechamiento en la modelización cuantitativa de la superficie terrestre [@Wilson2000TerrainAnalysisPrinciples; @Wilson2018EnviromentalApplicationsDigital].
+Desde entonces se han ido elaborando métodos y fórmulas que utilizan datos en malla para dar lugar a índices en forma de variables contínuas por el terreno [@Hengl2009GeomorphometryConceptsSoftware; @Florinsky2012DigitalTerrainAnalysis; @Florinsky2017IllustratedIntroductionGeneral]. 
+Si bien en un principio los desarrollos estuvieron enfocados a la superficie y relieve de La Tierra o morfometría, posteriormente se fueron incorporando aspectos de hidrología, índices topo-climáticos, bioclimáticos, etc, y que en la actualidad incluyen también derivados desde imágenes de teledetección.
+
+Su aplicación sobre los datos se realiza a través de implementaciones programadas ya sea en forma aplicaciones individuales o módulos disponibles a través de paquetes de software GIS. 
+Estos tipos de paquetes aportan una gran versatilidad, pues agrupan bajo una mismo interfaz múltiples funciones o geoprocesos, y facilitan su acceso.
+Dentro del conjunto de software GIS es posible encontrar aquellos específicos de un área concreta u otros cuyo ámbito es más amplio. 
+En esta categoría podría situarse a los paquetes SAGA [@Conrad2015SystemAutomatedGeoscientific], GRASS [@GRASSDevelopmentTeam2019GRASSGeographicResources], QGIS [@QGISDevelopmentTeam2019QGISGeographicInformation] u Orfeo Toolbox.
+Cabe destacar que orientados estas aplicaciones GIS independientes han sido desarrollados paquetes de R a modo de enlace que permiten ejecutar sus procesos desde su interfaz.
+Además, también para R se han desarrollados paquetes para datos espaciales específicos, como [RSToolBox][rstb] y complementarios que amplian en gran medida las herramientas y los flujos de trabajo a disposición de los usuarios.
+
+[rstb]: <http://bleutner.github.io/RStoolbox/rstbx-docu/RStoolbox.html>
+
+De entre todos ellos se ha escogido a SAGA porque las covariables que se necesitaban están disponibles en su catálogo de módulos y su sistema de acceso a estos es muy cómodo, permitiendo agilizar el proceso de cálculo.
+
+
+# Datos fuente
+
+```{sql, connection=con, output.var="sources" }
+SELECT DISTINCT ON (tb) tb, src_id, band_id, ST_BandPath(rast) as file
+	FROM (SELECT srcb.tableoid::regclass::character varying::text as tb, rast
+			  FROM _src_rast AS srcb ) AS sources
+	JOIN src_band ON tb = src_tb(src_id, band_id)
+```
+
+
+# Geomorfometría
+
+## Morfometría local (*Local land surface variables*)
+
+### Morphometric Features <*wood*>
+
+> Uses a multi-scale approach by fitting quadratic parameters to any size window (via least squares) to derive slope, aspect and curvatures (optional output) for subsequent classification of morphometric features (peaks, ridges, passes, channels, pits and planes). This is the method as proposed and implemented by Jo Wood (1996) in LandSerf and GRASS GIS (r.param.scale).
+>
+> -- [_SAGA-GIS: Tool Morphometric Features_](http://www.saga-gis.org/saga_tool_doc/7.4.0/ta_morphometry_23.html)
+  
+
+> The module calculates the following parameters. Terminology is from @Wood1996GeomorphologicalCharacterisationDigital with related terminology used in other GRASS modules listed in brackets):  
+> · elev: Generalised elevation value (for resampling purposes at different scale)  
+  · slope: Magnitude of maximum gradient (steepest slope angle)  
+  · aspect: Direction of maximum gradient (steepest slope direction=flow direction)  
+  · profc: profile curvature (curvature intersecting with the plane defined by Z axis and maximum gradient direction). Positive values describe convex profile curvature, negative values concave profile curvature.  
+  · planc: plan curvature (horizontal curvature, intersecting with the XY plane)  
+  · longc: longitudinal curvature (profile curvature intersecting with the plane defined by the surface normal and maximum gradient direction)  
+  · crosc: cross-sectional curvature (tangential curvature intersecting with the plane defined by the surface normal and a tangent to the contour - perpendicular to maximum gradient direction)  
+  · maxic: maximum curvature (can be in any direction)  
+  · minic: minimum curvature (in direction perpendicular to the direction of of maximum curvature)  
+  · feature: Morphometric features: peaks, ridges, passes, channels, pits and planes  
+>
+> -- [_GRASS GIS: r.param.scale_](https://grass.osgeo.org/grass76/manuals/r.param.scale.html)
+
+
+```{r}
+# Summary of covariates to be created
+covariates <- tribble(
+  ~covar, ~descr,
+  "FEATURES", "Morphometric Features", 
+  "ELEVATION", "Generalized Surface", 
+  "SLOPE", "Slope", 
+  "ASPECT", "Aspect", 
+  "PROFC", "Profile Curvature", 
+  "PLANC", "Plan Curvature", 
+  "LONGC", "Longitudinal Curvature",
+  "CROSC", "Cross-Sectional Curvature", 
+  "MAXIC", "Maximum Curvature", 
+  "MINIC", "Minimum Curvature"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "wood", tolower(covar) ) )
+
+## Append covariates tibble to a list of SAGA tools used
+covariates <- list("wood" = covariates)
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$wood$file[1]))
+```
+
+En base al análisis de la versión preliminar de desagregación de SMU, se decide establecer un límite de tolerancia de la pendiente de 2º.
+
+```{r}
+# ---- Run-time: 2 min
+if ( all(file_exists(path_wd(covariates$wood$file, ext = "sgrd"))) == FALSE ) { # If no all the files exist (any is missing)
+  rsaga.geoprocessor(lib = "ta_morphometry", module = 23, # Morphometric Features
+                     param = list(DEM = filter(sources, src_id == "dem")$file ,
+                                  # Outputs
+                                  FEATURES = path_wd(filter(covariates$wood, covar == "FEATURES")$file, ext = "sdat"), 
+                                  ELEVATION = path_wd(filter(covariates$wood, covar == "ELEVATION")$file, ext = "sdat"),  
+                                  SLOPE = path_wd(filter(covariates$wood, covar == "SLOPE")$file, ext = "sdat"),  # Deg
+                                  ASPECT = path_wd(filter(covariates$wood, covar == "ASPECT")$file, ext = "sdat"), # Deg
+                                  PROFC = path_wd(filter(covariates$wood, covar == "PROFC")$file, ext = "sdat"),   
+                                  PLANC = path_wd(filter(covariates$wood, covar == "PLANC")$file, ext = "sdat"),  
+                                  LONGC = path_wd(filter(covariates$wood, covar == "LONGC")$file, ext = "sdat"),  
+                                  CROSC = path_wd(filter(covariates$wood, covar == "CROSC")$file, ext = "sdat"), 
+                                  MAXIC = path_wd(filter(covariates$wood, covar == "MAXIC")$file, ext = "sdat"), 
+                                  MINIC = path_wd(filter(covariates$wood, covar == "MINIC")$file, ext = "sdat"),  
+                                  # Options
+                                  SIZE = 5, # Cell size of processing window. Default
+                                  TOL_SLOPE = 2.0), # VDGM 2018, pers. comm.
+                     env = env)
+  }
+# Morphology features relation
+# 1 - Planar
+# 2 - Pit
+# 3 - Channel
+# 4 - Pass (saddle)
+# 5 - Ridge
+# 6 - Peak
+```
+
+Las covariables optenidas se inspeccionan visualmente en QGIS y se analiza la estructura de cada una atendiendo a su descripción [@Blaga2012AspectsRegardingSignifiance; @Florinsky2017IllustratedIntroductionGeneral]. 
+
+**PROFC** y **PLANC** son equiparables a **LONGC** Y **CROSC**, donde los primeros utilizan los ejes canónicos mientras los segundos se referencian en un plano normal a la máxima pendiente; de hecho, visualmente no se aprecian diferencian entre **PROFC** Y **LONGC**.
+Mientras, la distribución de los valores de **PLANC** en su histograma muestra una campana muy estrecha sobre el valor de la media, y requiere reajustar la escala para obtener una visualización adecuada.
+Aparentemente **CROSC** diferencia áreas de mayores dimensiones que **PLANC** y guardan entre sí menos relación que el par **PROFC** y **LONGC**.
+
+Los valores negativos de **MINIC** y **MAXIC** señalan las zonas convexas, mientras que los valores positivos muestran zonas concavas [@Florinsky2017IllustratedIntroductionGeneral]. 
+La diferencia entre ambas es que **MINIC** define muy bien los canales de flujos de agua, mientras que **MAXIC** hace lo propio con las crestas y los cambios de vertientes [ver @Florinsky2017IllustratedIntroductionGeneral, pp. 736].
+Por este motivo, **MAXIC** presenta un patrón visual cercano a **CROSC**.
+Sería interesante estudiar su correlación. 
+
+Por último, **ELEVATION** porque es el MDT con suavizado (*smooth*), así como de **FEATURES**, que delimita áreas discretas sin uso potencial.
+
+```{r}
+# Deleting unusefull covariables 
+covariates$wood$file[1] %>%
+  path_dir() %>%
+  dir_ls(regexp = tolower("(ELEVATION|FEATURES)")) %>%
+  file_delete()
+
+# Filtering deleted files
+covariates[["wood"]] <- covariates$wood %>%
+  filter( file_exists(path_wd(.$file, ext = "sgrd")) )
+```
+
+
+Resumen:
+
+* Sería adecuado observar especialmente las correlaciones marcadas de los pares **PROFC** Y **LONG**; **PLANC** y **CROSC**; **MINIC** y **MAXIC**; y **CROSC** y **MAXIC**. 
+* En qué medida sería interesante utilizar una variable del grupo de planos canónicos y otra de planos normales a la máxima pendiente.
+* Potencialmente entiendo que **MINIC** sería la más interesante del par para señalar aquellas zonas de acumulación de materiales. 
+Su selección exclusiva frente a **MAXIC** depende de la correlación.
+* Se descartan **ELEVATION** y **FEATURES**.
+
+
+
+### Northerness and easterness <*aspect*>
+
+Transformación de la orientación de la pendiente (en inglés _aspect_) de una variable polar a dos variables lineales según los ejes norte-sur y este-oeste [@Hengl2009GeomorphometryConceptsSoftware]. 
+Considerando que el **ASPECT** parte desde los 0º N marcando 90º al E, la conversión se consigue mediante el seno para el eje este-oeste y el coseno para el eje norte-sur [@Subburayalu2013SoilSeriesMapping].
+Aunque el módulo [r.northerness.easterness][aspect] del paquete GRASS GIS está disponible, se decide implementarlo en SAGA mediante la herramienta [Grid Calculator][grid] por la sencillez de los cálculos y evitar el extra procesamiento al cambiar de ambiente.
+
+[aspect]: <http://wgbis.ces.iisc.ernet.in/grass/grass70/manuals/addons/r.northerness.easterness.html>
+
+[grid]: <http://www.saga-gis.org/saga_tool_doc/7.4.0/grid_calculus_1.html>
+
+Se usa como covariables base **ASPECT** y **SLOPE** obtenidos en <_wood_> en las fórmulas de las covariables:
+
+$$northerness = \cos(aspect)$$
+
+$$easterness = \sin(aspect)$$
+
+$$northslope = \cos(aspect) · slope$$
+
+$$interaction = \cos(aspect) · \sin(aspect)$$
+
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["aspect"]] <- tribble(
+  ~covar, ~descr,
+  "northerness", "Northerness", 
+  "easterness", "Easterness",
+  "northslope", "Interaction between northerness and slope",
+  "eastslope", "Interaction between easterness and slope",
+  "interaction", "Interaction between northerness and easterness"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "aspect", tolower(covar) ) )
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$aspect$file[1]))
+```
+
+```{r}
+# ---- Run-time: 15 s
+# Northerness
+saga <- if ( file_exists(path_wd(filter(covariates$aspect, covar == "northerness")$file, ext = "sgrd")) == FALSE ) {
+  rsaga.geoprocessor(lib = "grid_calculus", module = 1, # Grid Calculator
+                     param = list(GRIDS = path_wd(filter(covariates$wood, covar == "ASPECT")$file, ext = "sdat"), # ASPECT
+                                  # Outputs
+                                  RESULT = path_wd(filter(covariates$aspect, covar == "northerness")$file, ext = "sdat"),
+                                  # Options
+                                  RESAMPLING = 4, #  B-Spline Interpolation, default
+                                  FORMULA = "cos(g1)" # Northerness
+                     ),
+                     env = env)
+  }
+```
+
+```{r}
+# ---- Run-time: 15 s
+# Easterness
+saga <- if ( file_exists(path_wd(filter(covariates$aspect, covar == "easterness")$file, ext = "sgrd")) == FALSE ) {
+  rsaga.geoprocessor(lib = "grid_calculus", module = 1, # Grid Calculator
+                     param = list(GRIDS = path_wd(filter(covariates$wood, covar == "ASPECT")$file, ext = "sdat"), # ASPECT
+                                  # Outputs
+                                  RESULT = path_wd(filter(covariates$aspect, covar == "easterness")$file, ext = "sdat"),
+                                  # Options
+                                  RESAMPLING = 4, #  B-Spline Interpolation, default
+                                  FORMULA = "sin(g1)" # Easterness
+                     ),
+                     env = env)
+  }
+```
+
+```{r}
+# ---- Run-time: 15 s
+# Interaction between northerness and slope
+bands <- covariates$wood %>%
+  filter(covar %in% c("ASPECT", "SLOPE") ) %>% 
+  arrange(covar) %>%
+  select(file) %>%
+  flatten_chr() %>%
+  path_wd(ext = "sdat") %>%
+  paste0(collapse = ";")
+
+saga <- if ( file_exists(path_wd(filter(covariates$aspect, covar == "northslope")$file, ext = "sgrd")) == FALSE ) {
+  rsaga.geoprocessor(lib = "grid_calculus", module = 1, # Grid Calculator
+                     param = list(GRIDS = bands, # 1. ASPECT, 2. SLOPE
+                                  # Outputs
+                                  RESULT = path_wd(filter(covariates$aspect, covar == "northslope")$file, ext = "sdat"),
+                                  # Options
+                                  RESAMPLING = 4, #  B-Spline Interpolation, default
+                                  FORMULA = "cos(g1) * g2" # Interaction between northerness and slope
+                     ),
+                     env = env)
+  }
+```
+
+```{r}
+# ---- Run-time: 15 s
+# Interaction between easterness and slope
+saga <- if ( file_exists(path_wd(filter(covariates$aspect, covar == "eastslope")$file, ext = "sgrd")) == FALSE ) {
+  rsaga.geoprocessor(lib = "grid_calculus", module = 1, # Grid Calculator
+                     param = list(GRIDS = bands, # 1. ASPECT, 2. SLOPE
+                                  # Outputs
+                                  RESULT = path_wd(filter(covariates$aspect, covar == "eastslope")$file, ext = "sdat"),
+                                  # Options
+                                  RESAMPLING = 4, #  B-Spline Interpolation, default
+                                  FORMULA = "sin(g1) * g2" # Interaction between northerness and slope
+                     ),
+                     env = env)
+  }
+```
+
+```{r}
+# ---- Run-time: 15 s
+# Interaction between northerness and easterness
+saga <- if ( file_exists(path_wd(filter(covariates$aspect, covar == "interaction")$file, ext = "sgrd")) == FALSE ) {
+  rsaga.geoprocessor(lib = "grid_calculus", module = 1, # Grid Calculator
+                     param = list(GRIDS = path_wd(filter(covariates$wood, covar == "ASPECT")$file, ext = "sdat"), # ASPECT
+                                  # Outputs
+                                  RESULT = path_wd(filter(covariates$aspect, covar == "interaction")$file, ext = "sdat"),
+                                  # Options
+                                  RESAMPLING = 4, #  B-Spline Interpolation, default
+                                  FORMULA = "cos(g1) * sin(g1)" # Interaction between northerness and easterness
+                     ),
+                     env = env)
+  }
+```
+
+
+Tanto **northerness** como **easterness** presentan una alta variabilidad, que se ve maximizada en su interacción, **interaction**.
+Por contra, la interación del norte con la pendiente **northslope** presenta patrones más suaves que resalta las zonas donde la pendiente y la orientación tienen más influencia y la consigue reducir.
+Podría deducirse que el ruido observado proviene de pequeñas variaciones en el terreno de pendientes mínimas que se filtran en la interacción.
+
+```{r}
+# Deleting unusefull covariables 
+covariates$aspect$file[1] %>%
+  path_dir() %>%
+  dir_ls(regexp = tolower("interaction")) %>%
+  file_delete()
+
+# Filtering deleted files
+covariates[["aspect"]] <- covariates$aspect %>%
+  filter( file_exists(path_wd(.$file, ext = "sgrd")) )
+```
+
+Resumen:
+
+* Las interacciones **northslope** y **eastslope** presentan patrones suaves y resaltan las zonas donde la pendiente y la orientación tienen más influencia, por lo que parecen más relevantes.
+
+
+
+### Slope, Aspect, Curvature  <*slope*>
+
+> Calculates the local morphometric terrain parameters slope, aspect and if supported by the chosen method also the curvature.
+>
+> -- [_SAGA-GIS: Tool Slope, Aspect, Curvature_](http://www.saga-gis.org/saga_tool_doc/7.4.0/ta_morphometry_0.html)
+
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["slope"]] <- tribble(
+  ~covar, ~descr,
+  "SLOPE", "Slope", 
+  "ASPECT", "Aspect",
+  "C_GENE", "General Curvature",
+  "C_PROF", "Profile Curvature", 
+  "C_PLAN", "Plan Curvature", 
+  "C_TANG", "Tangential Curvature", 
+  "C_LONG", "Longitudinal Curvature", 
+  "C_CROS", "Cross-Sectional Curvature", 
+  "C_MINI", "Minimal Curvature", 
+  "C_MAXI", "Maximal Curvature",
+  "C_TOTA", "Total Curvature", 
+  "C_ROTO", "Flow Line Curvature"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "slope", tolower(covar) ) )
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$slope$file[1]))
+```
+
+```{r}
+# ---- Run-time: 1.5 min
+saga <- if ( all(file_exists(path_wd(covariates$slope$file, ext = "sgrd"))) == FALSE ) { # If no all the files exist (any is missing)
+  rsaga.geoprocessor(lib = "ta_morphometry", module = 0, # Slope, Aspect, Curvature
+                     param = list(ELEVATION = filter(sources, src_id == "dem")$file,
+                                  # Outputs
+                                  SLOPE = path_wd(filter(covariates$slope, covar == "SLOPE")$file, ext = "sdat"),  
+                                  ASPECT = path_wd(filter(covariates$slope, covar == "ASPECT")$file, ext = "sdat"),  
+                                  C_GENE = path_wd(filter(covariates$slope, covar == "C_GENE")$file, ext = "sdat"), 
+                                  C_PROF = path_wd(filter(covariates$slope, covar == "C_PROF")$file, ext = "sdat"),  
+                                  C_PLAN = path_wd(filter(covariates$slope, covar == "C_PLAN")$file, ext = "sdat"),   
+                                  C_TANG = path_wd(filter(covariates$slope, covar == "C_TANG")$file, ext = "sdat"),  
+                                  C_LONG = path_wd(filter(covariates$slope, covar == "C_LONG")$file, ext = "sdat"),  
+                                  C_CROS = path_wd(filter(covariates$slope, covar == "C_CROS")$file, ext = "sdat"), 
+                                  C_MINI = path_wd(filter(covariates$slope, covar == "C_MINI")$file, ext = "sdat"), 
+                                  C_MAXI = path_wd(filter(covariates$slope, covar == "C_MAXI")$file, ext = "sdat"),
+                                  C_TOTA = path_wd(filter(covariates$slope, covar == "C_TOTA")$file, ext = "sdat"), 
+                                  C_ROTO = path_wd(filter(covariates$slope, covar == "C_ROTO")$file, ext = "sdat"),  
+                                  # Options
+                                  METHOD = 6, # 9 parameter 2nd order polynom (Zevenbergen & Thorne 1987). Default
+                                  UNIT_SLOPE = 1, # 1, degrees
+                                  UNIT_ASPECT = 1), # 1, degree
+                     env = env)
+  }
+```
+
+Mediante la inspección visual de las covariables creadas, se observa como aquellas coincidentes en nombre con las creadas en *Wood* siguen un mismo patrón, muchas más perfiladas y con mayor cantidad de ruido.
+Se detecta además que existe una gran similitud entre **C_GENE** con **C_MINI**, **C_TOTA** con **SLOPE**, y **C_TANG** y **C_CROS**. 
+Esta última tiene base en la similitud en los métodos de cálculo [@Blaga2012AspectsRegardingSignifiance].
+Por estos motivos, se prevalece a las covariables creadas a través del método *Wood* y se mantienen aquellas exclusivas más diferenciadas, a saber **C_TANG**, **C_ROTO** y *C_TOTA*.
+
+**C_TOTA** muestra señales de ruido similares a las de **C_TANG**, donde tanto **C_TOTA** como **C_ROTO** discriminan áreas muy gruesas y contrastadas, lo que su reduce su interés. 
+También son desechadas
+
+```{r}
+# Deleting unusefull covariables 
+covariates$slope$file[1] %>%
+  path_dir() %>%
+  dir_ls(regexp = "C_TANG", invert = TRUE, ignore.case = TRUE) %>%
+  file_delete()
+
+# Filtering deleted files
+covariates[["slope"]] <- covariates$slope %>%
+  filter( file_exists(path_wd(.$file, ext = "sgrd")) )
+```
+
+
+Resumen:
+
+* Sólo se conserva **C_TANG** de las 12 covariables iniciales.
+Presenta una gra similitud con **CROSC**, con mayor definición, pero más ruido; y en menor medida, con **PLANC**. 
+Es necesario analizar sus correlaciones.
+
+
+
+## Morfometría compuesta (*Compound land surface variables*)
+
+
+### Downslope Distance Gradient <*downslope*>
+
+> Calculation of a new topographic index to quantify downslope controls on local drainage.
+>
+> -- [_SAGA-GIS: Tool Downslope Distance Gradient_](http://www.saga-gis.org/saga_tool_doc/7.4.0/ta_morphometry_9.html)
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["downslope"]] <- tribble(
+  ~covar, ~descr,
+  "GRADIENT", "Gradient", 
+  "DIFFERENCE", "Gradient Difference"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "downslope", tolower(covar) ) )
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$downslope$file[1]))
+```
+
+```{r}
+# ---- Run-time: 2 min
+saga <- if ( all(file_exists(path_wd(covariates$downslope$file, ext = "sgrd"))) == FALSE ) { # If no all the files exist (any is missing)
+  rsaga.geoprocessor(lib = "ta_morphometry", module = 9, # Downslope Distance Gradient
+                     param = list(DEM = filter(sources, src_id == "dem")$file,
+                                  # Outputs
+                                  GRADIENT = path_wd(filter(covariates$downslope, covar == "GRADIENT")$file, ext = "sdat"),  
+                                  DIFFERENCE = path_wd(filter(covariates$downslope, covar == "DIFFERENCE")$file, ext = "sdat"),  
+                                  # Options
+                                  DISTANCE = 10.0, # Default
+                                  OUTPUT = 2), # Gradient (degree). Default
+                     env = env)
+  }
+```
+
+En el análisis visual se encuentra que **GRADIENT** es capaz de capturar un patrón muy próximo a **SLOPE**, pero limpio de los artefactos de las parcelas, límites salteados y con mayor definición incluso en ciertas áreas. 
+Probablemente esté relacionado con que la ventana de análisis es variable y dependiente de la distancia vertical en máxima pendiente y no en el tamañao de malla [@Hjerdt2004NewTopographicIndex].
+De forma parecida **DIFFERENCE** se asemeja a **PROFC** y **LONGC**, resultando en una visualización más suavizada y clara.
+Ambas variables están más homogeneizadas y presentar menor variabilidad.
+Según @Hjerdt2004NewTopographicIndex, el gradiente tiende a disminuir en pendientes cóncavas y a aumentar en pendientes de perfiles convexos.
+
+Resumen:
+
+* **GRADIENTE** es semejante a **SLOPE**, mientras que **DIFFERENCE** lo es a **PROFC** y **LONGC**, aunque con patrones más claros y suavizados.
+* Ante correlaciones alta entre variables con patrones similares, cabría favorecer a **GRADIENT** y **DIFFERENCE**.
+
+
+
+
+### Multiresolution Index of Valley Bottom Flatness (MRVBF) and Multiresolution Index of Ridge Top Flatness (MRRTF) <*mrvbf*>
+
+> Calculation of the 'multiresolution index of valley bottom flatness' (MRVBF) and the complementary 'multiresolution index of the ridge top flatness' (MRRTF). 
+>
+> -- [_SAGA-GIS: Tool Multiresolution Index of Valley Bottom Flatness (MRVBF)_](http://www.saga-gis.org/saga_tool_doc/7.4.0/ta_morphometry_8.html)
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["mrvbf"]] <- tribble(
+  ~covar, ~descr,
+  "MRVBF", "Multiresolution Index of Valley Bottom Flatness (MRVBF)", 
+  "MRRTF", "Multiresolution Index of Ridge Top Flatness (MRRTF)"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "mrvbf", tolower(covar) ) )
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$mrvbf$file[1]))
+```
+
+Se modifica el parámetro umbral inicial para la pendiente para adaptarlo a la resolución del MDT [@Gallant2003MultiresolutionIndexValley].
+El algoritmo fue desarrollado para un MDT de 25 m de tamaño de malla, adjudicando el valor de *16.0* al umbral.
+Por cada salto múltiplo de 3 de la resolución del MDT, el umbral debe ser modificado en 2 veces.
+Así a 8 m. aproximadamente, `25/3`, el umbral que le correspondería es *32.0*, `16*2`.
+
+```{r}
+# ---- Run-time: 11.5 min
+saga <- if ( all(file_exists(path_wd(covariates$mrvbf$file, ext = "sgrd"))) == FALSE ) { # If no all the files exist (any is missing)
+  rsaga.geoprocessor(lib = "ta_morphometry", module = 8, # Multiresolution Index of Valley Bottom Flatness (MRVBF)
+                     param = list(DEM = filter(sources, src_id == "dem")$file,
+                                  # Outputs
+                                  MRVBF = path_wd(filter(covariates$mrvbf, covar == "MRVBF")$file, ext = "sdat"),  
+                                  MRRTF = path_wd(filter(covariates$mrvbf, covar == "MRRTF")$file, ext = "sdat"),  
+                                  # Options
+                                  T_SLOPE = 32.0, # Based on paper explanation
+                                  MAX_RES = 100.0 ), # Default
+                     env = env)
+  }
+```
+
+Se comprueba visualmente que la elección del umbral inicial es óptimo y el resultado adecuado para su uso como covariable.
+
+Resumen
+
+* **MRVBF** marca muy bien las zonas más bajas y de llanura. 
+De forma similar, el **MRRTF** marca las zonas altas de bajas pendientes.
+* Los patrones tienen sentido visual y no se encuentra exceso de ruido.
+* Ambas covariables son puro *arte*.
+
+
+
+### Multi-Scale Topographic Position Index (TPI) <*tpi*>
+
+> Topographic Position Index (TPI) calculation as proposed by Guisan et al. (1999).
+This implementation calculates the TPI for different scales and integrates these into one single grid. The hierarchical integration is achieved by starting with the standardized TPI values of the largest scale, then adding standardized values from smaller scales where the (absolute) values from the smaller scale exceed those from the larger scale. This integration scheme has been proposed by N. Zimmermann. 
+>
+> -- [_SAGA-GIS: Tool Multi-Scale Topographic Position Index_](http://www.saga-gis.org/saga_tool_doc/7.4.0/ta_morphometry_28.html)
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["tpi"]] <- tribble(
+  ~covar, ~descr,
+  "TPI", "Multi-Scale Topographic Position Index (TPI)"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "tpi", tolower(covar) ) )
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$tpi$file[1]))
+```
+
+```{r}
+# ---- Run-time: 14 min.
+saga <- if ( all(file_exists(path_wd(covariates$tpi$file, ext = "sgrd"))) == FALSE ) { # If no all the files exist (any is missing)
+  rsaga.geoprocessor(lib = "ta_morphometry", module = 28, # Multi-Scale Topographic Position Index (TPI)
+                     param = list(DEM = filter(sources, src_id == "dem")$file,
+                                  # Outputs
+                                  TPI = path_wd(filter(covariates$tpi, covar == "TPI")$file, ext = "sdat"),  
+                                  # Options
+                                  SCALE_MIN = 1, # Percentage, 1 means base scale (5 m.)
+                                  SCALE_MAX = 10,
+                                  SCALE_NUM = 5), 
+                     env = env)
+  }
+```
+
+El análisis visual a través de QGIS revela que el **TPI** guarda gran similitud con **PROFC** y **LONGC** a priori.
+Esto sería interesante comprobarlo durante la fase de correlación.
+
+Resumen
+
+* **TPI** muy próximo a **PROFC**, **LONGC** y **DIFFERENCE**, con figuras más agudizadas y algo distorsionadas.
+Necesario comparar la correlación.
+
+
+
+### Vector Ruggedness Measure (VRM) <*vrm*>
+
+> Tool Vector Ruggedness Measure (VRM)
+>
+> -- [_SAGA-GIS: Tool Vector Ruggedness Measure_](http://www.saga-gis.org/saga_tool_doc/7.4.0/ta_morphometry_17.html)
+
+> Represents a measurement of terrain ruggedness based on the methodology conceived by Sappington et al. (2007). The measure is calculated by decomposing slope and aspect into 3-dimensional vectors, and calculating the resultant vector magnitude within a user-specified moving window size, using r.neighbors. The user can specify neighborhood size to measure ruggedness across larger landscale scales. Neighborhood operations are performed using a rectangular window shape.
+>
+> -- [_GRASS GIS: r.vector.ruggedness_](https://grass.osgeo.org/grass76/manuals/addons/r.vector.ruggedness.html)
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["vrm"]] <- tribble(
+  ~covar, ~descr,
+  "VRM", "Vector Ruggedness Measure (VRM)"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "vrm", tolower(covar) ) )
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$vrm$file[1]))
+```
+
+```{r}
+# ---- Run-time: 1 min
+saga <- if ( all(file_exists(path_wd(covariates$vrm$file, ext = "sgrd"))) == FALSE ) { # If no all the files exist (any is missing)
+  rsaga.geoprocessor(lib = "ta_morphometry", module = 17, # Vector Ruggedness Measure (VRM)
+                     param = list(DEM = filter(sources, src_id == "dem")$file,
+                                  # Outputs
+                                  VRM = path_wd(filter(covariates$vrm, covar == "VRM")$file, ext = "sdat"),  
+                                  # Options
+                                  RADIUS = 4,
+                                  DW_WEIGHTING = 3), # Gaussian
+                     env = env)
+  }
+```
+
+En el análisis visual se observa que representa las zonas de escarpes y de gran pendientem, guardando una gran similitud con **SLOPE** y **ASPECT**.
+Probablemente no sea del todo adecuado en comparación con estas covariables porque crean muchas áreas pequeñas aisladas.
+
+Por este motivo, se descarta su uso como covariable.
+
+```{r}
+# Deleting unusefull covariables 
+covariates$vrm$file[1] %>%
+  path_dir() %>%
+  dir_delete()
+
+# Filtering deleted files
+covariates[["vrm"]] <- NULL
+```
+
+
+Resumen:
+
+* **VRM** destaca las zonas de escarpes y de gran pendiente.
+
+
+
+
+### Terrain Ruggedness Index (TRI) <*tri*>
+
+> Tool Terrain Ruggedness Index (TRI)
+>
+> -- [_SAGA-GIS: Tool Terrain Ruggedness Index_](http://www.saga-gis.org/saga_tool_doc/7.4.0/ta_morphometry_16.html)
+
+> Calculates the Terrain Ruggedness Index (TRI) of Riley et al. (1999). The index represents the mean change in elevation between a grid cell and its neighbours, over a user-specified moving window size. The original calculation in Riley et al., (1999) used only a 3x3 neighbourhood and represented the sum of the absolute deviations between the center pixel and its immediate 8 neighbours. In r.tri, this calculation is modified so that the calculation can be extended over any scale by taking the mean of the absolute deviations. 
+>
+> -- [GRASS GIS: r.tri](https://grass.osgeo.org/grass76/manuals/addons/r.tri.html)
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["tri"]] <- tribble(
+  ~covar, ~descr,
+  "TRI", "Terrain Ruggedness Index (TRI)"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "tri", tolower(covar) ) )
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$tri$file[1]))
+```
+
+```{r}
+# ---- Run-time: 40 s
+saga <- if ( all(file_exists(path_wd(covariates$tri$file, ext = "sgrd"))) == FALSE ) { # If no all the files exist (any is missing)
+  rsaga.geoprocessor(lib = "ta_morphometry", module = 16, # Terrain Ruggedness Index (TRI)
+                     param = list(DEM = filter(sources, src_id == "dem")$file,
+                                  # Outputs
+                                  TRI = path_wd(filter(covariates$tri, covar == "TRI")$file, ext = "sdat"),
+                                  # Options
+                                  MODE = 1, # Circle, default
+                                  RADIUS = 4,
+                                  DW_WEIGHTING = 3), # Gaussian weighting
+                     env = env)
+  }
+```
+
+Resumen:
+
+* Muy alta semejanza de **TRI** con **SLOPE** y, en un menor grado, con **GRADIENT**. 
+* Entre  **SLOPE** y **TRI**, esta última sería la elegida.
+**GRADIENT** sigue siendo la preponderante.
+
+
+
+
+
+## Hidrología (*hydrology variables*)
+
+### Vertical Distance to Channel Network <*channel*>
+
+Para realizar el cálculo de la distancia a la red de drenaje es necesario calcular previamente dicha red, que se lleva a cabo mediante otro módulo SAGA.
+
+#### Red de drenaje
+
+> Deterministic 8 based flow network analysis.
+>
+> -- [_SAGA-GIS: Tool Channel Network and Drainage Basins_](http://www.saga-gis.org/saga_tool_doc/7.4.0/ta_channels_5.html)
+
+Se trata de un metamódulo que engloba diferentes procesos del mismo área, utilizando parámetros estandar. 
+Con él se genera la red hidrológica base para el cálculo de covariables hidrológicas de distancias respecto a la red, pero no para su uso directo como covariable.
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["channel"]] <- tribble(
+  ~covar, ~descr,
+  #"DIRECTION", "Flow Direction",
+  #"CONNECTION", "Flow Connectivity", 
+  #"ORDER", "Strahler Order",
+  #"BASIN", "Drainage Basins (Grid)",
+  "SEGMENTS", "Channels", # Shape
+  #"BASINS", "Drainage Basins (Shape)", # Shape
+  # "NODES", "Junctions", # Shape
+  ) %>%
+  mutate(file = path( "gis", "covariates", "channel", tolower(covar) ) )
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$channel$file[1]))
+```
+
+```{r}
+# ---- Run-time: 1 min
+saga <- if ( all(file_exists(path_wd(covariates$channel$file, ext = "sgrd"))) == FALSE ) { # If no all the files exist (any is missing)
+  rsaga.geoprocessor(lib = "ta_channels", module = 5, # Channel Network and Drainage Basins
+                     param = list(DEM = filter(sources, src_id == "dem")$file,
+                                  # Outputs
+                                  SEGMENTS = path_wd(filter(covariates$channel, covar == "SEGMENTS")$file, ext = "shp")
+                     ),
+                     env = env)
+  }
+```
+
+La red de drenaje resultante es devuelta en formato vectorial, mientras las herramientas para morfometría esperan un raster binario de la red. 
+Por ello, se convierte a este formato mediante [Tool Shapes to Grid][shp2grid].
+
+[shp2grid]: <http://www.saga-gis.org/saga_tool_doc/7.4.0/grid_gridding_0.html>
+
+```{r}
+# Run-time: instantaneous
+saga <- if ( file_exists(path_wd(covariates$channel$file, ext = "sgrd")) == FALSE ) { # If no all the files exist (any is missing)
+  rsaga.geoprocessor(lib = "grid_gridding", module = 0, # Shapes to Grid
+                     param = list(INPUT = path_wd(filter(covariates$channel, covar == "SEGMENTS")$file, ext = "shp"),
+                                  TARGET_TEMPLATE = filter(sources, src_id == "dem")$file,
+                                  # Outputs
+                                  GRID = path_wd(filter(covariates$channel, covar == "SEGMENTS")$file, ext = "sdat"),
+                                  # Options
+                                  OUTPUT = 0, # Data / no-data values
+                                  TARGET_DEFINITION = 1 # Use of target template is TRUE
+                     ),
+                     env = env)
+  }
+```
+
+#### Distancia vertical a la red de drenaje
+
+> This tool calculates the vertical distance to a channel network base level. The algorithm consists of two major steps:
+  1. Interpolation of a channel network base level elevation
+  2. Subtraction of this base level from the original elevations
+>
+> -- [_SAGA-GIS: Tool Vertical Distance to Channel Network_](http://www.saga-gis.org/saga_tool_doc/7.4.0/ta_channels_3.html)
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["channel"]] <- tribble(
+  ~covar, ~descr,
+  #"BASELEVEL", "Channel Network Base Level",
+  "DISTANCE", "Vertical Distance to Channel Network"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "channel", tolower(covar) ) ) %>%
+  bind_rows(covariates$channel)
+```
+
+```{r}
+# ---- Run-time: 3 min
+saga <- if ( all(file_exists(path_wd(covariates$channel$file, ext = "sgrd"))) == FALSE ) { # If no all the files exist (any is missing)
+  rsaga.geoprocessor(lib = "ta_channels", module = 3, # Vertical Distance to Channel Network
+                     param = list(ELEVATION = filter(sources, src_id == "dem")$file,
+                                  CHANNELS = path_wd(filter(covariates$channel, covar == "SEGMENTS")$file, ext = "sdat"),
+                                  # Outputs
+                                  DISTANCE = path_wd(filter(covariates$channel, covar == "DISTANCE")$file, ext = "sdat"),
+                                  NOUNDERGROUND = 0
+                     ),
+                     env = env)
+  }
+```
+
+**DISTANCE** guarda cierto parecido con **GRADIENT** y puede ser razonable en la medida en que ambas son índices energéticos basados en distancias, el primero hasta alcanzar la red de drenaje, el segundo hasta cumplir una distancia ortogonal. 
+Resalta las áreas sobresalientes respecto al relieve de su alrededor.
+
+Resumen:
+
+* **DISTANCE** guarda cierto parecido con **GRADIENT**. 
+Interesante estudiar la correlación.
+* Resalta las áreas sobresalientes respecto al relieve de su alrededor.
+
+
+
+### Flow Accumulation (Top-Down) <*flow*>
+
+> Top-down processing of cells for calculation of flow accumulation and related parameters. This set of algorithms processes a DEM downwards from the highest to the lowest cell.
+>
+> -- [_SAGA-GIS: Tool Flow Accumulation (Top-Down)_](http://www.saga-gis.org/saga_tool_doc/7.4.0/ta_hydrology_0.html)
+
+Se usa para hallar el área de captación total que, además, será empleada posteriormente en el cálculo de ciertas covariables hidrológicas.
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["flow"]] <- tribble(
+  ~covar, ~descr,
+  "FLOW", "Flow Accumulation",
+  #"VAL_MEAN", "Mean over Catchment",
+  #"ACCU_TOTAL", "Accumulated Material", 
+  #"ACCU_LEFT", "Accumulated Material (Left Side)", 
+  #"ACCU_RIGHT", "Accumulated Material (Right Side)", 
+  #"FLOW_LENGTH", "Flow Path Length",
+  #"WEIGHT_LOSS", "Loss through Negative Weights", # When no-neg true
+  ) %>%
+  mutate(file = path( "gis", "covariates", "flow", tolower(covar) ) )
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$flow$file[1]))
+```
+
+```{r}
+# ---- Run-time: 1 min
+saga <- if ( all(file_exists(path_wd(covariates$flow$file, ext = "sgrd"))) == FALSE ) { # If no all the files exist (any is missing)
+  rsaga.geoprocessor(lib = "ta_hydrology", module = 0, # Flow Accumulation (Top-Down)
+                     param = list(ELEVATION = filter(sources, src_id == "dem")$file,
+                                  #ACCU_TARGET = path_wd(band_rast(sources, "dem", 1), ext = "sdat"),
+                                  # Outputs
+                                  FLOW = path_wd(filter(covariates$flow, covar == "FLOW")$file, ext = "sdat"),
+                                  #VAL_MEAN = path_wd(filter(covariates$flow, covar == "VAL_MEAN")$file, ext = "sdat"),
+                                  #ACCU_TOTAL = path_wd(filter(covariates$flow, covar == "ACCU_TOTAL")$file, ext = "sdat"),
+                                  # Options
+                                  FLOW_UNIT = 1, # Cell area, default
+                                  METHOD = 4, # 4. Multiple Flow Direction, default
+                                  CONVERGENCE = 1.10,
+                                  NO_NEGATIVES = 1), # False, default
+                     env = env)
+  }
+```
+
+Red de drenaje de un pixel de grosor, que permite describir la red, pero no ayuda a la caracterización del área circundante.
+Se descarta su uso como covariable.
+
+Resumen:
+
+* Se descarta el uso de **FLOW** como covariable.
+
+
+### Flow Width and Specific Catchment Area <*sca*>
+
+> Flow width and specific catchment area (SCA) calculation. SCA calculation needs total catchment area (TCA) as input, which can be calculated with one of the flow accumulation tools. 
+>
+> -- [_SAGA-GIS: Tool Flow Width and Specific Catchment Area_](http://www.saga-gis.org/saga_tool_doc/7.4.0/ta_hydrology_19.html)
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["sca"]] <- tribble(
+  ~covar, ~descr,
+  "WIDTH", "Flow Width",
+  "SCA", "Specific Catchment Area (SCA)"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "sca", tolower(covar) ) )
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$sca$file[1]))
+```
+
+```{r}
+# ---- Run-time: 15 seg
+saga <- if ( all(file_exists(path_wd(covariates$sca$file, ext = "sgrd"))) == FALSE ) { # If no all the files exist (any is missing)
+  rsaga.geoprocessor(lib = "ta_hydrology", module = 19, # Flow Width and Specific Catchment Area
+                     param = list(DEM = filter(sources, src_id == "dem")$file,
+                                  TCA = path_wd(filter(covariates$flow, covar == "FLOW")$file, ext = "sdat"), # From _flow_
+                                  # Outputs
+                                  WIDTH = path_wd(filter(covariates$sca, covar == "WIDTH")$file, ext = "sdat"),
+                                  SCA = path_wd(filter(covariates$sca, covar == "SCA")$file, ext = "sdat"),
+                                  # Options
+                                  METHOD = 1), # 1. Multiple Flow Direction 
+                     env = env)
+  }
+```
+
+En el análisis visual se observa que el ancho del flujo (*Flow Width*) es una variable categorizada en 17 grupos y que no aporta información diferente a la ya disponible.
+Por ello, se descarta su uso.
+
+```{r}
+# Deleting unusefull covariables 
+covariates$sca$file[1] %>%
+  path_dir() %>%
+  dir_ls(regexp = "WIDTH", invert = FALSE, ignore.case = TRUE) %>%
+  file_delete()
+```
+
+```{r}
+# Filtering deleted files
+covariates[["sca"]] <- covariates$sca %>%
+  filter( file_exists(path_wd(.$file, ext = "sgrd")) )
+```
+
+**SCA** tiene un patrón similar a **FLOW** que permite describir la red de drenaje, pero no ayuda a la caracterización del área circundante por sí misma.
+Se descarta su uso como covariable, aunque será utilizada para derivar nuevas covariables.
+
+Resumen:
+
+* Se descarta el uso de **SCA** como covariable, aunque será utilizada para derivar nuevas covariables.
+
+
+
+### Topographic Wetness Index (TWI) <*twi*>[^twi]
+
+> Calculation of the slope and specific catchment area (SCA) based Topographic Wetness Index (TWI).
+>
+> -- [_SAGA-GIS: Tool Topographic Wetness Index (TWI)_](http://www.saga-gis.org/saga_tool_doc/7.4.0/ta_hydrology_20.html)
+
+[^twi]: Una consideración sobre el módulo TWI de SAGA es que el área de captación podría utilizarse en los módulos TWI y SPI de cálculo.
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["twi"]] <- tribble(
+  ~covar, ~descr,
+  "TWI", "Topographic Wetness Index (TWI)"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "twi", tolower(covar) ) )
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$twi$file[1]))
+```
+
+```{r}
+# ---- Run-time: 10 s
+saga <- if ( all(file_exists(path_wd(covariates$twi$file, ext = "sgrd"))) == FALSE ) { # If no all the files exist (any is missing)
+  rsaga.geoprocessor(lib = "ta_hydrology", module = 20, # Topographic Wetness Index
+                     param = list(SLOPE = path_wd(filter(covariates$wood, covar == "SLOPE")$file, ext = "sdat"),
+                                  AREA = path_wd(filter(covariates$sca, covar == "SCA")$file, ext = "sdat"),
+                                  # Outputs
+                                  TWI = path_wd(filter(covariates$twi, covar == "TWI")$file, ext = "sdat"),
+                                  # Options
+                                  METHOD = 0), # 0. Standar, default
+                     env = env)
+  }
+```
+
+El patrón es nuevo y marca zonas sinuosas cuyo sentido espacial se relaciona con mayor acumulación de aguas y materiales.
+
+Resumen:
+
+* **TWI** tiene un patrón nuevo e interesante relacionado con mayor acumulación de materiales y retención de agua.
+
+
+
+### Stream Power Index (SPI) <*spi*>
+
+> Calculation of stream power index based on slope and specific catchment area (SCA) [SPI = SCA * tan(Slope)].
+>
+> -- [_SAGA-GIS: Tool Stream Power Index_](http://www.saga-gis.org/saga_tool_doc/7.4.0/ta_hydrology_21.html)
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["spi"]] <- tribble(
+  ~covar, ~descr,
+  "SPI", "Stream Power Index (SPI)"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "spi", tolower(covar) ) )
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$spi$file[1]))
+```
+
+```{r}
+# ---- Run-time: 10 s
+saga <- if ( all(file_exists(path_wd(covariates$spi$file, ext = "sgrd"))) == FALSE ) { # If no all the files exist (any is missing)
+  rsaga.geoprocessor(lib = "ta_hydrology", module = 21, # Stream Power Index
+                     param = list(SLOPE = path_wd(filter(covariates$wood, covar == "SLOPE")$file, ext = "sdat"),
+                                  AREA = path_wd(filter(covariates$sca, covar == "SCA")$file, ext = "sdat"),
+                                  # Outputs
+                                  SPI = path_wd(filter(covariates$spi, covar == "SPI")$file, ext = "sdat"),
+                                  # Options
+                                  CONV = 0), # 0. No conversion (areas already given as specific catchment area). Default
+                     env = env)
+  }
+```
+
+Las covariables TWI y SPI comparten los parámetros iniciales para el cálculo, la pendiente y el área de captación específica, por lo que hay que estar atentos a una posible alta correlación entre ambas.
+Este hecho se comprueba mediante el análisis visual, con patrones casi idénticos.
+Sin embargo, la desviación estándar del **SPI** es muy superior, obligando a un ajuste manual de la escala gráfica a un rango muy pequeño para conseguir una representación adecuada y dando lugar a contrastes más pronunciados.
+
+Resumen:
+
+* **TWI** y **SPI** comparten los parámetros iniciales para su cálculo.
+* Ambas dibujan patrones muy similares, pero **SPI** tiene una desviación estandar muy superior a **TWI** y su una visualización estándar es muy deficiente.
+* Se propone analizar su correlación con **TWI** y, en última medida, desecharla en favor de esta.
+
+
+
+### TCI Low <*tci*>
+
+> Terrain Classification Index for Lowlands (TCI Low).
+>
+> -- [_SAGA-GIS: Tool TCI Low_](http://www.saga-gis.org/saga_tool_doc/7.4.0/ta_hydrology_24.html)
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["tci"]] <- tribble(
+  ~covar, ~descr,
+  "TCILOW", "TCI Low"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "tci", tolower(covar) ) )
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$tci$file[1]))
+```
+
+```{r}
+# ---- Run-time: 10 s
+saga <- if ( all(file_exists(path_wd(covariates$tci$file, ext = "sgrd"))) == FALSE ) { # If no all the files exist (any is missing)
+  rsaga.geoprocessor(lib = "ta_hydrology", module = 24, # TCI Low
+                     param = list(DISTANCE = path_wd(filter(covariates$channel, covar == "DISTANCE")$file, ext = "sdat"),
+                                  TWI = path_wd(filter(covariates$twi, covar == "TWI")$file, ext = "sdat"),
+                                  # Outputs
+                                  TCILOW = path_wd(filter(covariates$tci, covar == "TCILOW")$file, ext = "sdat")
+                     ),
+                     env = env)
+  }
+```
+
+TCILOW presenta un patrón similar a los ya descritos por TWI y SPI, por lo que se debe **prestar atención al análisis cuantitativo de su correlación**.
+Resalta especialmente el contraste entre zonas baja de acumulación con zonas superiores de erosión.
+
+Resumen:
+
+* **TCI** dibujan un patrón cercano a **TWI** con diferentes matices. 
+* Se propone analizar su correlación con **TWI**.
+
+
+
+### SAGA Wetness Index <*stwi*>
+
+> The 'SAGA Wetness Index' is, as the name says, similar to the 'Topographic Wetness Index' (TWI), but it is based on a modified catchment area calculation ('Modified Catchment Area'), which does not think of the flow as very thin film. As result it predicts for cells situated in valley floors with a small vertical distance to a channel a more realistic, higher potential soil moisture compared to the standard TWI calculation.
+>
+> -- [_SAGA-GIS: Tool SAGA Wetness Index_](http://www.saga-gis.org/saga_tool_doc/7.4.0/ta_hydrology_15.html)
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["stwi"]] <- tribble(
+  ~covar, ~descr,
+  "AREA", "Catchment Area", 
+  "SLOPE", "Catchment Slope",
+  "AREA_MOD", "Modified Catchment Area", 
+  "TWI", "Topographic Wetness Index (SAGA)"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "stwi", tolower(covar) ) )
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$stwi$file[1]))
+```
+
+```{r}
+# WARNING! ---- Run-time: ~45 min
+saga <- if ( all(file_exists(path_wd(covariates$stwi$file, ext = "sgrd"))) == FALSE ) { # If no all the files exist (any is missing)
+  rsaga.geoprocessor(lib = "ta_hydrology", module = 15, # SAGA Wetness Index
+                     param = list(DEM = filter(sources, src_id == "dem")$file,
+                                  # Outputs
+                                  AREA = path_wd(filter(covariates$stwi, covar == "AREA")$file, ext = "sdat"),
+                                  SLOPE = path_wd(filter(covariates$stwi, covar == "SLOPE")$file, ext = "sdat"),
+                                  AREA_MOD = path_wd(filter(covariates$stwi, covar == "AREA_MOD")$file, ext = "sdat"),
+                                  TWI = path_wd(filter(covariates$stwi, covar == "TWI")$file, ext = "sdat")
+                    ),
+                     env = env)
+  }
+```
+
+En contra de lo que podría deducirse por el nombre, el **TWI** de SAGA no tiene una gran similitud al TWI original y su sentido espacial es más sencillo de apreciar.
+Las covariables complementarias del módulo se diferencian de las calculadas previamente, en especial las áreas de captación. 
+Potencialmente serían elegidas sobre las calculadas previamente.
+Incluso, cabría utilizar las áres de captación de este modelo en los otros módulos **TWI** y **SPI**. 
+Si bien las áreas de captación no resultan interesantes como covariables y son nominadas para ser desechadas.
+
+Resumen:
+
+* **TWI** y **SLOPE** de SAGA parecen variables multi resolución por su patrón y detalle, y son de gran interés.
+Su relación con parámetros físicos no parece tan directa como con variables previas.
+* Parece la covariable inversa de **GRADIENT**, será necesario estudiar su correlación con esta.
+* Algo similar ocurre con **SLOPE** de Wood, si bien su patrón visual es menos contrastado y su uso sería preferente frente a este.
+* Hace falta renombrarlas para evitar el conflito de nombres con las covariables de Wood a futuro.
+
+* **TWI** de SAGA es puro *arte* en la versión original.
+* Incluso, cabría utilizar las áres de captación de este modelo en los otros módulos **TWI** y **SPI**.
+
+
+
+### Melton Ruggedness Number (MNR) <*mrn*>
+
+> Melton ruggedness number (MNR) is a simple flow accumulation related index, calculated as difference between maximum and minimum elevation in catchment area divided by square root of catchment area size. The calculation is performed for each grid cell, therefore minimum elevation is same as elevation at cell's position. Due to the discrete character of a single maximum elevation, flow calculation is simply done with Deterministic 8.
+>
+> -- [_SAGA-GIS: Tool Melton Ruggedness Number_](http://www.saga-gis.org/saga_tool_doc/7.4.0/ta_hydrology_23.html)
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["mrn"]] <- tribble(
+  ~covar, ~descr,
+  "AREA", "Catchment Area",
+  "ZMAX", "Maximum Height", 
+  "MRN", "Melton Ruggedness Number"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "mrn", tolower(covar) ) )
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$mrn$file[1]))
+```
+
+```{r}
+# ---- Run-time: 1 min
+saga <- if ( all(file_exists(path_wd(covariates$mrn$file, ext = "sgrd"))) == FALSE ) { # If no all the files exist (any is missing)
+  rsaga.geoprocessor(lib = "ta_hydrology", module = 23, # Melton Ruggedness Number
+                     param = list(DEM = filter(sources, src_id == "dem")$file,
+                                  # Outputs
+                                  AREA = path_wd(filter(covariates$mrn, covar == "AREA")$file, ext = "sdat"),
+                                  ZMAX = path_wd(filter(covariates$mrn, covar == "ZMAX")$file, ext = "sdat"),
+                                  MRN = path_wd(filter(covariates$mrn, covar == "MRN")$file, ext = "sdat")
+                     ),
+                     env = env)
+  }
+```
+
+A través del análisis visula se encuentra que el área de captación calculada por este método no representa una novedad respecto a las anteriores.
+Mientras, la máxima altitud del área de captación no parecer ser una covariable adecuada, ya que no señala zonas homogéneas y su principal proviedad es la definición del lecho del río.
+Por último, el índice *MRN* se calcula por un método el método de flujo sencillo *D8* y su patrón es marcadamente rectilíneo, lo que es una de las características a evitar de las covariables.
+Por todo ello, se decide prescindir de este módulo al completo.
+
+```{r}
+# Deleting unusefull covariables 
+covariates$mrn$file[1] %>%
+  path_dir() %>%
+  dir_delete()
+
+# Filtering deleted files
+covariates[["mrn"]] <- NULL
+```
+
+
+
+
+
+## Topo-climáticas (*Topo-climatic variables*)
+
+### Solar-radiation Aspect Index <*trasp*>
+
+> Calculates the Roberts and Cooper (1989) Solar-radiation Aspect Index 
+>
+> -- [_spatialEco_](https://rdrr.io/cran/spatialEco/man/trasp.html)
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["trasp"]] <- tribble(
+  ~covar, ~descr,
+  "trasp", "Solar-radiation Aspect Index",
+  ) %>%
+  mutate(file = path( "gis", "covariates", "trasp", tolower(covar) ) )
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$trasp$file[1]))
+```
+
+```{r}
+# ---- Run-time: 10 s
+trasp <- filter(sources, src_id == "dem")$file %>%
+  raster() %>%
+  spatialEco::trasp()
+
+# SAGA files written with raster::writeRaster function has the flag TOPTOBOTTOM = TRUE, which makes QGIS unable to read the raster.
+# For this reason, a GTiff file is created and then transformed to SAGA with GDAL in order to keep all files with the same format.
+writeRaster(trasp, path_wd(filter(covariates$trasp, covar == "trasp")$file, ext = "tif"), 
+            format = "GTiff", overwrite = TRUE, progress = "text")
+
+glue('gdal_translate -of SAGA -a_srs EPSG:25830 "{GTIF}" {SAGA}',
+     GTIF = path_wd(filter(covariates$trasp, covar == "trasp")$file, ext = "tif"),
+     SAGA = path_wd(filter(covariates$trasp, covar == "trasp")$file, ext = "sdat")) %>% 
+  system()
+
+file_delete(path_wd(filter(covariates$trasp, covar == "trasp")$file, ext = "tif"))
+rm(trasp)
+```
+
+Resumen:
+
+* Si se inverte la escala de visualización **TRASP** suavizado, se obtiene un patrón prácticamente idéntico al de **SLOPE**.
+Es necesario estudiar su correlación.
+* Aunque se plantea como alternativa de **ASPECT**, no tiene una similitud aparente alta. 
+También es interesante el contraste de la correlación.
+
+
+
+
+### Morphometric Protection Index <*protection*>
+
+> This algorithm analyses the immediate surrounding of each cell up to an given distance and evaluates how the relief protects it.
+It is equivalent to the positive openness in [@Yokoyama2002VisualizingTopographyOpenness].
+>
+> -- [_SAGA-GIS: Tool Morphometric Protection Index_](http://www.saga-gis.org/saga_tool_doc/7.4.0/ta_morphometry_7.html)
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["protection"]] <- tribble(
+  ~covar, ~descr,
+  "PROTECTION", "Morphometric Protection Index",
+  ) %>%
+  mutate(file = path( "gis", "covariates", "protection", tolower(covar) ) )
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$protection$file[1]))
+```
+
+```{r}
+# WARNING! ---- Run-time: ~40 min
+saga <- if ( all(file_exists(path_wd(covariates$protection$file, ext = "sgrd"))) == FALSE ) { # If no all the files exist (any is missing)
+  rsaga.geoprocessor(lib = "ta_morphometry", module = 7, # Morphometric Protection Index
+                     param = list(DEM = filter(sources, src_id == "dem")$file,
+                                  # Outputs
+                                  PROTECTION = path_wd(filter(covariates$protection, covar == "PROTECTION")$file, ext = "sdat"),  
+                                  # Options
+                                  RADIUS = 1000), # 2000, default
+                     env = env)
+  }
+```
+
+Resumen:
+
+* El patrón de **PROTECTION** es cercano a **SLOPE** de Wood y **TRI**, aunque con menor contraste y sin una presencia tan notable de la red de drenaje.
+Su uso es interesante y preferente a priori.
+
+
+
+### Diurnal Anisotropic Heat <*heat*>
+
+> This tool calculates a rather simple approximation of the anisotropic diurnal heat (Ha) distribution using the formula: _Ha = cos(amax - a) * arctan(b)_ where *amax* defines the aspect with the maximum total heat surplus, *a* is the slope aspect, and *b* is the slope angle [See Boehner & Antonic in: @Hengl2009GeomorphometryConceptsSoftware, pp.195-226].
+>
+> -- [_SAGA-GIS: Tool Diurnal Anisotropic Heat_](http://www.saga-gis.org/saga_tool_doc/7.4.0/ta_morphometry_12.html)
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["heat"]] <- tribble(
+  ~covar, ~descr,
+  "DAH", "Diurnal Anisotropic Heating",
+  ) %>%
+  mutate(file = path( "gis", "covariates", "heat", tolower(covar) ) )
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$heat$file[1]))
+```
+
+```{r}
+# ---- Run-time: ~15 s
+saga <- if ( all(file_exists(path_wd(covariates$heat$file, ext = "sgrd"))) == FALSE ) { # If no all the files exist (any is missing)
+  rsaga.geoprocessor(lib = "ta_morphometry", module = 12, # Diurnal Anisotropic Heat
+                     param = list(DEM = filter(sources, src_id == "dem")$file,
+                                  # Outputs
+                                  DAH = path_wd(filter(covariates$heat, covar == "DAH")$file, ext = "sdat"),
+                                  ALPHA_MAX = 202.5 # Aspect with the maximum heat surplus is ~SW
+                                  ),
+                     env = env)
+  }
+```
+
+Resumen:
+
+* Como su descripción indica, **DAH** guarda cierta semejanza con el **ASPECT**, pero disminuyendo el ruido y esquivando la problemática de la variable polar. 
+Es interesante dentro del conjunto topo-climático.
+
+
+
+### Land Surface Temperature <*temperature*>
+
+> Temperature estimation at each grid point as a function of temperature, temperature lapse rate and elevation for a reference station.
+>
+> -- [_SAGA-GIS: Tool Land Surface Temperature_](http://www.saga-gis.org/saga_tool_doc/7.4.0/ta_morphometry_13.html)
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["temperature"]] <- tribble(
+  ~covar, ~descr,
+  "LST", "Land Surface Temperature"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "temperature", tolower(covar) ) )
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$temperature$file[1]))
+```
+
+```{r}
+# ---- Run-time: ~15 s
+saga <- if ( all(file_exists(path_wd(covariates$temperature$file, ext = "sgrd"))) == FALSE ) { # If no all the files exist (any is missing)
+  rsaga.geoprocessor(lib = "ta_morphometry", module = 13, # Land Surface Temperature
+                     param = list(DEM = filter(sources, src_id == "dem")$file,
+                                  # Outputs
+                                  LST = path_wd(filter(covariates$temperature, covar == "LST")$file, ext = "sdat")
+                     ),
+                     env = env)
+  }
+```
+
+Resumen:
+
+* **LST** es un escalado de la elevación si se va a utilizar normalizada, dibujando el mismo patrón. 
+Por este motivo podría ser interesante su uso sobre el de la elevación como covariable.
+Esta decisión se basará en el estudio de la correlación entre ellas.
+
+
+
+### Potential Incoming Solar Radiation <*insolation*>
+
+> Calculation of potential incoming solar radiation (insolation).
+>
+> -- [_SAGA-GIS: Tool Potential Incoming Solar Radiation_](http://www.saga-gis.org/saga_tool_doc/7.4.0/ta_lighting_2.html)
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["insolation"]] <- tribble(
+  ~covar, ~descr,
+  "GRD_DIRECT", "Direct Insolation",
+  "GRD_DIFFUS", "Diffuse Insolation"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "insolation", tolower(covar) ) )
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$insolation$file[1]))
+```
+
+```{r}
+# WARNING! ---- Run-time: ~40 min
+saga <- if ( all(file_exists(path_wd(covariates$insolation$file, ext = "sgrd"))) == FALSE ) { # If no all the files exist (any is missing)
+  rsaga.geoprocessor(lib = "ta_lighting", module = 2, # Potential Incoming Solar Radiation
+                     param = list(GRD_DEM = filter(sources, src_id == "dem")$file,
+                                  # Outputs
+                                  GRD_DIRECT = path_wd(filter(covariates$insolation, covar == "GRD_DIRECT")$file, ext = "sdat"), 
+                                  GRD_DIFFUS = path_wd(filter(covariates$insolation, covar == "GRD_DIFFUS")$file, ext = "sdat"), 
+                                  # Options
+                                  SHADOW = 1, # Fat, a bit slower but less artifacts
+                                  LOCATION = 1, # Calculate from grid system
+                                  LATITUDE = 41,
+                                  PERIOD = 2, # Range of days
+                                  DAY = "2018-03-21", # Beginning of the spring 
+                                  DAY_STOP = "2019-03-20", # Ending of the winter
+                                  DAYS_STEP = 28, # Each 28 days
+                                  HOUR_STEP = 4.0 # Every 4 hours = 6 calculations per day
+                     ),
+                     env = env)
+  }
+```
+
+Resumen:
+
+* **GRD_DIRECT** dibuja un patrón similar a **DAH** con ciertas diferencias. 
+Sería interesante analizar su correlación.
+
+* **GRD_DIFFUS** también tiene un patrón cercano a **LST**, aunque menos relacionado con la altitud y su uso podría ser preferente respecto a este.
+
+
+
+
+# Teledetección
+
+## Colores (*Colour*)
+
+El MDT forma el núcleo desde el que se derivan las covariables para la Cartografía Digital de Suelos y su análisis se traduce en los variables morfométricas, hidrológicas y topo-climáticas.
+En la metodología convencional para la cartografía de suelos, además del relive, también son indicadores de gran relevancia el color y las características de la vegetación.
+Buscando mimetizar estas acciones se emplea imágenes de teledetección de las que obtener diferentes índices. 
+
+Más allá de resumir el color en una única variable cuantitativa, se persigue calcular índices de interés dentro del espectro electromagnético con especial incidencia en el rango del visible y del infrarrojo. 
+Por ejemplo, se busca calcular el grado de intensidad del rojo [@Flynn2019SemiautomaticDisaggregationNational] o resaltar áreas con mayor presencia de arcillas [Roecker et al. in: @Boettinger2010DigitalSoilMapping, pp. 369-384].
+
+Muchos de estos índices no han sido implementados en paquetes GIS, por lo que se utilizan las fórmulas descritas con la herramienta [Grid Calculator][grid] de SAGA.
+
+### Coloration Index (CI) <_colour_>
+
+[Fórmula entre la región del rojo y azul][coloration] como índice de coloración [@Escadafal1994IndicesSpectrauxPour].
+
+[coloration]: <https://www.indexdatabase.de/db/i-single.php?id=11>
+
+$$\frac{Red - Blue}{Red}$$
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["colour"]] <- tribble(
+  ~covar, ~descr,
+  "ci", "Coloration Index"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "colour", tolower(covar) ) )
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$colour$file[1]))
+```
+
+```{r}
+# ---- Run-time: 15 s
+bands <- sources %>%
+  filter(src_id == "rs" & band_id %in% c(2, 3, 4) ) %>% # Sentinel 2A: blue, red
+  arrange(band_id) %>%
+  select(file) %>%
+  flatten_chr() %>%
+  paste0(collapse = ";")
+  
+saga <- if ( file_exists(path_wd(filter(covariates$colour, covar == "ci")$file, ext = "sgrd")) == FALSE ) {
+  rsaga.geoprocessor(lib = "grid_calculus", module = 1, # Grid Calculator
+                     param = list(GRIDS = bands, # 1. blue, 2. green, 3. red
+                                  # Outputs
+                                  RESULT = path_wd(filter(covariates$colour, covar == "ci")$file, ext = "sdat"),
+                                  # Options
+                                  RESAMPLING = 3, #  B-Spline Interpolation, default
+                                  FORMULA = "g3 / (g1 + g2 + g3)" # Coloration Index
+                     ),
+                     env = env)
+  }
+```
+
+Resumen:
+
+* **ci** parece guardar cierta correlación con las zonas donde hay suelos descabezados cuyos **horizontes arcillosos están en la superficie**, especialmente aquellos más intensos, que quedan destacadas sobre el resto sin crear zonas muy contrastadas.
+
+
+
+### Normalized Difference Red/Green Redness Index (RI) <*colour*>
+
+[Indice de rojez][redness] mediante una fórmula de normalization entre las bandas verde y roja. @Bannari1995ReviewVegetationIndices lo describe para un uso sobre vegetación, pero posteriormente @Flynn2019SemiautomaticDisaggregationNational lo denomina *"Colour index"* y lo emplea para en cartografía de suelos. 
+
+[redness]: <https://www.indexdatabase.de/db/i-single.php?id=74>
+
+$$\frac{Red − Green}{Red + Green}$$
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["colour"]] <- tribble(
+  ~covar, ~descr,
+  "ri", "Normalized Difference Red/Green Redness Index"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "colour", tolower(covar) ) ) %>%
+  bind_rows(covariates$colour)
+```
+
+```{r}
+# ---- Run-time: 15 s
+bands <- sources %>%
+  filter(src_id == "rs" & band_id %in% c(3, 4) ) %>% # Sentinel 2A: green, red
+  arrange(band_id) %>%
+  select(file) %>%
+  flatten_chr() %>%
+  paste0(collapse = ";")
+  
+saga <- if ( file_exists(path_wd(filter(covariates$colour, covar == "ri")$file, ext = "sgrd")) == FALSE ) {
+  rsaga.geoprocessor(lib = "grid_calculus", module = 1, # Grid Calculator
+                     param = list(GRIDS = bands, # 1. green, 2. red
+                                  # Outputs
+                                  RESULT = path_wd(filter(covariates$colour, covar == "ri")$file, ext = "sdat"),
+                                  # Options
+                                  RESAMPLING = 4, #  B-Spline Interpolation, default
+                                  FORMULA = "(g2 - g1) / (g2 + g1)" # Normalized Difference Red/Green Redness Index
+                     ),
+                     env = env)
+  }
+```
+
+Resumen:
+
+* **ri** identifica perfectamente zonas *boscosas y de aguas*, y en general otorga valores bajos a zonas con vegetación frente a suelos desnudos. 
+Quizás por eso destaca las zonas de arcillas, pero sin contrastarlas con las de carbonatos en superficie.
+* No parece un índice especialmente preparado para suelos.
+
+
+### Colour Redness Index (CRI) <*colour*>
+
+Indice de rojez sobre el visible completo mediante la fórmula con las bandas azul, verde y roja. 
+Ha sido descrito su uso para resaltar hematíes [@Flynn2019SemiautomaticDisaggregationNational]
+
+$$\frac{Red^{2}}{Blue · Green^{3}}$$
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["colour"]] <- tribble(
+  ~covar, ~descr,
+  "cri", "Colour Redness Index"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "colour", tolower(covar) ) ) %>%
+  bind_rows(covariates$colour)
+```
+
+```{r}
+# ---- Run-time: 15 s
+bands <- sources %>%
+  filter(src_id == "rs" & band_id %in% c(2, 3, 4) ) %>% # Sentinel 2A: blue, green, red
+  arrange(band_id) %>%
+  select(file) %>%
+  flatten_chr() %>%
+  paste0(collapse = ";")
+  
+saga <- if ( file_exists(path_wd(filter(covariates$colour, covar == "cri")$file, ext = "sgrd")) == FALSE ) {
+  rsaga.geoprocessor(lib = "grid_calculus", module = 1, # Grid Calculator
+                     param = list(GRIDS = bands, # 1. blue, 2. green, 3. red
+                                  # Outputs
+                                  RESULT = path_wd(filter(covariates$colour, covar == "cri")$file, ext = "sdat"),
+                                  # Options
+                                  RESAMPLING = 4, #  B-Spline Interpolation, default
+                                  FORMULA = "(g3^2) / (g1 * (g2^3) )" # Colour Redness Index
+                     ),
+                     env = env)
+  }
+```
+
+Rango de valores muy amplio, aunque se concentra entre 0 y `1e-5` excepto en las zonas de bosque y montaña. 
+Esto da lugar a una **desviación estandar muy elevada** sin que aporte gran información sobre los suelos y obliga a reajustar la escala de visualización.
+Por este motivo, se desestima su uso.
+
+```{r}
+# Deleting unusefull covariables 
+covariates$colour$file[1] %>%
+  path_dir() %>%
+  dir_ls(regexp = "cri") %>%
+  file_delete()
+
+# Filtering deleted files
+covariates[["colour"]] <- covariates$colour %>%
+  filter( file_exists(path_wd(.$file, ext = "sgrd")) )
+```
+
+
+
+
+## Cationes (*Cations*)
+
+### Red/Green ratio. Carbonates (CO3) <*cations*>
+
+Ratio entre las bandas 3 y 2 de Landsat 5 Thematic Mapper (TM), que acentúa las zonas en superficie blancas o carbonatadas [Roecker et al. in: @Boettinger2010DigitalSoilMapping, pp. 369-384].
+
+| Sensor | Band number | Band name | Wavelength (μm) | Resolution (m) | Band Applications |
+|:------:|:-----------:|:---------:|:---------------:|:--------------:|:------------------:|
+|TM | 1 | Visible Blue | 0.45 - 0.52 | 30 | Bathymetric mapping, distinguishing soil from vegetation, and deciduous from coniferous vegetation |
+|TM | 2 | Visible Green | 0.52 - 0.60 |	30 | Emphasizes peak vegetation, which is useful for assessing plant vigor |
+|TM | 3 | Visible Red |	0.63 - 0.69 |	30 | Discriminates vegetation slopes |
+|TM | 4 | NIR |	0.76 - 0.90 |	30 | Emphasizes biomass content and shorelines |
+|TM | 5 | SWIR 1 | 1.55 - 1.75 |	30 | Discriminates moisture content of soil and vegetation; penetrates thin clouds |
+|TM | 6 | Thermal | 10.40 - 12.50 |	120 | Thermal mapping and estimated soil moisture |
+|TM | 7 | SWIR 2 | 2.08 - 2.35 |	30 | Hydrothermally altered rocks associated with mineral deposits |
+ : Metadatos de las sensores del satélite [Landsat 5 TM.](https://eos.com/landsat-5-tm/)
+
+Según los datos de los sensores del satélite, dichas bandas corresponden con el rojo y verde visible.
+
+$$\frac{Red}{Green}$$ 
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["cations"]] <- tribble(
+  ~covar, ~descr,
+  "co3", "Red/Green ratio. Carbonates"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "cations", tolower(covar) ) )
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$cations$file[1]))
+```
+
+```{r}
+# ---- Run-time: 15 s
+bands <- sources %>%
+  filter(src_id == "rs" & band_id %in% c(3, 4) ) %>% # Sentinel 2A: green, red
+  arrange(band_id) %>%
+  select(file) %>%
+  flatten_chr() %>%
+  paste0(collapse = ";")
+  
+saga <- if ( file_exists(path_wd(filter(covariates$cations, covar == "co3")$file, ext = "sgrd")) == FALSE ) {
+  rsaga.geoprocessor(lib = "grid_calculus", module = 1, # Grid Calculator
+                     param = list(GRIDS = bands, # 1. green, 2. red
+                                  # Outputs
+                                  RESULT = path_wd(filter(covariates$cations, covar == "co3")$file, ext = "sdat"),
+                                  # Options
+                                  RESAMPLING = 4, #  B-Spline Interpolation, default
+                                  FORMULA = "g2 / g1" # Red/Green ratio. Carbonates
+                     ),
+                     env = env)
+  }
+```
+
+Resumen:
+
+* Visualización prácticamente igual que **ri** y con las mismas consideraciones. 
+Se desaconseja su uso en Cartografía Digital de Suelos.
+
+
+
+### Normalized Difference Salinity Index (NDSI) <_cations_>
+
+[Índice de salinidad][salinity] mediante una fórmula de normalización entre las bandas SWIR I y II [@Al-Khaier2003SoilSalinityDetection].
+
+[salinity]: <https://www.indexdatabase.de/db/i-single.php?id=57>
+
+$$\frac{SWIR 1-SWIR 2}{SWIR 1+SWIR 2}$$ 
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["cations"]] <- tribble(
+  ~covar, ~descr,
+  "ndsi", "Normalized Difference Salinity Index"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "cations", tolower(covar) ) )%>%
+  bind_rows(covariates$cations)
+```
+
+```{r}
+# ---- Run-time: 15 s
+bands <- sources %>%
+  filter(src_id == "rs" & band_id %in% c(11, 12) ) %>% # Sentinel 2A: SWIR I, SWIR II
+  arrange(band_id) %>%
+  select(file) %>%
+  flatten_chr() %>%
+  paste0(collapse = ";")
+  
+saga <- if ( file_exists(path_wd(filter(covariates$cations, covar == "ndsi")$file, ext = "sgrd")) == FALSE ) {
+  rsaga.geoprocessor(lib = "grid_calculus", module = 1, # Grid Calculator
+                     param = list(GRIDS = bands, # 1. SWIR I, 2. SWIR II
+                                  # Outputs
+                                  RESULT = path_wd(filter(covariates$cations, covar == "ndsi")$file, ext = "sdat"),
+                                  # Options
+                                  RESAMPLING = 4, #  B-Spline Interpolation, default
+                                  FORMULA = "(g1 - g2) / (g1 + g2)" # Normalized Difference Salinity Index
+                     ),
+                     env = env)
+  }
+```
+
+Remarca las zonas con vegetación y por oposición también las zonas de suelos desnudos, pero sin destacar ninguna característica en particular.
+Al no encontrar un aporte de información razonable, se decide desechar su uso.
+
+```{r}
+# Deleting unusefull covariables 
+covariates$cations$file[1] %>%
+  path_dir() %>%
+  dir_ls(regexp = "ndsi") %>%
+  file_delete()
+
+# Filtering deleted files
+covariates[["cations"]] <- covariates$cations %>%
+  filter( file_exists(path_wd(.$file, ext = "sgrd")) )
+```
+
+Resumen:
+
+* Remarca las zonas con vegetación y por oposición también las zonas de suelos desnudos, pero sin destacar ninguna característica en particular.
+Al no encontrar un aporte de información razonable, se decide desechar su uso.
+
+
+
+## Geles (*Gels*)
+
+### SWIR I/II Ratio. Clay <*gels*>
+
+Ratio entre las bandas 5 y 7 de Landsat 5 Thematic Mapper, que resalta las áreas de mayor retención de agua que se relacionan con arcillas (TM) [Roecker et al. in: @Boettinger2010DigitalSoilMapping, pp. 369-384].
+Según los datos de los sensores del satélite, dichas bandas [corresponden con las del SWIR][clay].
+
+[clay]: <https://www.indexdatabase.de/db/i-single.php?id=204>
+ 
+$$\frac{SWIR1}{SWIR2}$$ 
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["gels"]] <- tribble(
+  ~covar, ~descr,
+  "clay", "SWIR I/II Ratio. Clay"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "gels", tolower(covar) ) )
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$gels$file[1]))
+```
+
+```{r}
+# ---- Run-time: 15 s
+bands <- sources %>%
+  filter(src_id == "rs" & band_id %in% c(11, 12) ) %>% # Sentinel 2A: SWIR1, SWIR2
+  arrange(band_id) %>%
+  select(file) %>%
+  flatten_chr() %>%
+  paste0(collapse = ";")
+  
+saga <- if ( file_exists(path_wd(filter(covariates$gels, covar == "clay")$file, ext = "sgrd")) == FALSE ) {
+  rsaga.geoprocessor(lib = "grid_calculus", module = 1, # Grid Calculator
+                     param = list(GRIDS = bands, # 1. SWIR1, 2. SWIR2
+                                  # Outputs
+                                  RESULT = path_wd(filter(covariates$gels, covar == "clay")$file, ext = "sdat"),
+                                  # Options
+                                  RESAMPLING = 4, #  B-Spline Interpolation, default
+                                  FORMULA = "g1 / g2" # SWIR I/II Ratio. Clay
+                     ),
+                     env = env)
+  }
+```
+
+```{r}
+# Deleting unusefull covariables 
+covariates$gels$file[1] %>%
+  path_dir() %>%
+  dir_ls(regexp = tolower("clay")) %>%
+  file_delete()
+
+# Filtering deleted files
+covariates[["gels"]] <- covariates$gels %>%
+  filter( file_exists(path_wd(.$file, ext = "sgrd")) )
+```
+
+Resumen:
+
+* Guarda gran relación **ndsi**, lo cúal tiene sentido porque ambas covariables se basan en un ratio de las mismas bandas.
+Se prefiere el uso de **ndsi** sobre este ratio al ser normalizado y por ello se desecha su uso.
+
+
+
+### Simple Ratio Red/Blue Iron Oxide (IO) <*gels*>
+
+[Ratio entre las regiones roja y azul][iron], que permite detectar óxidos de hierro.
+
+[iron]: <https://www.indexdatabase.de/db/i-single.php?id=203>
+ 
+$$\frac{Red}{Blue}$$ 
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["gels"]] <- tribble(
+  ~covar, ~descr,
+  "io", "Simple Ratio Red/Blue Iron Oxide"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "gels", tolower(covar) ) ) %>%
+  bind_rows(covariates$gels)
+```
+
+```{r}
+# ---- Run-time: 15 s
+bands <- sources %>%
+  filter(src_id == "rs" & band_id %in% c(2, 6) ) %>% # Sentinel 2A: Blue, Ultra Red
+  arrange(band_id) %>%
+  select(file) %>%
+  flatten_chr() %>%
+  paste0(collapse = ";")
+  
+saga <- if ( file_exists(path_wd(filter(covariates$gels, covar == "io")$file, ext = "sgrd")) == FALSE ) {
+  rsaga.geoprocessor(lib = "grid_calculus", module = 1, # Grid Calculator
+                     param = list(GRIDS = bands, # 1. Blue, 2. Ultra Red
+                                  # Outputs
+                                  RESULT = path_wd(filter(covariates$gels, covar == "io")$file, ext = "sdat"),
+                                  # Options
+                                  RESAMPLING = 4, #  B-Spline Interpolation, default
+                                  FORMULA = "g2 / g1" # Simple Ratio Red/Blue Iron Oxide
+                     ),
+                     env = env)
+  }
+```
+
+Alta desviación estandar que se refleja en la necesidad de variar la escala de visualización para lograr un resultado mínimo.
+Destaca especialmente las áreas vegetales, pero también las zonas claras que son potencialmente suelos descabezados que muestran su horizonte de acumulación de carbonatos.
+
+Resumen:
+
+* **io** no detecta especialmente bien los óxidos de hierro, pero sí zonas claras claras que son potencialmente carbonatos cuando se visualiza en escala inversa y se destacan los varoles bajos.
+
+
+
+### Red/SWIR II ratio. Ferrous iron <*gels*>
+
+Ratio entre las bandas 3 y 7 de Landsat 5 Thematic Mapper (TM), que permite detectar hierro ferroso [Roecker et al. in: @Boettinger2010DigitalSoilMapping, pp. 369-384].
+Según los datos de los sensores del satélite, dichas bandas corresponden con las regiones del rojo visible y SWIR lejano.
+ 
+$$\frac{Red}{SWIR 2}$$ 
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["gels"]] <- tribble(
+  ~covar, ~descr,
+  "ironous", "Red/SWIR ratio. Ferrous iron"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "gels", tolower(covar) ) ) %>%
+  bind_rows(covariates$gels)
+```
+
+```{r}
+# ---- Run-time: 15 s
+bands <- sources %>%
+  filter(src_id == "rs" & band_id %in% c(4, 12) ) %>% # Sentinel 2A: red, SWIR2
+  arrange(band_id) %>%
+  select(file) %>%
+  flatten_chr() %>%
+  paste0(collapse = ";")
+  
+saga <- if ( file_exists(path_wd(filter(covariates$gels, covar == "ironous")$file, ext = "sgrd")) == FALSE ) {
+  rsaga.geoprocessor(lib = "grid_calculus", module = 1, # Grid Calculator
+                     param = list(GRIDS = bands, # 1. red, 2. SWIR2
+                                  # Outputs
+                                  RESULT = path_wd(filter(covariates$gels, covar == "ironous")$file, ext = "sdat"),
+                                  # Options
+                                  RESAMPLING = 4, #  B-Spline Interpolation, default
+                                  FORMULA = "g1 / g2" # Red/SWIR ratio. Ferrous iron
+                     ),
+                     env = env)
+  }
+```
+
+Resumen:
+
+* Parece que **ironous** remarca los carbonatos por encima de **io**, creando mayores contrastes y parece que potencialmente podrían complementarse bien.
+
+
+
+### Ferrous and ferric iron index <*gels*>
+
+[Indice de hierro férrico y ferroso][ironic] mediante las bandas SWIR lejano, NIR ~ rojo lejano, verde y rojo [@Rowan2003LithologicMappingMountain; @Henrich2009DevelopmentOnlineIndicesdatabase].
+
+[ironic]: <https://www.indexdatabase.de/db/i-single.php?id=21>
+ 
+$$(SWIR2/NIR)+(G/R)$$ 
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["gels"]] <- tribble(
+  ~covar, ~descr,
+  "ironic", "Ferrous and ferric iron index"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "gels", tolower(covar) ) ) %>%
+  bind_rows(covariates$gels)
+```
+
+```{r}
+# ---- Run-time: 15 s
+bands <- sources %>%
+  filter(src_id == "rs" & band_id %in% c(3, 4, 8, 12) ) %>% # Sentinel 2A: green, red, SWIR1, SWIR2
+  arrange(band_id) %>%
+  select(file) %>%
+  flatten_chr() %>%
+  paste0(collapse = ";")
+  
+saga <- if ( file_exists(path_wd(filter(covariates$gels, covar == "ironic")$file, ext = "sgrd")) == FALSE ) {
+  rsaga.geoprocessor(lib = "grid_calculus", module = 1, # Grid Calculator
+                     param = list(GRIDS = bands, # 1. green, 2. red, 3. NIR, 4. SWIR2
+                                  # Outputs
+                                  RESULT = path_wd(filter(covariates$gels, covar == "ironic")$file, ext = "sdat"),
+                                  # Options
+                                  RESAMPLING = 4, #  B-Spline Interpolation, default
+                                  FORMULA = "(g4 / g3) + (g1 / g2)" # Ferrous and ferric iron index 
+                     ),
+                     env = env)
+  }
+```
+
+Guarda cierta semejanza con el **ci**, pero no remarca solo aquellas zonas rojizas más intensas y que pueden coincidir con los suelos desnudos, sino también considera zonas más oscuras con aparente vegetación de cobertura. 
+Por otro lado, la construcción del índice es muy rara, pues permite que con valores muy diferentes de relación SWIR y R/G se obtengan valores semejantes.
+Esto podría tener relación con la interpretación poco clara que se ha encontrado.
+Por este motivo, se desecha como covariable.
+
+```{r}
+# Deleting unusefull covariables 
+covariates$gels$file[1] %>%
+  path_dir() %>%
+  dir_ls(regexp = "ironic") %>%
+  file_delete()
+
+# Filtering deleted files
+covariates[["gels"]] <- covariates$gels %>%
+  filter( file_exists(path_wd(.$file, ext = "sgrd")) )
+```
+
+Resumen:
+
+* Guarda cierta semejanza con el **ci**, pero no remarca solo aquellas zonas rojizas más intensas y que pueden coincidir con los suelos desnudos, sino también considera zonas más oscuras con aparente vegetación de cobertura. 
+
+
+
+
+### SWIR I/NIR ratio. Ferric oxides <*gels*>
+
+[Ratio entre SWIR y NIR][ironox], que permite detectar óxidos de hierro.
+
+[ironox]: <https://www.indexdatabase.de/db/i-single.php?id=20>
+
+$$\frac{SWIR 1}{NIR}$$ 
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["gels"]] <- tribble(
+  ~covar, ~descr,
+  "ironox", "SWIR/NIR ratio. Ferric iron"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "gels", tolower(covar) ) ) %>%
+  bind_rows(covariates$gels)
+```
+
+```{r}
+# ---- Run-time: 15 s
+bands <- sources %>%
+  filter(src_id == "rs" & band_id %in% c(8, 11) ) %>% # Sentinel 2A: NIR, SWIR I
+  arrange(band_id) %>%
+  select(file) %>%
+  flatten_chr() %>%
+  paste0(collapse = ";")
+  
+saga <- if ( file_exists(path_wd(filter(covariates$gels, covar == "ironox")$file, ext = "sgrd")) == FALSE ) {
+  rsaga.geoprocessor(lib = "grid_calculus", module = 1, # Grid Calculator
+                     param = list(GRIDS = bands, # 1. NIR, 2. SWIR I
+                                  # Outputs
+                                  RESULT = path_wd(filter(covariates$gels, covar == "ironox")$file, ext = "sdat"),
+                                  # Options
+                                  RESAMPLING = 4, #  B-Spline Interpolation, default
+                                  FORMULA = "g2 / g1" # SWIR I /NIR ratio. Ferric oxides
+                     ),
+                     env = env)
+  }
+```
+
+Resumen de variables:
+
+* Cierta semejanza con con **ironic**, si bien más suavizado. 
+No se percibe correlación directa con una característica edafológica.
+* Potencial variable a ser descartada según su correlación.
+
+
+
+### Inverse SWIR II/I ratio. Ferrous silicates <*gels*>
+
+[Ratio inverso entre las bandas SWIR II/I][ironsil], que permite detectar silicatos de hierro.
+
+[ironsil]: <https://www.indexdatabase.de/db/i-single.php?id=22>
+
+$$\frac{SWIR 2}{SWIR 1}$$ 
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["gels"]] <- tribble(
+  ~covar, ~descr,
+  "ironsil", "Inverse SWIR II/I ratio. Ferrous silicates"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "gels", tolower(covar) ) ) %>%
+  bind_rows(covariates$gels)
+```
+
+```{r}
+# ---- Run-time: 15 s
+bands <- sources %>%
+  filter(src_id == "rs" & band_id %in% c(11, 12) ) %>% # Sentinel 2A: SWIR1, SWIR2
+  arrange(band_id) %>%
+  select(file) %>%
+  flatten_chr() %>%
+  paste0(collapse = ";")
+  
+saga <- if ( file_exists(path_wd(filter(covariates$gels, covar == "ironsil")$file, ext = "sgrd")) == FALSE ) {
+  rsaga.geoprocessor(lib = "grid_calculus", module = 1, # Grid Calculator
+                     param = list(GRIDS = bands, # 1. SWIR1, 2. SWIR2
+                                  # Outputs
+                                  RESULT = path_wd(filter(covariates$gels, covar == "ironsil")$file, ext = "sdat"),
+                                  # Options
+                                  RESAMPLING = 4, #  B-Spline Interpolation, default
+                                  FORMULA = "g2 / g1" # Inverse SWIR II/I ratio. Ferrous silicates
+                     ),
+                     env = env)
+  }
+```
+
+Resumen.
+
+* **ironsil** facilita la interpretación de la zona noroeste, sin que se consiga encontrar una relación material clara.
+
+
+
+### Salinity Index (SCI) <*gels*>
+
+[Índice de salinidad del suelo][salinity] mediante una fórmula de normalización entre las bandas SWIR I y NIR [@Al-Khaier2003SoilSalinityDetection].
+
+[salinity]: <https://www.indexdatabase.de/db/i-single.php?id=88>
+
+$$\frac{NIR-SWIR 1}{SWIR 1+NIR}$$ 
+
+```{r}
+# Summary of covariates to be created to covariates list
+covariates[["gels"]] <- tribble(
+  ~covar, ~descr,
+  "si", "Salinity Index"
+  ) %>%
+  mutate(file = path( "gis", "covariates", "gels", tolower(covar) ) ) %>%
+  bind_rows(covariates$gels)
+```
+
+```{r}
+# ---- Run-time: 15 s
+bands <- sources %>%
+  filter(src_id == "rs" & band_id %in% c(8, 11) ) %>% # Sentinel 2A: NIR, SWIR1
+  arrange(band_id) %>%
+  select(file) %>%
+  flatten_chr() %>%
+  paste0(collapse = ";")
+  
+saga <- if ( file_exists(path_wd(filter(covariates$gels, covar == "sci")$file, ext = "sgrd")) == FALSE ) {
+  rsaga.geoprocessor(lib = "grid_calculus", module = 1, # Grid Calculator
+                     param = list(GRIDS = bands, # 1. NIR, 2. SWIR1
+                                  # Outputs
+                                  RESULT = path_wd(filter(covariates$gels, covar == "sci")$file, ext = "sdat"),
+                                  # Options
+                                  RESAMPLING = 4, #  B-Spline Interpolation, default
+                                  FORMULA = "(g1 - g2) / (g1 + g2)" # Salinity Index
+                     ),
+                     env = env)
+  }
+```
+
+Resumen:
+
+* **si** sobresalta zonas de suelos más desnudos y contrasta la vegetación.
+Permite señalar zonas de suelos rojizos más intensos.
+* Potencialmente descartable por el mismo razonamiento que **NDSI**. 
+Se aceptaría su uso según el equilibrio entre bandas de geomorfometría y teledetección.
+
+
+## Interrelación de covariables
+
+Se ha calculado un amplio rango de índices aunque las bandas y las relaciones establecidas son bastante similares. 
+Esto se observa en la comparación entre **sci** y **ironox** o de **ironsil** con **clay**.
+
+En el primer caso se utiliza las mismas bandas de partida y su patrón visual es prácticamente idéntico, donde **sci** se basa en una diferencia normalizada en el rango -1 ~ 1 que facilita su comparativa, 
+Por este motivo se opta por mantener **sci** y deshechar **ironox**.
+
+```{r}
+# Deleting unusefull covariables 
+covariates$gels$file[1] %>%
+  path_dir() %>%
+  dir_ls(regexp = "ironox") %>%
+  file_delete()
+```
+
+**ironsil** y **clay** son ratios con las mismas bandas, siendo el primero el inverso del segundo.
+En su momento ya se eliminó **clay** por su similitud con **ndsi**, y por el mismo razonamiento, se desecha **ironsil**.
+
+```{r}
+# Deleting unusefull covariables 
+covariates$gels$file[1] %>%
+  path_dir() %>%
+  dir_ls(regexp = "ironsil") %>%
+  file_delete()
+```
+
+```{r}
+# Filtering deleted files
+covariates[["gels"]] <- covariates$gels %>%
+  filter( file_exists(path_wd(.$file, ext = "sgrd")) )
+```
+
+De forma semejante ocurre al binomio **sci** ~ **ironox** ocurre entre **ri** y **co3**, siendo este último el ratio simple y el primero la versión de diferencia normalizada.
+Manteniendo el criterio establecido, se retira **co3** de la lista de covariables.
+
+```{r}
+# Deleting unusefull covariables 
+covariates$cations$file[1] %>%
+  path_dir() %>%
+  dir_ls(regexp = "co3") %>%
+  file_delete()
+```
+
+El grupo de cálculo *cations* se queda vacío, por lo que se elimina.
+
+```{r}
+covariates$cations$file[1] %>%
+  path_dir() %>%
+  dir_delete()
+
+covariates[["cations"]] <- NULL
+```
+
+
+```{r}
+saveRDS(object = covariates, file = path(proj$res, "covariates_list", ext = "rds") )
+```
+
+
+
+
+
+# Cohesión de los identificadores de las covariables
+
+A la hora de trabajar con todas las covariables en conjunto es necesario disponer de un identificador único específico para cada una de ellas. 
+
+
+```{r, warning=FALSE}
+covariates <- readRDS(file = path(proj$res, "covariates_list", ext = "rds") ) 
+```
+
+## Filtrado
+
+Se desechan aquellas covariables intermediarias que no guardan especial valor físico.
+
+```{r}
+# ---- SEGMENTS
+# Deleting unusefull covariables 
+covariates$channel$file[1] %>%
+  path_dir() %>%
+  dir_ls(regexp = tolower("segments")) %>%
+  file_delete()
+
+# Filtering deleted files
+covariates[["channel"]] <- covariates$channel %>%
+  filter( file_exists(path_wd(.$file, ext = "sgrd")) )
+```
+
+```{r}
+# ---- FLOW
+# Deleting unusefull covariables 
+covariates$flow$file[1] %>%
+  path_dir() %>%
+  dir_delete()
+
+# Filtering deleted files
+covariates[["flow"]] <- NULL
+```
+
+```{r}
+# ---- SCA
+# Deleting unusefull covariables 
+covariates$sca$file[1] %>%
+  path_dir() %>%
+  dir_delete()
+
+# Filtering deleted files
+covariates[["sca"]] <- NULL
+```
+
+
+
+## Unificación
+
+Se opta por el atributo *covar* en *minúscula* como dicho identificador.
+
+```{r, warning=FALSE}
+# Collecting all covariables in the same tibble & renaming covariables to lower case
+covariates <- covariates %>%
+  bind_rows(.id = "module") %>%
+  mutate(covar = tolower(covar))
+```
+
+## Duplicados 
+
+Antes de ser utilizado, es necesario comprobar que no existen duplicados en los identificadores.
+
+```{r}
+covariates %>%
+  group_by(covar) %>%
+  summarise(count = n()) %>%
+  filter(count > 1)
+```
+
+Se encuentra que hay ciertas covariables que compartían nombre, en concreto **slope** y **twi**.
+
+```{r}
+covariates %>%
+  filter(covar %in% c("slope", "twi"))
+```
+
+Son covariables que provienen de módulos de SAGA diferentes, aunque son denominadas igual por el paquete GIS.
+Se decide moficiar los nombres provenientes del módulo *stwi* y convertirlos en únicos.
+
+```{r, warning=FALSE}
+covariates <- covariates %>%
+  filter(module == "stwi") %>%
+  mutate(covar = paste0("s", covar)) %>% # New names for covariates
+  bind_rows( filter(covariates, ! module == "stwi") ) # Combining after filtering old module names
+```
+
+## Homogeneización
+
+Por otro lado, se varían ciertos nombres para homogeneizar las nomenclaturas y su organización dentro de la base de datos.
+Así, por ejemplo, todas las curvaturas empezaran por *c* y no existirán prefijos que denominen formatos de archivos, como *grd*.
+
+```{r, warning=FALSE}
+# Curvatures 
+covariates <- covariates %>%
+  filter(module == "slope") %>%
+  mutate(covar = str_replace(covar, "_", "")) %>% # New names for covariates
+  bind_rows( filter(covariates, ! module == "slope") ) # Combining after filtering
+
+covariates <- covariates %>%
+  filter(module == "wood", str_detect(descr, "Curvature")) %>%
+  mutate(covar = paste0("c", str_sub(covar, start = 0, end = -2))) %>% # New names for covariates
+  bind_rows( filter(covariates, ! (module == "wood" & str_detect(descr, "Curvature")) )) # Combining after filtering
+```
+
+```{r, warning=FALSE}
+# Radiation
+covariates <- covariates %>%
+  filter(module == "insolation") %>%
+  mutate(covar = paste0("r", str_replace_all(covar, "grd_", "")) ) %>% # New names for covariates
+  bind_rows( filter(covariates, ! (module == "insolation")) ) # Combining after filtering
+```
+
+```{r, warning=FALSE}
+# Downslope
+covariates <- covariates %>%
+  filter(module == "downslope" & str_detect(covar, "gradient")) %>%
+  mutate(covar = "downslope") %>% # New names for covariates
+  bind_rows( filter(covariates, ! (module == "downslope" & str_detect(covar, "gradient")) )) # Combining after filtering
+
+covariates <- covariates %>%
+  filter(module == "downslope" & str_detect(covar, "diff")) %>%
+  mutate(covar = "downdiff") %>% # New names for covariates
+  bind_rows( filter(covariates, ! (module == "downslope" & str_detect(covar, "diff")) )) # Combining after filtering 
+```
+
+```{r, warning=FALSE}
+# Distance 
+covariates <- covariates %>%
+  filter(module == "channel" & str_detect(covar, "distance")) %>%
+  mutate(covar = "distv") %>% # New names for covariates
+  bind_rows( filter(covariates, ! (module == "channel" & str_detect(covar, "distance")) )) # Combining after filtering
+```
+
+```{r, warning=FALSE}
+# Protection
+covariates <- covariates %>%
+  filter(module == "protection") %>%
+  mutate(covar = "mpi") %>% # New names for covariates
+  bind_rows( filter(covariates, ! (module == "protection") )) # Combining after filtering 
+```
+
+```{r, warning=FALSE}
+covariates <- covariates %>% 
+  arrange(covar)
+```
+
+```{r, warning=FALSE}
+saveRDS(object = covariates, file = path(proj$res, "covariates", ext = "rds") )
+```
+
+
+
+
+
+# Reducción de la extensión de las covariables
+
+Las covariables derivadas tienen una extesión igual a las fuentes de los datos, es decir, a la región de trabajo mínima que consideraba el efecto de contaminación de bordes. 
+Sin embargo, el uso de las covariables se dará exclusivamente dentro del área del proyecto, por lo que una región amplia que no será efectivamente útil. 
+Por eso, se decide reducir nuevamente su extensión a una superficie que cubre a un buffer de 500 m. sobre el límite del proyecto.
+Esto permitirá además asegurar que la extensión de todas las covariables será equivalente, incluyendo los píxeles limítrofes y facilitará futuras manipulaciones.
+
+## Nueva cobertura
+
+La nueva cobertura supone la superficie mínima que recoge un *buffer* de 500 m. sobre la región del proyecto.
+La elección de este valor es subjetiva, admitiendo cierta variación. 
+Las consideraciones de partida han sido reducir el tamaño de los rasters y mantener un cierto margen de manejo y error.
+
+```{sql, connection=con}
+CREATE MATERIALIZED VIEW IF NOT EXISTS csm.cover AS
+SELECT ROW_NUMBER() OVER() AS sid, ST_ConvexHull( ST_Buffer(geom, 500)) AS geom 
+  FROM csm.region
+```
+
+```{sql, connection=con}
+BEGIN ;
+
+CREATE INDEX ON csm.cover USING gist (geom) ;
+COMMENT ON MATERIALIZED VIEW csm.mask IS 'Kept region after raster processing made with a 500 m buffer. / DO Campo de Borja' ;
+
+COMMIT ;
+```
+
+## Reducción a la cobertura definitiva
+
+```{r}
+covariates <- covariates %>% 
+  mutate(final = path("gis", "covariates", "final", covar))
+
+## Create directory to hold new files
+dir_create(path_dir(covariates$final[1]))
+```
+
+```{r}
+# Getting the mask of the project region of interest
+glue('pgsql2shp -f {path_wd("gis", "covariates", "cover", ext = "shp")} {pgsql} ',
+     double_quote('SELECT * FROM cover'),
+     pgsql = glue("-h localhost -u {keyring::key_list(\"psql-su\")[1,2]} -P {keyring::key_get(\"psql-su\")} dicsm")) %>% system()
+```
+
+```{r}
+# Clipping bands with the mask
+saga <- foreach(b = seq_along(covariates$covar), .final = function(l) setNames(l, covariates$covar)) %dopar% {
+  if ( file_exists(path_wd(covariates$final[[b]], ext = "sgrd")) == FALSE ) {
+      rsaga.geoprocessor(lib = "shapes_grid", module = 7, # Clip Grid with Polygon
+                   param = list(INPUT = path_wd(covariates$file[[b]], ext = "sdat"), 
+                                POLYGONS = path_wd("gis", "covariates", "cover", ext = "shp"),
+                                OUTPUT = path_wd(covariates$final[[b]], ext = "sdat"), 
+                                EXTENT = "3" ), # Polygon extent
+                   env = env)
+    }
+}
+```
+
+
+```{r, warning=FALSE}
+saveRDS(object = covariates, file = path(proj$res, "covariates", ext = "rds") )
+```
+
+
+
+# Registro en la base de datos
+
+Con el cálculo y análisis inicial completados, se registran las covariables en la base de datos para su posterior uso durante el resto del estudio.
+
+**MODIFICATION AFTER THE RELEASE**
+
+```{r}
+covariates <- covariates %>% 
+  mutate(covar = ifelse(str_detect(covar, "downdiff"), "ddiff", covar)) %>% 
+  mutate(covar = ifelse(str_detect(covar, "downslope"), "dwslope", covar)) %>% 
+  mutate(covar = ifelse(str_detect(covar, "sslope"), "upslope", covar)) %>% 
+  mutate(covar = ifelse(str_detect(covar, "easterness"), "east", covar)) %>% 
+  mutate(covar = ifelse(str_detect(covar, "eastslope"), "eastsp", covar)) %>% 
+  mutate(covar = ifelse(str_detect(covar, "northerness"), "north", covar)) %>% 
+  mutate(covar = ifelse(str_detect(covar, "northslope"), "northsp", covar)) %>%
+  mutate(covar = ifelse(str_detect(covar, "ironous"), "feous", covar)) %>% 
+  mutate(covar = ifelse(str_detect(covar, "sarea_mod"), "ssca", covar)) %>% 
+  mutate(covar = ifelse(str_detect(covar, "sarea"), "sca", covar)) %>% 
+  # New Salinity Index
+  mutate(covar = ifelse(str_detect(covar, "sci"), "si", covar)) %>% 
+  mutate(descr = ifelse(str_detect(covar, "si"), "Salinity Index", descr)) %>% 
+  mutate(final = ifelse(str_detect(covar, "si"), str_replace(final, "sci", "si"), final))
+```
+
+```{r}
+covariates <- covariates %>% 
+  mutate(data = str_replace(final, "gis/covariates/final/", "data/covariates/"))
+```
+
+
+## Introducción de los metadatos
+
+Para realizar el registro de los diferentes rasters es necesario primero nombrar y describir las covariables.
+De esta manera se generan automáticamente las tablas que acogerán los rasters gracias al sistema desarrollado en la base de datos, al igual que ocurría con las fuentes de datos
+
+```{r, warning=FALSE}
+covariates <- readRDS(file = path(proj$res, "covariates", ext = "rds") ) 
+```
+
+```{r}
+dbWriteTable(con, Id(schema = "covars", table = "covar"), 
+             select(covariates, covar_id = covar, descr), append=TRUE )
+```
+
+
+## Traducción del formato
+
+Las covariables procesadas deben trasladarse a su localización definitiva en el directorio `data` antes de ser registradas definitivamente en la base de datos.
+Se considera que las covariables no van a tener nuevos usos de procesamiento y que existen otro formato estándar para el almacenamiento, *GeoTiff*, que supondría una reducción del número de archivos a manejar y que facilitaría su consulta.
+Por eso, se aprovecha el traslado a la nueva localización para *traducir* las imágenes sin perjuicio en su calidad.
+
+```{r}
+covariates <- covariates %>% 
+  mutate(data = path("data", "covariates", covar))
+
+# Convert every selected raster band to SAGA format for processing
+saga <- foreach(r = seq_along(covariates$covar), .final = function(l) setNames(l, covariates$covar) ) %do% {
+  if ( file_exists(path_wd(covariates$data[[r]], ext = "sgrd")) == FALSE ) {
+    glue('gdal_translate -of GTiff -a_srs EPSG:25830 {final} {data}',
+         final = path_wd(covariates$final[[r]], ext = "sdat"),
+         data = path_wd(covariates$data[[r]], ext = "tiff") ) %>% 
+      system()
+  }
+}
+```
+
+
+## Registro de las covariables
+
+Cada covariable será alojada en la base de datos en una tabla independiente, que tomará su estructura de una tabla modelo.
+Esto permitirá asegurar la consistencia entre todas las tablas de covariables, y, en el futuro, que sean consultadas en conjunto fácilmente.
+
+```{r, eval=FALSE}
+# Registering rasters
+pgis <- foreach(r = seq_along(covariates$covar), .final = function(l) setNames(l, covariates$covar)) %do% {
+  glue('raster2pgsql -a -C -r -s 25830 -t 100x100 -P -R -I -Y {data} covars.{tb} | psql -h localhost -U {user} -d dicsm',
+       data = path_wd(covariates$data[[r]], ext = "tiff"),
+       tb = covariates$covar[[r]],
+       user = keyring::key_list("psql-su")[1,2] ) %>% 
+    system()
+}
+```
+
+
+
+## Revisión final
+
+Finalmente, se consultan todas las bandas registradas en la base de datos con su descripción a modo de revisión final. 
+
+```{sql, connection=con}
+SELECT * 
+FROM public.raster_columns
+WHERE r_table_schema LIKE 'covars'
+ORDER BY r_table_name
+```
+
+
+
+
+# Limpieza
+
+Tras el almacenamiento de las bandas procesadas en el directorio definitivo y su registro en la base de datos, se eliminan todos los archivos intermedios generados durante el tratamiento.
+
+```{r}
+# Temporary directory in _gis_
+dir_delete(path_wd("gis", "covariates"))
+```
+
+
+
+# Conclusión
+
+Se han calculado un total de **38 covariables** pertenecientes a diferentes categorías, *geomorfometría* y *teledetección*, utilizando para ello el paquete SIG **SAGA**.
+Dichas covariables serán las empleadas durante el resto del estudio para la partición por clasificación de las SMU.
+
+
+
+
+
+# Bibliografía
+
+::: {#refs}
+:::

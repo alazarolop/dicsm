@@ -1,0 +1,889 @@
+---
+title: "Covariates analysis for DiCSM: a project scale analysis"
+author: "Alberto Lázaro-López"
+date: "21th Oct 2019"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+abstract: Several covariates have been calculated, but just some of them are really adjusted to landforms of the project location. This document studies those previously calculated covariates in order to understand its relationships and its material meaning. This will allow to filter the most relevant at project scale.  
+bibliography: ../ref/dicsm.bib
+---
+
+```{r core, include=FALSE }
+for (.i in paste0("src/", c("spatial", "dbms", "core", "raster"), ".R" ) ) source(.i)
+
+proj <- dir_ls(regexp = "covar") %>% 
+  .proj_subdir()
+```
+
+
+# Introducción
+
+Las covariables son mediciones derivadas a partir de datos de la superficie de La Tierra que representan parámetros ambientales que abarcan un amplio rango, desde variables morfométricas del relieve hasta índices bioclimáticos.
+Aquellas que han sido calculadas en el projecto responden a las principales opciones disponibles en los diferentes módulos de los paquetes SIG, fundamentalmente **SAGA**. 
+
+Este conjunto es muy heterogéneo, incluyendo variables muy similares entre sí, pero obtenidas por diferentes métodos, y cuya selección no responde a ningún criterio espacial ni edafológico a priori.
+Por este motivo, es necesario efectuar un análisis y filtrado ajustada a la región de trabajo y las características del proyecto que permita destacar aquellas covariables que potencialmente mejor describen y que aportan más información del área de estudio.
+
+Con este objetivo, se desarrolla un proceso de estudio y selección basado en el análisis de la correlación entre covariables, su calidad visual y su relación con fenómenos materiales.
+Este método toma en consideración las conclusiones de los estudios de tratamiento y manejo de rastérs así como de cálculo de correlaciones entre ellos que han sido elaborados en el marco del projecto.
+
+
+
+# Covariables 
+
+```{sql, connection=con, output.var="covariates" }
+-- List of all available covariates
+SELECT DISTINCT tableoid::regclass::varchar AS covar_id, ST_BandPath(rast) AS path
+FROM _covar_rast
+ORDER BY covar_id
+```
+
+## Denominación y descripción
+
+Han sido calculadas **38** covariables, cuya descripción y rango de valores son:
+
+1. **aspect**  
+  Dirección (orientación) de la pendiente máxima.
+  Es una variable circular entre 0º y 360º, donde 0º marca el N y, en sentido horario, 90º el este, 180º el sur y el 270º el oeste.
+
+1. **ccros**  
+  Curvatura definida por la intersección del plano normal a la superficie y la tangente al contorno (*cross-sectional curvature*).
+  Se trata de una medida de la convergencia del flujo de elementos a mayor cota por gravedad y lateralmente en los suelos cuando los valores negativos y divergente en los positivos. 
+  Su sentido geomorfológico se relaciona con la presencia de crestas y valles estrechos [@Florinsky2017IllustratedIntroductionGeneral].
+  Su método de cálculo integra mediciones a múltiples escalas.
+
+1. **ci**  
+  Índice de coloración (*Coloration Index*), que relaciona la región del rojo y la del azul.
+  Parece guardar cierta correlación con las zonas donde hay suelos descabezados cuyos horizontes arcillosos están en la superficie, especialmente aquellos más intensos, que quedan destacadas sobre el resto sin crear zonas muy contrastadas.
+  
+1. **clong**  
+  Curvatura con la intersección del plano definido por la normal a la superficie y la máxima pendiente (*longitudinal curvature*). 
+  Es una medida de aceleración relativa de los flujos de materiales y energía cuando los valores son positivos y de desaceleración cuando son negativos.
+  Geomorfológicamente, permite revelar terrazas y escarpes [@Florinsky2017IllustratedIntroductionGeneral].
+  Su método de cálculo integra mediciones a múltiples escalas.
+  
+1. **cmaxi**  
+  Máxima curvatura, en cualquier dirección (*maximal curvature*).
+  Geomorfológicamente, valores positivos corresponden con unidades elongadas convexas, como crestas, mientras que valores negativos se relacionan con unidades cóncavas [@Florinsky2017IllustratedIntroductionGeneral].
+  Su método de cálculo integra mediciones a múltiples escalas.
+  
+1. **cmini**  
+  Mínima curvatura, en cualquier diredcción (*minimal curvature*).
+  Geomorfológicamente, valores positivos corresponden con unidades convexas, mientras que valores negativos se relacionan con unidades cóncavas elongadas como depresiones o valles [@Florinsky2017IllustratedIntroductionGeneral].
+  Su método de cálculo integra mediciones a múltiples escalas.
+
+1. **cplan**  
+  Curvatura con la intersección del plano XY (*plan curvature*). 
+  Es una medida de la divergencia entre líneas de flujos.
+  Valores positivos describen convergencia, mientras valores negativos muestra divergencia [@Florinsky2017IllustratedIntroductionGeneral].
+  Su método de cálculo integra mediciones a múltiples escalas.
+   
+1. **cprof**  
+  Curvatura con la intersección del plano definido por el eje Z y la máxima pendiente (*profile curvature*).
+  Valores positivos describen perfiles convexos y negativos perfiles cóncavos.
+  Su método de cálculo integra mediciones a múltiples escalas.
+  
+1. **ctang**  
+  Similar a curvatura *cross-sectional* (*tangential curvature*).
+  Está calculada a través de un método sencillo a una única escala.
+  
+1. **dah**  
+  Medida del calentamiento diurno relativo en función de la orientación de máxima insolación *Diurnal Anisotropic Heat*.
+  
+1. **distv**
+  Distancia vertical a la red de drenacje. 
+  La diferencia de altura ayuda a identificar áreas inferiores y, potencialmente, de mayor acumulación de materiales.
+  
+1. **downdiff**
+  Índice para la cuantificación del control de la morfología de la pendiente sobre la red de drenaje local. 
+  Resulta de la diferencia entre el índice **dwslope** y la pendiente local, *slope*.
+
+1. **downslope**
+Cálculo de un nuevo índice topográfico para cuantificar el control de la pendiente en el drenaje local. 
+
+  Índice para la cuantificación del control de la morfología de la pendiente sobre la red de drenaje local. 
+  Los valores tienden a ser bajos para perfiles cóncavos y altos para perfiles cónvexos.
+  Este índice está menos afectados por la resolución del MDT que otros índices locales [@Hjerdt2004NewTopographicIndex]. 
+  Expressed as a gradient, tanad = d/Ld, values tend to be lower on concave slope profiles and higher on convex slope profiles compared with the local gradient, tanb.
+  The dwslope index reaches a minimum at the foot of the slope.
+  
+1. **easterness**
+  Estitud, variable lineal oeste-este sobre la orientación de la máxima pendiente.
+  El rango de valores es de 1, oeste, a -1, este. 
+  
+1. **eastslope**
+  Interacción entre estitud y la pendiente, de forma que las zonas de mayor pendiente den mayor importancia a la variable.
+  
+1. **io**
+  Ratio simple entre las regiones roja y azul. 
+  Permite detectar óxidos de hierro y destaca especialmente las áreas vegetales, así como también las zonas claras que serían potencialmente suelos descabezados que muestran su horizonte de acumulación de carbonatos.
+
+1. **feous**
+  Ratio entre las regiones del rojo y del SWIR.
+  Permite detectar hierro ferroso y remarca los carbonatos por encima de **io**, creando mayores contrastes y parece que potencialmente podrían complementarse bien.
+
+1. **lst**
+  Temperatura superficial en función de la altitud (*Land Surface Temperature*).
+  
+1. **mpi**
+  Índice de protección que evalúa el relive circundante hasta una distancia dada (*Morphometric Protection index*).
+  Mide la relación entre el relieve y la distancia horizonal t xpresa el grado de cerramiento de una ubicación.
+  Los valores positivos, que expresan apertura sobre la superficie, son altos para las formas convexas.
+
+1. **mrrtf**
+  (*Multiresolution Index of Ridge Top Flatness*, MRRTF).
+  Este índice marca las zonas altas en pendiente, mayores cuanto mayor sea el valor.
+  
+1. **mrvbf**
+  (*Multiresolution Index of Valley Bottom Flatness*, MRVBF).
+   Este índice considera la elevación relativa y la pendiente para marcar muy bien con valores positivos las zonas más bajas y de llanura, señalando otencialmente zonas de mayor acumulación de materiales y humedad.
+   Es complementario a **MRRTF**, predominando el carácter del índice de mayor valor para un mismo pixel.
+   En contraste con los mapas de pendientes, [@Gallant2003MultiresolutionIndexValley].
+
+1. **northerness**
+  Nortitud, variable lineal norte-sur sobre la orientación de la máxima pendiente.
+  El rango de valores es de 1, norte, a -1, sur 
+
+1. **northslope**
+  Interacción entre estitud y la pendiente, de forma que las zonas de mayor pendiente den mayor importancia a la variable.
+
+1. **rdiffus**
+  Radiación solar difusa potencial (*Diffuse Potential Incoming Solar Radiation*).
+  
+1. **rdirect**
+  Radiación solar directa potencial (*Direct Potential Incoming Solar Radiation*)
+  
+1. **ri**
+  Indice de rojez mediante una fórmula de normalization entre las bandas verde y roja (*Redness Index*).
+  Marca zonas boscosas y de aguas, y en general otorga valores bajos a zonas con vegetación frente a suelos desnudos.
+  Quizás por eso destaca las zonas de arcillas, pero sin contrastarlas con las de carbonatos en superficie.
+  
+1. **sarea**
+  Área de captación estándar (*Standard catchment area*), medida por la unidad de celda de la malla del MDT (m.)
+  
+1. **sarea_mod**
+  Área de captación modificada para el algorítmo de Índice Topográfico de Humedad de SAGA (*Standard catchment area*), con iguales atributos que el área de captación estándar.
+  
+1. **si**
+  Denominado índice de salinidad del suelo mediante una fórmula de normalización entre las bandas SWIR I y NIR (*Salinity Index*).
+  Sobresalta zonas de suelos más desnudos y contrasta la vegetación. Permite señalar zonas de suelos rojizos más intensos.
+
+1. **slope**
+  Pendiente medida en grados (*Slope*).
+  
+1. **spi**
+  Índice de potencia de flujo basado en la pendiente en el área de captación estándar (*Stream Power Index*).
+  Mayor valor a mayor pendiente y área de captación.
+
+1. **upslope**
+  Pendiente en el área de captación modificada del Índice Topográfico de Humedad de SAGA (*Catchment Slope*).
+  The catchment slope output grid of the Catchment Area (Parallel) module is computed like this: for each cell, the local slope is calculated using the approach of Zevenbergen & Thorne. These slope values are accumulated dwslope. Finally, for each cell the accumulated slope values are divided by the derived catchment area of the cell. The unit of the grid are radians.
+
+1. **stwi**
+  Índice Topográfico de Humedad de SAGA (*Topographic Wetness Index by SAGA*).
+  Similar al Índice Topográfico de Humedad, pero basado en un área de captación modificada.
+  Señala el potencial de humedad, mayor para las zonas bajas y de acumulación.
+
+1. **tcilow**
+  Índice de clasificación del relieve para zonas bajas (*Terrain Classification Index for Lowlands*).
+  Representa geoformas en un enotrno local yal canza valores en un rango entre 0 y 1.
+  Valores mayores se corresonderían con las zonas más bajas. 
+  
+1. **tpi**
+  Diferencia de la altitud central frente a la media del área de la ventana de análisis (*Multi-Scale Topographic Position Index, TPI*).
+  Esta implementación lo calcula a diferentes escalas y, posteriormente, los integra.
+   
+1. **trasp**
+  Índice de orientación de la insolación(*Solar-radiation Aspect Index*).
+  Transformación lineal de la variable orientación de 0 a 1, donde el máximo valor lo recibe la orientación más cálida y seca (típicamente S-SO).
+
+1. **tri**
+  Índice de rugosidad del terreno (*Terrain Ruggedness Index*).
+  Supone la media de la variación de altitud entre los puntos dentro de la ventana de análisis y el valor central.
+
+1. **twi**
+  Índice Topográfico de Humedad clásico basado en el área de captación específica (*Topographic Wetness Index*).
+  Con igual interpretación que el Índice Topográfico de Humedad de SAGA.
+  
+
+## Matríz de covariables
+
+Con la finalidad de elaborar los análisis sobre el conjunto de las covariables, se reunen los datos de todas las variables en una única matríz.
+Debido al gran tamaño que dicha matríz adquiriría (~10GB), es necesario reducirla a una subselección con el mismo número de columnas, pero con un tercio del número de filas originales aproximadamente. 
+Esto sería suficiente para que los cálculos fueran completados, mantuviesen su sentido y se lograsen en un menor tiempo.
+Además, se siguen las indicaciones del anexo de *alto rendimiento* y el [método sugerido para traspasar la información desde los rasters][bigrast] y se construye la matríz sobre un archivo ligado a un objeto de R, lo que facilitará la paralelización y el reducirá el consumo de memoria en los cálculos notablemente.
+
+[bigrast](https://stackoverflow.com/questions/47623934/creation-of-big-matrix-object-from-rasterbrick).
+
+```{r}
+#' There are two options to collect data from raster files: 
+#' 1. Create a raster brick and get values from there as explained in the link.
+#' 2. Load every raster independently and load it later.
+#' The later allows to filter NULL values, and it should be the adopted one. 
+
+if (file_exists(path_wd("gis", "covariates", "covar_sub", ext = "bk"))==FALSE ) {
+  # Create a list of raster layers
+  rastlist <- foreach(r = seq_along(covariates$path), .final = function(l) setNames(l, covariates$covar_id) ) %do% {
+    covariates$path[[r]] %>% 
+      raster()
+  }
+  
+  # All layers have the same extent, so attributes to create the matrix are taken from one of them.
+  pix <- getValues(rastlist[[1]])
+  pix <- pix[! is.na(pix)]
+  
+  cell <- length(pix)
+  cellsz <- as.integer(cell*0.35)
+  
+  
+  # Create big.matrix file
+  dir_create("gis", "covariates")
+  
+  dimcv <- vector(mode = "list")
+  dimcv[[2]] <- toupper(names(rastlist))
+  
+  bigcv <- bigmemory::big.matrix(nrow = cellsz, ncol = length(rastlist),
+                                 type = "double", 
+                                 dimnames = dimcv,
+                                 backingpath = path("gis", "covariates"), 
+                                 backingfile = path("covar_sub", ext = "bk"),
+                                 descriptorfile = path("covar_sub", ext = "desc") )
+  
+  # Sampling scheme
+  smp <- sample(x = 1:cell, size = cellsz, replace = FALSE )
+  
+  # ---- Run-time: ~2 min
+  for(r in seq_along(rastlist)) {
+    pix <- raster::getValues(rastlist[[r]])
+    pix <- pix[! is.na(pix)]
+    pix <- pix[smp]
+    bigcv[, r] <- pix
+    
+    rm(pix)
+  }
+  gc()
+  
+} else {
+  bigcv <- bigmemory::attach.big.matrix( path_wd("gis", "covariates", "covar_sub", ext = "desc") ) 
+}
+```
+
+Comprobación de la matríz.
+
+```{r}
+# Check
+head(bigcv)
+```
+
+
+
+# Cálculos
+
+El método de estudio y selección se basa en la combinación de un análisis cuantitativo y uno visual de las variables. 
+Los indicadores recogidos dentro del primer grupo son la distribución de las variables y la correlación entre pares, para los que se generan los valores y gráficas correspondientes.
+
+## Matríz de gráficas de dispersión por pares
+
+En primer lugar, se calcula la matríz de gráficas de dispersión por pares.
+
+```{r}
+# It's saved as an image in order to get a quicker visualization. 0.02
+set.seed(5432)
+cv <- sample(x = 1:nrow(bigcv), size = as.integer((nrow(bigcv)*0.00001)), replace = FALSE )
+cv <- bigcv[cv, ] 
+
+cv %>% 
+  as.data.frame() %>%
+  GGally::ggpairs(progress = TRUE)
+
+# ---- Run-time: ~8 min.
+ggsave(path(proj$img, "cv_pairs", ext = "png"), fig, width = 28, height = 28)
+```
+
+```{r, warning=FALSE}
+# Resize the image usign Image Magick pack
+glue("convert {img} -resize 25% {img}",
+     img = path(proj$img, "cv_pairs", ext = "png") ) %>%
+  system()
+```
+
+
+## Correlación de Pearson
+
+La **correlación de Pearson** se emplea para descubrir posibles correlaciones lineales entre las variables y su salida serán dos matrices complementarias, una de correlaciones y la otra con los valores *p-values* respectivos
+
+Aprovechando el sistema de **matríces de gran tamaño con soporte en archivo** creado y se paraleliza su cálculo.
+
+```{r}
+# SETTINGS
+## Number of covariates
+nvar <- ncol(bigcv)
+
+## Number of blocks
+nblocks <- NULL
+if( is.null(nblocks) == TRUE )  {
+  nvarblock <- 4L # Max 
+  while( nvar %% nvarblock != 0 ) {
+    nvarblock <- nvarblock - 1L
+  } 
+  nblocks <- as.integer(nvar / nvarblock)
+}
+
+## Allocate variables to blocks
+blocks <- split(1:nvar, rep(1:nblocks, each = nvarblock))
+
+## Combinations of variables
+combs <- arrangements::combinations(1:nblocks, 2, replace = FALSE)
+```
+
+
+```{r}
+bigcor <- function(bigmat, met = "pearson") {
+  # CHECK
+  assertthat::assert_that( met %in% c("pearson", "spearman") )
+  
+  ## METHOD
+  ## Allocation of matrix
+  corr <- matrix(ncol = nvar, nrow = nvar)
+  colnames(corr) <- toupper(covariates$covar_id)
+  rownames(corr) <- toupper(covariates$covar_id)
+  
+  corr <- list("r" = corr, 
+               "P" = corr)
+  
+  ## Calculation of Spearman's Correlation
+  ## ~ 2 minutes
+  cor_res <- foreach( i = 1:nrow(combs) ) %dopar% {
+    cv1 <- blocks[[ combs[i, 1] ]]
+    cv2 <- blocks[[ combs[i, 2] ]]
+  
+    block_cor <- Hmisc::rcorr(bigmat[, c(cv1, cv2) ], 
+                     type = met) # Choosen method
+    
+    # All correlations are calculated between variables and thus replace in combs is FALSE
+    # It's more memory efficient than combining columns, as processing time is almost non-existante. 
+    block_res <- list("cv1" = cv1, "cv2" = cv2, "r" = block_cor$r, "P" = block_cor$P)
+    
+    rm(cv1, cv2, block_mat)
+    gc()
+    
+    block_res
+  }
+  
+  for( i in seq_along(cor_res) ) {
+    cv1 <- cor_res[[i]]$cv1
+    cv2 <- cor_res[[i]]$cv2
+    
+    corr$r[c(cv1, cv2), c(cv1, cv2) ] <- cor_res[[i]]$r
+    corr$P[c(cv1, cv2), c(cv1, cv2) ] <- cor_res[[i]]$P
+  }
+  
+  gc()
+  
+  corr
+}
+```
+
+```{r}
+# Pearson's correlation
+# Function aplication with Pearson
+correlations <- vector(mode = "list")
+
+# ---- Run-time: 1.5 min
+correlations[["pearson"]] <- bigcor(bigcv, "pearson")
+```
+
+```{r}
+saveRDS(correlations, file = path(proj$res, "correlations", ext = "rds") ) 
+```
+
+
+## Correlación de Spearman
+
+También se calula la [correlación de *Spearman*][spearman], que examina la fuerza de las relaciones monotónicas. 
+Se caracterizan porque las dos variables avanzan en la misma dirección, pero no necesariamente al mismo ritmo, es decir, que abarca más allá de las relaciones lineales detectadas a través de la correlación de *Pearson*.
+
+[spearman]: <https://support.minitab.com/en-us/minitab-express/1/help-and-how-to/modeling-statistics/regression/how-to/correlation/interpret-the-results/>
+
+Se considera que su cálculo es complementario al de esta. 
+Su salida es similar también.
+
+```{r}
+# ---- Run-time: 1 h
+correlations[["spearman"]] <- bigcor(bigcv, "spearman")
+```
+
+```{r}
+saveRDS(correlations, file = path(proj$res, "correlations", ext = "rds") ) 
+```
+
+
+
+## Gráficas de correlaciones
+
+Una vez calculadas las matrices, se dibujan y formatean para un análisis más fácil y eficiente.
+
+```{r}
+# Loading saved correlation matrixes
+correlations <- readRDS(file = path(proj$res, "correlations", ext = "rds") )
+```
+
+```{r}
+# Pattern for images
+# -- hc: hierarchical clustering of variables
+# -- lab: correlation coefficient display
+# -- dim: dimensions to set the figure
+
+cor_fig <- tribble(
+  ~file, ~hc, ~lab, ~dim,
+  "-ord", TRUE, FALSE, 7,
+  "-coe", TRUE, TRUE, 14
+)
+
+# Plotting the matrixes
+cor_plot <- foreach(i = names(correlations)) %:%
+  foreach(j = seq_along(cor_fig$file)) %do% {
+    
+    ggcorrplot::ggcorrplot(correlations[[i]]$r, method = "square",
+             hc.order = cor_fig$hc[j],  type = "full",
+             ggtheme = ggplot2::theme_gray,
+             colors = rev(RColorBrewer::brewer.pal(n = 3, name = "RdBu")),
+             lab = cor_fig$lab[j], lab_size = 2) +
+      scale_x_discrete(position = "top") +
+      theme(axis.text.x = element_text(angle = 315))
+  }
+
+cor_plot <- cor_plot %>%
+  flatten()
+```
+
+
+```{r}
+# A record for every image
+cor_fig <- cor_fig %>%
+  bind_rows(cor_fig) %>% 
+  mutate(file = paste0(rep(names(correlations), each = 2), file)) %>%
+  mutate(file = path(proj$img, file)) 
+
+# List with parameters of the function and extension of images
+cor_fig <- cor_fig %>%
+  transmute(filename = path_wd(file, ext = "png"), 
+            width = dim, 
+            height = dim) %>%
+  as.list()
+
+cor_fig[["plot"]] <- cor_plot
+
+#Run in parallel
+pwalk(cor_fig, ggsave)
+```
+
+
+
+
+# Análisis cuantitativo
+
+El primero de los análisis se apoya en las matrices de correlación y sus gráficas correspondientes.
+
+## Distribuciones
+
+Se empieza explorando la distribución de las variables, donde cabría diferenciar tres grandes grupos.
+Por un lado, las variables de orientaciones, como **easterness**, tienen distribuciones bimodales. 
+Esto tiene sentido ya que derivan de funciones trigonométricas sobre la orientación.
+En este grupo de bimodales cabría incluir a **twi**, aunque este hecho no era esperado atendiendo a su descripción.
+El resto de las variables son unimodales y con exceso de curtosis.
+Dentro de estas, las curvaturas estarían centradas en un valor medio, si bien el resto presentan asimetría.
+
+Respecto a los gráficos de dispersión entre variables, cabría resaltar que **cplan**, **spi**, **area_mod** y **area** tienen ciertos valores **aberrantes** que distorsionan todas las gráficas en las que participan. 
+También, que las variables de orientaciones dibujan un patrón de *ruido blanco* en sus gráficos de dispersión con otras covariables y que entre **easterness** y **northerness** se describe una circunferencia perfecta referentes a los grados de la orientación.
+En sus versiones de interacción con la pendiente la gráfica dibujan círculos rellenos que podría debeser a la deformación por la intensidad de la pendiente de la circunferencia. 
+
+```{r, eval=TRUE, echo=FALSE, out.width='85%', fig.cap='Matriz de gráficas de dispersión por pares. La mayor parte de las variables no se encuentran correlacionadas entre sí, si bien se detectan como algunas distribuciones no son normales y se encuentran escoradas, como "easterness".'}
+knitr::include_graphics( path_wd(proj$img, "cv_pairs", ext = "png") )
+```
+
+
+## Significación de las correlaciones (*p-value*)
+
+Para evaluar los resultados de las correlaciones se estudia primero si los valores ahí recogidos son significativos, es decir, si el *p-valor* es inferior a *0,05*.
+
+```{r}
+class(correlations$pearson) <- "rcorr"
+
+correlations$pearson %>% 
+  broom::tidy() %>% 
+  filter(p.value > 0.05) %>% 
+  mutate_if(is.numeric, round, 3) %>% 
+  arrange(p.value)
+```
+
+La mayor parte de las correlaciones son significativas. 
+Se observa que aquellas que no, se correponden en su mayoría a correlaciones donde intervienen las variables **spi**, **cplan**, las variantes de **area** y las variantes de las orientaciones como *easterness*, y que coinciden con las variables cuyas distribuciones presentaban valores aberrantes que distorsionaban las gráficas de dispersión entre pares.
+
+```{r}
+class(correlations$spearman) <- "rcorr"
+
+correlations$spearman %>% 
+  broom::tidy() %>% 
+  filter(p.value > 0.05) %>% 
+  mutate_if(is.numeric, round, 3) %>% 
+  arrange(p.value)
+```
+
+Las correlaciones por *Spearman* devuelven un resultado similar de significancia.
+
+
+
+## Patrones de la matríz de correlaciones 
+
+Con esto, se comparan las expresiones gráficas de ambas correlaciones.
+
+```{r, eval=TRUE, echo=FALSE, out.width='85%', fig.cap='Matriz de correlación de Pearson donde se observan grandes bloques de correlación entre covariables. En azul cuando son inversamente proporcionales, en rojo cuando son directamente proporcionales. Las zonas descoloridas describen pares no correlacionados.'}
+knitr::include_graphics( path_wd(proj$img, "pearson-coe", ext = "png") )
+```
+
+```{r, eval=TRUE, echo=FALSE, out.width='85%', fig.cap='Matriz de correlación de Spearman donde se observan grandes bloques de correlación entre covariables. En azul cuando son inversamente proporcionales, en rojo cuando son directamente proporcionales. Las zonas descoloridas describen pares no correlacionados.'}
+knitr::include_graphics( path_wd(proj$img, "spearman-coe", ext = "png") )
+```
+
+Ambas gráficas tienen patrones similares, ya que las variables quedan agrupadas con el mismo sentido, si bien las correlaciones por *Spearman* son más intensas.
+
+Esto señalaría la existencia de correlaciones más allá de las lineales, que pueden encontrarse en la gráfica de dispersión por pares, por ejemplo entre **mrrtf** y **upslope** o **rdiffus** y **trasp**.
+
+Respecto a los grupos observados, permiten separar las variables por sentido lógico. 
+
+Se reconocen dos grupos con una correlación inversa entre sí y que son tratados en paralelo.
+
+(@) **Grupo 1A: curvaturas**
+
+    * En este grupo de alta correlación positiva quedarían recogidas todas las curvaturas, a excepción de **cplan**.
+    También incluye a **tpi**.
+
+    * La relación teórica descrita entre las covariables **cprof** y **clong**; **cplan** y **ccros**; **cmini** y **cmaxi**; queda recogida. 
+    Es especialmente intensa entre **cprof** y **clong**. 
+    Por su parte, **ccros** con **cplan** no es tan evidente y presenta una correlación superior con **ctang**.
+    El par final compuesto por **cmaxi** y **cmini** son las que menor correlación tienen entre sí.
+  
+    * Respecto a **tpi**, si bien no es una curvatura, considera las diferencias entre las altitudes para una ventana de análisis.
+  
+  
+(@) **Grupo 1B: inversa de curvaturas**
+
+    * Existe un grupo inverso a las principales curvaturas donde queda recogida **cplan**, así como **tcilow**, **twi** y **downdiff**.
+    No existe una alta correlación entre sus miembros.
+
+
+Nuevamente, se reconocen dos grupos con una correlación inversa entre sí y que son tratados en paralelo. 
+En este caso, las correlaciones son más altas entre los subgrupos.
+
+
+(@) **Grupo 2A: erosión y transporte**
+
+    * Está compuesto por las derivadas de la pendiente **slope**, **upslope**, y **dwslope**, junto con **tri**, **mpi** y **distv**.
+    Teoricamente, se agrupan variables cuyos valores positivos señalan zonas de mayor erosión y transporte de materiales.
+  
+    * La variable con mayor correlación con el resto es **slope**, jugando un papel parecido a **tpi** en el anterior apartado.
+  
+    * Se pueden distinguir dos subgrupos de muy alta correlación, superiores a *0.85*, formados por los pares **slope** y **tri**, y **upslope** y **mpi**. 
+
+    * **tri** tiene muy alta semejanza con **slope**.
+    En un menor grado, guarda una relación directa con **dwslope**, **upslope** y **mpi**, así como **distv**.
+  
+    * **distv** es la menos correlacionada con las demás del grupo y es marcada su relación con **dwslope** y **tcilow**.
+
+
+(@) **Grupo 2B: acumulación de materiales**
+
+    * Está compuesto por **trasp**, **mrvbf**, **stwi**, **rdiffus**, **lst** y **mrrtf**. 
+    Atendiendo a la correlación de **Spearman** aquí también se incluiría la **sarea_mod**.
+    
+    * Dentro de este, **rdiffus** y **lst**; y **mrvbf** y **stwi** forman pares de muy alta correlación.
+    **trasp** quedaría entre ambos formando alta correlación con los dos subgrupos.
+    **mrrtf** sería la menos correlacionada.
+    
+    * El sentido material del grupo iría por la acumulación de materiales expresada principalmente por **stwi**, **mrvbf** y **mrrtf**.
+    También incluye un subgrupo de variables topo-climáticas altamente relacionadas con la elevación y la orientación. 
+    Con una región de trabajo caracterizada por un eje altitudinal fuerte, es posible que de lugar a esta asociación. 
+    Con el mismo sentido, las zonas más bajas son las zonas de menos pendiente y de menor erosión.
+    
+    * Las variables de acumulación principales, **stwi**, **mrvbf** y **mrrtf**, son puro arte visual.
+    
+
+(@) **Grupo 3: insolación**
+  
+    * Formado por dos covariables topo-climáticas **dah** y **rdirect**, y **aspect**.
+    
+    * Las dos primeras forman un par de alta correlación y cuyo sentido físico es muy cercano.
+    **aspect** es fuente de **dah**
+    
+
+(@) **Grupo 4: orientaciones**
+    
+    * Las variables basadas en el **aspect**: **northerness** e **easterness** y sus interacciones con **slope** no guardan ningún tipo de relación con ningún otro grupo de covariables, y forman pares de alta correlación, cada sentido trigonométrico con su correspondiente interacción.
+
+  
+
+(@) **Grupo 5: teledetección**
+
+    * Son las variables calculadas desde imágenes de teledetección: **io**, **feous**, **si**, **ri** y **ci**.
+    
+    * Existen dos pares de correlación media positiva que están integrados, por un lado **si** y **ri**; y por otro, **ci** y **ri**, donde esta última actúa de nexo de unión. 
+    Mientras, la correlación de **si** y **ci** es baja. 
+    
+    * La correlación de Pearson muestra una correlación inversa media entre **feous** y **ci**.
+    Mientras, **Spearman** señala principalmente entre **feous** e **io** así como **feous** e **ri**.
+
+
+
+
+# Análisis visual
+
+Se visualizan directamente las capas de las covariables a través de QGIS buscando entender el sentido material, así como evaluar el nivel de limpieza o ruido de cálculo en ellas.
+Este análisis se apoya en las agrupaciones de variables basada en las correlaciones.
+
+1. **Grupo 1A: curvaturas**
+
+    * Hay una notable diferencia entre las generadas por el módulo **<wood>** que es multi-escala, frente a la derivada por el módulo **<slope** con una escala simple, es decir todas las curvaturas frente a **ctang**.
+    
+    * En este sentido, **ccros** presenta una gran similitud con **ctang**, que cuenta con mayor definición, aunque más ruido.
+    La relación con **cplan** no es tan evidente.
+  
+    * En última instancia, ¿en qué medida sería interesante utilizar una variable del grupo de planos canónicos y otra de planos normales a la máxima pendiente, por ejemplo **cprof** y **ccros**, junto con **cmaxi**?. 
+    O, por el contrario, ¿utilizar las más diferenciadas de multi-escala, **cmaxi** y **cmini** con la única de escala simple **ctang**?.
+
+
+1. **Grupo 1B: inversa de curvaturas**
+  
+    * La explicación material de **downdiff** no hace interesante su uso, ya que la diferencia entre las dos medidas de la pendiente estaría más enfocada a una medida de calidad de la variable **dwslope** en sí.
+    
+    * Por otro lado, estaría **twi** frente a **tcilow** como subgrupo de correlaciones.
+    Los patrones espaciales son semejantes y adolecen del mismo problema de tratamiento de las zonas de más pendientes o de altitud, con patrones distorsionadas, frente a las bajas, que captan mucho mejor. 
+    Por ello, no sería aconsejable su empleo para la clasificación.
+    Cabría su utilización para extraer estas zonas bajas y diferenciar su posterior tratamiento, una metodología referenciada en la literatura [].
+    
+    * Visualmente este grupo no guarda tanta relación entre sí y materialmente queda como grupo antagonista principalmente de las curvaturas y, en segunda instancia, de las variables del próximo grupo de erosión y transporte.
+  
+  
+1. **Grupo 2A: erosión y transporte**
+    
+    * Alta semejanza en el patrón visual de las covariables, especialmente entre los pares de alta correlación descritos.
+    
+    * Las variables **dwslope** y **upslope** son claramente multi-escalas o, al menos, integran mediciones en la zona de recogida de cada pixel.
+    En el subgrupo formado por **tri**, **slope** y **dwslope** esta característica es determinante, donde la calidad del patrón y la limpieza de ruida es claramente superior en **dwslope**, remarcando las zonas de mayor erosión.
+    
+    * Por otra parte, el par de alta correlación **upslope** y **mpi** tiene ciertos matices diferenciadores. 
+    **mpi** no remarca las zonas de valle o de la red de flujo de materiales, comno sí hace **upslope**. 
+    
+    * Parecería interesante la combinación **dwslope** con **upslope**.
+
+
+1. **Grupo 2B: acumulación de materiales**
+  
+    * **stwi** y **mrvbf** tienen patrones muy parecidos, donde **stwi** presenta menos ruido o límites menos marcados.
+    
+    * **mrrtf** también maneja los saltos entre bancales o parcelas con límites rectilíneos, lo que podría no hacer aconsejable su uso en las parcelas agrícolas.
+    
+    * **lst** y en menor medida **rdiffus** son modificaciones mínima sobre la elevación, sin aportar nueva información de gran utilidad.
+    Esto desaconsejaría su uso. 
+
+
+1. **Grupo 3: insolación**
+  
+    * Como su descripción indica, **dah** guarda cierta semejanza con el **aspect**, pero disminuyendo el ruido y esquivando la problemática de la variable polar. 
+    Además, considera la orientación de mayor insolación para determinar la escala.
+    **rdirect** dibuja un patrón similar a **dah** con ciertas diferencias, donde **dah** tiene mayor sentido material.
+
+
+1. **Grupo 4: orientaciones**
+  
+    * El patrón de las variables directas por función trigonométrica es muy homogéneo y poco adaptado.
+    Sin embargo, las variantes con interacción con la pendiente introducen un patrón identificable con el terreno y su uso parecería más interesante.
+
+1. **Grupo 5: teledetección**
+  
+    * **io**, en contra de su descripción, no detecta especialmente bien los óxidos de hierro, sino zonas boscosas.
+    Por su parte, **feous** sí remarca zonas carbonatadas, creando mayores contrastes.
+    Esto puede tener relación con las bandas utilizadas, pues **io** se basa en un ratio rojo-azul, frente al ratio rojo-SWIR de **feous**.
+    Este último resulta más expresivo desde un punto de vista material para la retención de agua.
+    Tambien, se observa a través de QGIS como **feous** tiene mejor patrón espacial.
+    
+    * Respecto al grupo **si**, **ri** y **ci**, el primero identifica zonas boscosas y masas de agua y, también, zonas más oscurecidas.
+    En cierta medida, capta zonas más rojizas o potencialmente suelos descabezados con el horizonte argílico en superficie. 
+    Sin embargo, esto siempre no se cumple.
+    Su patrón tiene genera bastante detalle.
+    
+    **ri** y **ci** marcan claramente una zona más rojiza en el mapa, pero que después no son capaces de delimitar el detalle de las zonas respectos a otras colidantes en escalas grandes.
+    Su detalle es bastante reducido.
+    En general otorga valores bajos a zonas con vegetación frente a zonas rojizas y quizás por eso destaca las zonas de arcillas, pero sin contrastarlas con las de carbonatos en superficie.
+    
+
+# Selección
+
+Con el estudio sobre las matrices de correlación y la visualización en QGIS ha sido posible entender el funcionamiento de las variables en el área de estudio y señalar variables de interés, así como variables cuyo empleo no parece adecuado, dentro de los diferentes grupos.
+
+1. **Grupo 1A: curvaturas**
+    
+  Se considera interesante utilizar las curvaturas más diferenciadas de multi-escala, **cmaxi** y **cmini** con la única de escala simple **ctang**.
+  Cono alternativa y atendiendo a las correlaciones, cabría la posibilidad de seleccionar una variable del grupo de planos canónicos y otra de planos normales a la máxima pendiente, por ejemplo **cprof** y **ccros**, junto con **cmaxi**, que tiene menos correlaciones inversas con el grupo **2**.
+
+
+1. **Grupo 1B: inversa de curvaturas**
+
+  **cplan**, se descarta por la presencia de valores aberrantes, así como **downdiff**  por la debilidad de su sentido material. 
+  **tcilow** y **twi** también se descartarían por su problema del tratamiento de las zonas de más pendientes o de altitud, con patrones distorsionadas.
+  
+  Finalmente el grupo *1* quedaría formado por 3 covariables.
+
+
+1. **Grupo 2A: erosión y transporte**
+
+  Se descarta el uso **slope**, **tri** y **distv** por su alta correlación con **dwslope** a favor de esta última, considerando la calidad de su patrón espacial y la menor presencia de ruido.
+  Entre el par **upslope** y **mpi**, ambas tienen correlaciones muy parecidas, con excepciones en **stwi** a favor de **upslope**, y **cmini** hacia **mpi**.
+  Se considera que por su sentido físico es preferible el uso de **upslope**.
+  Así, el uso complementario de **dwslope** y **upslope** permitiría el contraste de la red de drenaje a diferentes escalas y sus correlaciones son las menores en el grupo.
+  
+  
+1. **Grupo 2B: acumulación de materiales**
+
+  Dentro del grupo de alta correlación **stwi** y **mrvbf**, sus patrones muy parecidos, pero **stwi** presenta menos ruido o límites menos marcados y sería la seleccionada.
+  Se descarta **mrrtf**, por la presencia de secciones rectilíneas en su patrón, aún siendo la menos correlacionada.
+  Dentro del subgrupo **lst** y **rdiffus**, **lst** queda descartada por su aportación mínima de información frente a la altitud. 
+  **rdiffus** podría ser incluido tentativamente y comprobar su efecto, dado que también cuenta con una alta relación con la altitud.
+  
+  Finalmente el grupo *2* quedaría formado por 3 covariables, el mismo que las curvaturas, o 4 en uno de los supuestos.
+  
+1. **Grupo 3: insolación**
+  
+  Por el mayor sentido espacial de **dah**, ya que considera la orientación de mayor exposición y se opta por esta frente a **rdirect**.
+  
+
+1. **Grupo 4: orientaciones**
+
+  Se selecciona entre los pares de direcciones con alta correlación las variantes con interacción de la pendiente, ya que estas introducen un patrón identificable con el terreno y su uso parecería más interesante, es decir, **eastslope** y **northslope**.
+  Su introducción sería tentativa, debido a que en último estancia, el patrón individual se asemeja al de **tcilow** y presenta distorsiones.
+  
+  
+1. **Grupo 5: teledetección**
+
+  La alta correlación señalada por *Spearman* entre **feous** e **io** se resuelve a favor de **feous** por su sentido material por las bandas en uso y su patrón espacial de mejor contraste.
+  Mientras, dada la alta correlación de **ri** con sus pares con **si** y **ci** y su bajo sentido material, se descarta su uso.
+  **si** y **ri** no son capaces de señalar correctamente zonas de acumulación de arcillas, pero se considera su uso tentativo.
+
+
+En ese sentido, se establece una clasificación de las covariables principal con las variables más destacadas, y otras secundarias en la que se intercambian las variables de curvatura y de teledetección de cara a una posible comparativa futura.
+
+
+## Principal
+
+Se trata de aquellas variables que, dentro de cada grupo asociado a ciertos procesos materiales, presentan visualmente un patrón espacial más interesante y con poca presencia de ruido.
+
+| Grupo | Nº de covariables | Covariables preferentes |
+|:-----:|:-----------------:|:-----------------------:|
+| 1A | 3 | ccros + cprof + cmaxi |
+| 1B | 0 | ∄ |
+| 2A | 2 | dwslope + upslope |
+| 2B | 1 | stwi |
+| 3 | 1 |dah |
+| 4 | 2 | ∄ |
+| 5 | 3 | feous |
+| Total | 8 | |
+  : Covariables secundarias
+
+```{r}
+cvprin <- covariates %>% 
+  filter(covar_id %in% c("ccros", "cprof", "cmaxi", "dwslope", "upslope", "stwi", "dah", "feous")) %>% 
+  transmute(select_id = '1', 
+            covar_id)
+
+dbWriteTable(con, Id(schema = "covars", table = "covar_select"), 
+             cvprin, append = TRUE )
+```
+
+
+## Secundaria
+
+Alternativa a la selección principal que modifica la selección de curvaturas, que ha sido donde mayor duda ha habido durante la criba entre variables multi-escalares y de escala simple.
+
+| Grupo | Nº de covariables | Covariables preferentes |
+|:-----:|:-----------------:|:-----------------------:|
+| 1A | 3 | cmaxi + ctang + cmini |
+| 1B | 1 | ∄ |
+| 2A | 2 | dwslope + upslope |
+| 2B | 1 | stwi |
+| 3 | 1 |dah |
+| 4 | 2 | ∄ |
+| 5 | 3 | feous |
+| Total | 8 | |
+  : Covariables principales
+
+```{r}
+cvsec <- covariates %>% 
+  filter(covar_id %in% c("cmaxi", "ctang", "cmini", "dwslope", "upslope", "stwi", "dah", "feous")) %>% 
+  transmute(select_id = '2', 
+            covar_id)
+
+dbWriteTable(con, Id(schema = "covars", table = "covar_select"), 
+             cvsec, append = TRUE )
+```
+  
+  
+## Tercera
+
+
+| Grupo | Nº de covariables | Covariables preferentes |
+|:-----:|:-----------------:|:-----------------------:|
+| 1A | 3? | ? |
+| 1B | 0 | ∄ |
+| 2A | 2 | dwslope + upslope |
+| 2B | 2 | stwi |
+| 3 | 1 |dah |
+| 4 | 0 | ∄ |
+| 5 | 2 | feous + si |
+| Total | 9 | |
+  : Covariables secundarias
+
+```{r}
+cvter <- covariates %>% 
+  filter(covar_id %in% c("ccros", "cprof", "cmaxi", "dwslope", "upslope", "stwi", "dah", "feous", "si")) %>% 
+  transmute(select_id = '3', 
+            covar_id)
+
+#dbWriteTable(con, Id(schema = "covars", table = "covar_select"), 
+#             cvter, append = TRUE )
+```
+
+
+> ¿Añadir una más con rdiffus?
+
+> Cabría eliminar aquí las que no fueran a ser nunca de interés
+  
+
+# Conclusión
+
+Se ha desarrollado un estudio de las covariables a través de diferentes matrices de correlación y de su visualización a través de QGIS. 
+Se ha podido detectar grupos de variables con tendencias similares de correlación y con gran similitud en sus patrones espaciales.
+Entre estos, se han destacado aquellas variables de uso preferencial para la búsqueda de los grupos de las SMU primarias, resultando en un total de 8 covariables (Ver tabla).
+
+| Grupo | Asociación | Nº de covariables | Covariables principales |
+|:-----:|:-----------------:|:-----------------------:|
+| 1A | Curvaturas | 3 | ccros + cprof + cmaxi |
+| 1B | Inversa de curvaturas | 0 | ∄ |
+| 2A | Erosión y transporte | 2 | dwslope + upslope |
+| 2B | Acumulación de materiales | 1 | stwi |
+| 3 | Insolación | 1 |dah |
+| 4 | Orientaciones | 0 | ∄ |
+| 5 | Teledetección | 1 | feous |
+| Total | 13 | | | 
+  : Covariables principales
+
+
+
+
+
+# Bibliografía
+
+::: {#refs}
+:::

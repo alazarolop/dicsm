@@ -1,0 +1,448 @@
+---
+title: "Management methods for raster in R"
+author: "Alberto Lázaro-López"
+date: "18th June 2019"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+abstract: DiCSM whole project is based on analysis over spatial objects, both vector and raster formats. This implies a big amount of operations on this objects and hence, an optimise management workflow should be define. This document tackles this necessity and test several workflows to achieve it.   
+---
+
+```{r core, include=FALSE }
+for (.i in paste0("src/", c("spatial", "dbms", "core", "raster"), ".R" ) ) source(.i)
+
+proj <- .proj_envi("covar") %>% 
+  path_file() %>% 
+  .proj_subdir()
+```
+
+
+# Introducción[^1]
+
+[^1]: Este documento reproduce la aproximación inicial de alto rendimiento para rasters que ha sido superada por el propio uso en el análisis de las covariables, desarrollado en la sección respectiva. 
+Por ejemplo, los rastes ahora se vuelcan en matrices directamente con una función más eficiente, se cargan individualmente en la big.matrix y se subseleccionan por métodos más eficientes. 
+
+El projecto DiCSM se basa en la aplicación de métodos de análisis estadístico sobre información espacial, tanto en formato vectorial como raster. 
+Esto implica un gran número de operaciones sobre objetos de estos tipos y, por lo tanto, un flujo de trabajo optimizado con ellos redundaría en una mayor cohesión y mejor rendimiento.
+
+En concreto, este documento se centra en el manejo más optimizado de datos raster, contemplando el alojamiento principal en una base de datos, los diferentes tamaños y su carga en R para el análisis.
+Se pretende hacer una comparativa de _benchmarking_ entre las diferentes opciones conocidas.
+
+
+# Carga desde una base de datos
+
+Las dos opciones principales serían:
+
+* La carga directa desde la base de datos de los raster para su posterior tratamiento o transformación.
+* La exportación de los datos a ficheros para su carga en R y posterior tratamiento o transformación.
+
+Se han desarrollado diferentes funciones para realizar estos procedimientos para estandarizar y cohesionar las mismas ejecuciones.
+
+```{sql, connection=con, output.var="covariates" }
+SELECT covar
+FROM covar.covariates
+WHERE covar ~ 'stwi|pi|slope|ci'
+LIMIT 4
+```
+
+
+```{r}
+# From database to file
+covariates <- covariates %>%
+  mutate( src = pgiscon(covar, "covar"),
+          file = path( proj$gis, "covariates", covar ) )
+
+gdal <- foreach(rt = seq_along(covariates$covar)) %do% {
+  if ( file_exists(path_wd(covariates$file[[rt]], ext = "tiff")) == FALSE ) {
+    glue('gdal_translate -of GTiff -a_srs EPSG:25830 "{pgis}" {file}',
+         pgis = covariates$src[[rt]],
+         file = path_wd(covariates$file[[rt]], ext = "tiff")
+         ) %>% 
+      system()
+  }
+}
+```
+
+```{r}
+microbenchmark::microbenchmark(
+  covar_pgis <- pgisrast(covariates$src, .nm = covariates$covar),
+  covar_file <- filerast(path_wd(covariates$file, ext = "tiff")),
+  times = 2L  
+) %>%
+  saveRDS(file = path(proj$res, "rast_import", ext = "rds") ) 
+```
+
+```{r, eval=TRUE, echo=FALSE}
+if (file_exists( path_wd(proj$res, "rast_import", ext = "rds")) == TRUE ) {
+  (readRDS( file = path(proj$res, "rast_import", ext = "rds") ))
+}
+```
+
+A la hora de cargar los datos, se comprueba que el realizarlo desde la base de datos implica mucho más tiempo. 
+Sin embargo, hay que considerar que el proceso de importanción desde la base de datos supone la copia de su contenido a un objeto de R, frente a los archivos donde se crea un puntero hacia su localización, pero no son cargados en memoria. 
+Por ello, para cuantificar la carga sería necesario incluir la conversión a una tabla en memoria.
+
+```{r}
+microbenchmark::microbenchmark(
+  covar_pgis.tbl <- covar_pgis %>%  tblcolraster(),
+  covar_file.tbl <- covar_file %>%  tblcolraster(),
+  times = 2L
+) %>%
+  saveRDS(file = path(proj$res, "rast_tbl", ext = "rds") ) 
+```
+
+```{r, eval=TRUE, echo=FALSE}
+if (file_exists( path_wd(proj$res, "rast_tbl", ext = "rds")) == TRUE ) {
+  (readRDS( file = path(proj$res, "rast_tbl", ext = "rds") ))
+}
+```
+
+```{r}
+dsn <- pgiscon(.tb = 'covar_smu1', .sch = '_dsm', .db = 'tezisdb', .where = 'smu1_id ~ $$J14C$$')
+microbenchmark::microbenchmark(
+  smu1_raw <- readGDAL(dsn, silent = TRUE),
+  smu1_tbl <- readGDAL(dsn, silent = TRUE) %>% raster::brick() %>% raster::as.data.frame(),
+  times = 3L
+) %>%
+  saveRDS(file = path(proj$res, "rast_tbl_where", ext = "rds") ) 
+```
+
+```{r, eval=TRUE, echo=FALSE}
+if (file_exists( path_wd(proj$res, "rast_tbl_where", ext = "rds")) == TRUE ) {
+  (readRDS( file = path(proj$res, "rast_tbl_where", ext = "rds") ))
+}
+```
+
+Como se esperaba, el resultado de esta última fase es mejor en el caso de los ráster importados desde la base de datos. 
+Sin embargo en el cómputo total la diferencia es muy desfavorable para estas, siendo más de 100 veces inferior en el caso de los archivos.
+
+La ventaja de incorporar los datos desde la base de datos es la eliminación de pasos intermedios sobre archivos y la facilidad de consulta. 
+Por ello, se considera que **para el trabajo de archivos de gran tamaño es más eficiente su conversión a archivo y su consulta posterior**.
+Mientras, **para el caso de rasters de menor tamaño, la versatilidad de la consulta directa a la base de datos sería preferible y los tiempos de carga se igualan a los de archivos**.
+
+
+
+
+# Transformación a tibble
+
+Según la sección previa de carga de datos raster en R, la manera más eficiente de utilizar imágenes raster de gran tamaño (> 1GB) es mediante la exportación de estos a archivos y posteriormente su carga en R.
+Una vez descrito este procedimiento, el siguiente paso consistiría evaluar la mejor manera de alojarlos y tratarlos en R.
+
+Se considera en primer lugar los formatos estandar de R: _data frame_ y _matrix_.
+Se quiere optimizar la conversión a _tibble_ de los rasters a partir de una lista de rasters, comparando dos métodos diseñados.
+El primero de ellos la unifica en un _stack_ de rasters que se convierte a un _data frama_.
+Mientras, el segundo la convierte en una lista de _data frames_ para después unificarlos.
+
+```{r}
+microbenchmark::microbenchmark(
+  covar_file.col <- covar_file %>%  tblcolraster(),
+  covar_file.col2 <- covar_file %>%  tblcolraster2(),
+  times = 2L
+) %>%
+  saveRDS(file = path(proj$res, "rast_tblcol", ext = "rds") ) 
+```
+
+```{r, eval=TRUE, echo=FALSE}
+if (file_exists( path_wd(proj$res, "rast_tblcol", ext = "rds")) == TRUE ) {
+  (readRDS( file = path(proj$res, "rast_tblcol", ext = "rds") ))
+}
+```
+
+El primer método de transformación supone una reducción cercana al 40% y es el seleccionado como método base para transformar rasters en una tabla sobre la que aplicar los análisis estadísticos deseados.
+
+
+
+# Gestión de memoria
+
+Previamente se ha analizado el proceso más ágil para la carga de los datos en formato raster a R y la mejor forma para su conversión a un formato tabla de R (data frame).
+Ahora se desea comprobar en qué medida este alojamiento es lo suficientemente eficiente como para poder realizar ciertos cálculos en un tiempo razonable.
+Para ello, se va a analizar el comportamiento del ordenador utilizando todas las covariables disponibles (32).
+
+```{sql, connection=con, output.var="covariates" }
+-- List of all available covariates
+SELECT covar
+FROM covar.covariates
+```
+
+Se convierte a archivos externos como había sido sugerido anteriormente.
+
+```{r}
+# Path for raster files
+covariates <- covariates %>%
+  mutate(file = path( proj$gis, "covariates", covar ))
+
+# Export covariates from database to files
+db <- foreach(rt = seq_along(covariates$covar), .final = function(db) setNames(db, as.character(covariates$covar))) %do% {
+  if ( file_exists(path_wd(covariates$file[[rt]], ext = "tiff")) == FALSE ) {
+    glue('gdal_translate -of GTiff -a_srs EPSG:25830 "{pgis}" {file}',
+     pgis = pgiscon(.tb = covariates$covar[[rt]], .sch = "covar"),
+     file = path_wd(covariates$file[[rt]], ext = "tiff")) %>% 
+      system()
+  }
+  rm(rt)
+}
+```
+
+```{r}
+# ¡WARNING! Don't run it.
+# Load rasters into R from file
+#covar_rast <- filerast(.rt_src = path_wd(covariates$file, ext = "tiff"))
+
+# Transform rasters to a tibble with a column for every raster.
+# covar_rast <- covar_rast %>%
+#  tblcolraster()
+```
+
+Sin embargo, se obtiene un error de límite de memoria. 
+
+> Error: vector memory exhausted (limit reached?)
+
+En este caso, se ha utilizado una función que acopla todos los procesos en un único paso. 
+Como primera alternativa, se prueba el mismo procedimiento escalonado.
+
+```{r}
+# ¡WARNING! Don't run it.
+#covar_rast <- filerast(.rt_src = path_wd(covariates$file, ext = "tiff"))
+
+#covar_rast <- stack(covar_rast)
+#covar_rast <- raster::as.data.frame(covar_rast)
+```
+
+Se detecta que el problema reside en crear una única tabla que recoja todos los rasters.
+
+
+Después de consultar sobre dicho problema en _Stack Overflow_, se plantean tres soluciones posibles:
+
+* Incrementar la memoria máxima (física y virtual) de R hasta el máximo del ordenador. 
+  De forma predeterminada [se sitúa en los 16GB][vram].
+* Utilizar sistemas de alto rendimiento de R para alojar objetos en memoria compartida o en disco.
+* Utilzar el mismo procedimiento, pero diviendo el tratamiento en bloques de covariables.
+
+[vram]: <https://stackoverflow.com/questions/51248293/error-vector-memory-exhausted-limit-reached-r-3-5-0-macos>
+
+
+## Incremento de memoria límite de R
+
+Se decide utilizar en primer lugar el primer sistema, aumentando la memoria a los 40GB.
+
+```{r}
+covar <- filerast(.rt_src = path_wd(covariates$file, ext = "tiff"))
+  
+covar <- stack(covar)
+# Instantaneous
+
+covar <- raster::as.data.frame(covar)
+# ~3 min
+
+covar <- as_tibble(covar)
+# Instantaneous
+
+covar <- filter_all(covar, all_vars(!is.na(.)) )
+# ~1.5 min
+
+covar <- as.matrix(covar)
+# < 1 min
+
+# Cleaning memory before proceeding
+gc()
+```
+
+Se consigue resolver el problema y se comprueba que el filtro de no valores reduce considerablemente el tamaño de la tabla.
+
+Además, se prueba a realizar un cálculo de correlación utilizando la función **cor**, en base a las conclusiones del estudio sobre métodos de correlación para rasters en R.
+El resultado es muy positivo, siendo un proceso rápido y de bajo consumo de recursos.
+
+```{r}
+cor_pearson <- cor(covar, method = "pearson")
+# Calculation process is insaline fast. It's done in less than a minute (< 1 min.)
+
+cor_spearman <- cor(covar, method = "spearman")
+```
+
+Sin embargo, al intentar repetir el proceso con la correlación de Spearman se vuelve a encontrar el mismo problema.
+Además, el consumo de memoria se dispara.
+Por estos motivo, se decide implementar la siguiente solución disponible.
+
+
+## Memoria compartida y externa.
+
+Se quiere implementar la solución de alta eficiencia de memoria, _shared memory_ y _file backup matrixes_.
+En la revisión de recursos disponibles en la _Task view_ de [**High-Performance and Parallel Computing with R**][hpc] se encuentran referencias a los dos principales paquetes para _Large memory and out-of-memory data_: [**bigmemory**][bigmemory] y [**ff**][ff].
+
+[hpc]: <https://cran.r-project.org/web/views/HighPerformanceComputing.html>
+
+[bigmemory]: <https://cran.r-project.org/web/packages/bigmemory/index.html>
+
+[ff]: <https://cran.r-project.org/web/packages/ff/index.html>
+
+La decisión sobre qué alternativa utilizar se basa en [comparativas ya elaboradas][big_ff]. 
+En ella se expresa que el rendimiento de ambos sistemas es similar, con la diferencia fundamendtal que **ff** se basa en archivos en discos y **bigmemory** permite tanto el uso de archivos en memoria como en disco.
+Por otro lado, de este último existen mayor número de recursos como [referencias][bigref], manuales y [paquetes con funciones][bigorg] adaptadas en torno al mismo sistema, como **bigtabulate**, **biganalytics**, **bigalgebra** y **synchronicity**.
+Además, existe otro paquete, [**bigstatsr**][bigstatsr] con un alto número de funciones que previamente estuvo basado en **bigmemory** y permite una [fácil conversión entre formatos][bigtrans]. 
+Ambos paquetes tienen [implementaciones adaptadas][bigforeach] al uso del paquete de paralelización **foreach**.
+
+[big_ff]: <http://www.bytemining.com/2010/08/taking-r-to-the-limit-part-ii-large-datasets-in-r/>
+
+[bigref]: <http://www.stat.yale.edu/~mjk56/temp/bigmemory-vignette.pdf>
+
+[bigorg]: <http://bigmemory.org/>
+
+[bigstatsr]: <https://privefl.github.io/blog/package-bigstatsr-statistics-with-matrices-on-disk-user-2017/>
+
+[bigtrans]: <https://privefl.github.io/bigstatsr/articles/bigstatsr-and-bigmemory.html>
+
+[bigforeach]: <https://privefl.github.io/blog/a-guide-to-parallelism-in-r/>
+
+
+Por todo ello, se opta por probar la implementación de **bigmemory**, creando en el proceso un _file backup_.
+
+```{r}
+# If there is no backed file, create the big.matrix and the backing file.
+if (file_exists(path_wd(proj$gis, "covariates", "covar", ext = "bk"))==FALSE ) {
+  
+  covar <- bigmemory::as.big.matrix(covar, type = "double", 
+                          backingpath = path_wd(proj$gis, "covariates"), 
+                          backingfile = path("covar", ext = "bk"), 
+                          descriptorfile = path("covar", ext = "desc"))
+  
+} else {
+# Or attached it again, if exists.
+  covar <- bigmemory::attach.big.matrix( path_wd(proj$gis, "covariates", "covar", ext = "desc") ) 
+}
+```
+
+Se prueba el mismo método de correlación y el funcionamiento es prácticamente idéntico.
+
+```{r}
+# To access the whole matrix in memory, a pair of square brackets are used.
+cor_pearson <- cor(covar[], method = "pearson")
+```
+
+Ahora se comprueba la posibilidad de [transformación de un archivo _bigmemory_ a uno de tipo _bigstatsr_][bigtrans].
+
+```{r}
+covar_desc <- bigmemory::describe(covar)
+
+covar_fbm <- bigstatsr::FBM(nrow = nrow(covar), ncol = ncol(covar), type = covar_desc@description$type,
+      backingfile = paste0(covar_desc@description$dirname, fs::path_ext_remove(covar_desc@description$filename)),
+      create_bk = FALSE)
+
+
+# Convert the filebacked big.matrix to a FBM
+covar_fbm[1234:1239, 4:6]
+```
+
+Y el funcionamiento de la función de correlación del paquete **bigstatsr**.
+
+```{r}
+t <- bigstatsr::big_cor(covar_fbm)
+# ~ 3 minutes
+```
+
+Que resulta también ser positivo.
+
+
+## Divisón y tratamiento por bloques.
+
+La solución de memoria compartida o de volcado en archivo en disco supone un ahorro importante de memoria en el cómputo de análisis estadísticos con las covariables, que estaba resultando ser el principal cuello de botella en la paralelización.
+
+Se prueba a paralelizar el cálculo de la correlación de Spearman.
+Para ello se utiliza una matriz que es una subselección de la ya existente, pero con el número de filas suficiente para que los cálculos sean válidos (>`nrow(covar_ras)*0.25`).
+
+```{r}
+# If there is no backed file, create the big.matrix and the backing file.
+if (file_exists(path_wd(proj$gis, "covariates", "covar_sub", ext = "bk"))==FALSE ) {
+    
+  covar_sub <- sample_n(covar, (nrow(covar_rast)*0.25), replace=FALSE )
+  
+  covar_sub <- as.big.matrix(covar_sub2, type = "double", 
+                          backingpath = path_wd(proj$gis, "covariates"), 
+                          backingfile = path("covar_sub", ext = "bin"), 
+                          descriptorfile = path("covar_sub", ext = "desc"))
+    
+} else {
+# Or attached it again, if exists.
+  covar_sub <- bigmemory::attach.big.matrix( path_wd(proj$gis, "covariates", "covar_sub", ext = "desc") ) 
+}
+```
+
+
+```{r}
+# SETTINGS
+## Number of covariates
+nvar <- nrow(covariates)
+
+## Number of blocks
+nblocks <- NULL
+if( is.null(nblocks) == TRUE )  {
+  nvarblock <- 4L # Max 
+  while( nvar %% nvarblock != 0 ) {
+    ncolblock <- nvarblock - 1L
+  } 
+  nblocks <- as.integer(nvar / nvarblock)
+}
+
+## Allocate variables to blocks
+blocks <- split(1:nvar, rep(1:nblocks, each = nvarblock))
+
+## Combinations of variables
+combs <- arrangements::combinations(1:nblocks, 2, replace = FALSE)
+combs <- combs[sample(1:nrow(combs), size = 10, replace = FALSE), ]
+
+
+## METHOD
+## Allocation of matrix
+cor_spearman <- matrix(ncol = nvar, nrow = nvar)
+colnames(cor_spearman) <- covariates$covar
+rownames(cor_spearman) <- covariates$covar
+
+## Calculation of Spearman's Correlation
+registerDoParallel(cores = 6L)
+cor_res <- foreach( i = 1:nrow(combs) ) %dopar% {
+  cv1 <- blocks[[ combs[i, 1] ]]
+  cv2 <- blocks[[ combs[i, 2] ]]
+
+  block_mat <- cor(covar_sub[, c(cv1, cv2) ],
+                   method = "spearman")
+  
+  # All correlations are calculated, but just the intersection is saved.
+  # It's more memory efficient than combining columns, as processing time is almost non-existante. 
+  block_res <- list("cv1" = cv1, "cv2" = cv2, "cor" = block_mat)
+  
+  rm(b1, b2, block_comb, block_mat)
+  
+  block_res
+}
+
+for( i in seq_along(cor_res) ) {
+  cv1 <- cor_res[[i]]$cv1
+  cv2 <- cor_res[[i]]$cv2
+  cor <- cor_res[[i]]$cor
+  
+  cor_spearman[c(cv1, cv2), c(cv1, cv2) ] <- cor
+  cor_spearman[cv2, cv1] <- t(cor)
+}
+
+rm(nblocks, b1, b2, block_mat)
+gc()
+```
+
+Aún activando todos los hilos de procesamiento del ordenador, el consumo de memoria no excede de 17GB en RAM y 15GB en SWAP, y el cálculo finaliza cerca de los 55 minutos, que suponen unas 2 horas y media menos que la vez anterior (~45% de tiempo de ejecución).
+
+Se verifica así que la combinación de memoria compartida o de volcado en archivo **bigmemory** unida a la paralelización **foreach** supone un incremento muy importante de las posibilidades de procesamiento.
+
+
+
+
+# Conclusión
+
+Se han realizado diferentes test con el fin de encontrar el manejo más óptimo de rasters en R de cara a un procesamiento de alto rendimiento dentro del proyecto DiCSM.
+
+**La importación de archivos más efectiva, contabilizando su lectura y conversión a una tabla, depende del tamaño del raster**: cuando son tamaños grandes (> 500MB), la conversión a un archivo intermediario y su transformación en tabla es más rápida; al contrario, cuando son rasters pequeños los tiempos de carga son mucho menores cuando son importados desde la base de datos de PostgreSQL/PostGIS.
+
+Con tamaños de tablas considerables (>10GB), los procesos y los extras de memoria que requieren pueden llevar a agotar los recursos disponibles de memoria sin explotar al máximo los recursos de computación. 
+En este escenario, el uso de métodos de **memoria compartida o volcado en archivo punteado desde R** aporta una gran eficiencia.
+Estos métodos están preparados para su uso en paralelización y permiten con ello exprimir el potencial del ordenador.
+

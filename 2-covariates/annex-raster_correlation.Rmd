@@ -1,0 +1,308 @@
+---
+title: "Correlation methods for raster in R"
+author: "Alberto Lázaro-López"
+date: "13th June 2019"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+abstract: Covariates selection in DiCSM project is based in qualitative and quantitave methods. In other to develope the laters, different methods for covariance and correlation calculation for raster are tested.
+---
+
+```{r core, include=FALSE }
+for (.i in paste0("src/", c("spatial", "dbms", "core", "raster"), ".R" ) ) source(.i)
+
+proj <- .proj_envi("covar") %>% 
+  path_file() %>% 
+  .proj_subdir()
+```
+
+# Introducción
+
+La selección de covariables en el proyecto DiCSM se pretende que esté basada tanto en análisis cualitativos como cuantitativos. 
+Los cualitativos son fundamentalmente visuales y se desarrollan durante la fase de cálculo.
+Mediante los últimos, los cuantitativos, se establecen parámetros para realizar una comparativa más objetiva.
+La decisión definitiva combinará ambos métodos.
+
+Los métodos teóricos que se quieren aplicar son el análisis habituales en estadística: la covarianza y las correlaciones de Pearson y Spearman.
+El objetivo es poner a prueba diferentes funciones de R que permiten el cálculo de estas variables y determinar cúales son más óptimas para nuestros requisitos.
+
+
+## Requisitos
+
+* Cálculo de coeficientes de correlación de Pearson, Spearman y covarianza.
+
+* Los coeficientes deben estar disponible en un formato de matriz para su representación gráfica.
+
+* Representación gráfica de los resultados obtenidos.
+
+* En casos puntuales será interesante calcular al covarianza y visualizarla sobre el mapa en formato raster.
+
+* Deberá ser posible la paralelización de los cálculos.
+
+
+# Antecedentes
+
+La revisión de antecedentes se ha basado en el estudio de la documentación de paquetes de R seleccionados a través de consultas del metabuscador [MetaCRAN][metacran], que se resumen en la siguiente tabla.
+
+[metacran]: <https://www.r-pkg.org/>
+
+| Paquete | Función | Input | Output | Parallelization |
+|:-------:|:-------:|:-----:|:------:|:---------------:|
+| base | cor | Matrix or Data frame | Matrix | _NA_
+| Hmisc | rcorr | Matrix | List (3 elementos) | _FALSE_ |
+| broom | tidy | _rcorr_ | Tibble | _FALSE_ |
+| CENFA | parCov | RasterBrick | Matrix | _TRUE_
+| raster | layerStats | RasterBrick | List (2 elementos) | _FALSE_ |
+| raster | clusterR + calc + _func_ | RasterBrick | RasterLayer | _FALSE_ |
+| raster | corLocal | Raster* | RasterLayer | _FALSE_ |
+| spatialEco | rasterCorrelation | RasterLayer | RasterLayer | _FALSE_ |
+| spatialEco | raster.modifed.ttest | RasterLayer | SpatialPixelsDataFrame (5 elementos) | _FALSE_ |
+| | | | | |
+| ggcorrplot | * | Matrix | _Plot_ | _NA_
+  : Funciones encontradas para el cálculo y la visualización de matrices de correlación. 
+
+
+* [**base::cor**][cor]: Matriz de los coeficientes de correlación de Pearson o Spearman para cada par de columnas de la matrix origen o para el cruce entre dos matrices diferentes. 
+
+[cor]: <https://www.rdocumentation.org/packages/stats/versions/3.6.0/topics/cor>
+
+
+* [**Hmisc::rcorr**][rcorr]: Matriz de los coeficientes de correlación de Pearson o Spearman para cada par de columnas de la matriz origen y test de significancia.
+Combinado el resultado con [**broom::tidy**][tidy.rcorr] se obtiene un tibble resumen optimizado.
+
+[rcorr]: <https://www.rdocumentation.org/packages/Hmisc/versions/4.2-0/topics/rcorr>
+
+[tidy.rcorr]: <https://www.rdocumentation.org/packages/broom/versions/0.5.2/topics/tidy.rcorr>
+
+
+* [**CENFA::parCov**][parCov]: Matriz de covarianza a partir de un RasterBrick (o Stack).
+
+[parCov]: <https://www.rdocumentation.org/packages/CENFA/versions/1.0.0/topics/parCov>
+
+
+* [**raster::layerStats**][layerStats]: Matriz de correlación de Pearson o covarianza a partir de un RasterBrick (o Stack).
+
+[layerStats]: <https://www.rdocumentation.org/packages/raster/versions/2.9-5/topics/layerStats>
+
+
+* [**raster::clusterR**][clusterR]: Raster creado a partir de cualquier función aplicada paralelizada sobre RasterBrick (o Stack) sin ventana de análisis (celda a celda).
+Se pueden aplicar funciones como **cov** o **cor**.
+
+[clusterR]: <https://www.rdocumentation.org/packages/raster/versions/2.9-5/topics/cluster>
+
+
+* [**raster::corLocal**][corLocal]: Raster de los coeficientes de correlación de Pearson, Spearman o Kendall calculados con ventana de análisis sobre Raster* (Layer, Stack o Brick).
+
+[corLocal]: <https://www.rdocumentation.org/packages/raster/versions/2.9-5/topics/corLocal>
+
+
+* [**spatialEco::rasterCorrelation**][rasterCorrelation]: Raster de los coeficientes de correlación de Pearson, Spearman o covarianza calculados con ventana de análisis sobre Raster* (Layer, Stack o Brick).
+
+[rasterCorrelation]: <https://www.rdocumentation.org/packages/spatialEco/versions/1.1-1/topics/rasterCorrelation>
+
+
+* [**spatialEco::raster.modifed.ttest**][raster.modifed.ttest]: SpatialPixelsDataFrame con los coeficientes de correlación mediante el "Dutilleul's modified t-test" calculado con ventana de análisis sobre Raster* (Layer, Stack o Brick), p-Valor del test de significancia y la correlación espacial de Moran I para los planos x e y.
+
+[raster.modifed.ttest]: <https://www.rdocumentation.org/packages/spatialEco/versions/1.1-1/topics/raster.modifed.ttest>
+
+
+## Selección inicial
+
+De las opciones identificas, las únicas que dan lugar a una matriz con coeficientes son [**cor**][cor], [**rcorr**][rcorr] y [**layerStats**][layerStats]. 
+Con ellas sería posible obtener los coefiencientes buscados y su posterior representación visual. 
+
+
+
+# Cálculo
+
+Se quiere comprobar la viabilidad de su uso y funcionamiento.
+
+```{sql, connection=con, output.var="covariates" }
+-- List of all available covariates
+SELECT DISTINCT tableoid::regclass::varchar AS covar_id, ST_BandPath(rast) AS path
+FROM _covar_rast
+ORDER BY covar_id
+LIMIT 2
+```
+
+```{r}
+rastlist <- foreach(r = seq_along(covariates$path), .final = function(l) setNames(l, covariates$covar_id) ) %do% {
+  covariates$path[[r]]
+}
+
+rastlist <- brick(rastlist)
+
+covar_mat <- getValues(rastlist)
+covar_mat <- covar_mat[complete.cases(covar_mat), ] 
+```
+
+```{r}
+# Correlation calculation with _cor_
+cor_cor <- covar_mat %>%
+  cor(method = "pearson")
+```
+
+```{r}
+# Correlation calculation with _rcorr_
+cor_rcorr <- covar_mat %>%
+  Hmisc::rcorr(type = "pearson")
+
+cor_rcorr.tidy <- broom::tidy(cor_rcorr)
+```
+
+```{r}
+# Correlation calculation with _layerStats_
+cor_layerStats <- raster::stack(covar_rast) %>%
+  raster::layerStats(stat = "pearson", na.rm = TRUE)
+```
+
+```{r}
+# Benchmarking
+microbenchmark::microbenchmark(
+  covar_mat %>% cor(method = "pearson"),
+  covar_mat %>% Hmisc::rcorr(type = "pearson"),
+  rastlist %>% raster::layerStats(stat = "pearson", na.rm = TRUE),
+  times = 3
+) %>%
+  saveRDS(file = path(proj$res, "cor_bench-pearson", ext = "rds") ) 
+```
+
+```{r, eval=TRUE, echo=FALSE}
+( readRDS(file = path(proj$res, "cor_bench-pearson", ext = "rds")) )
+```
+
+La función _layerStats_ es mucho más cómoda en su aplicación, porque permite utilizar una lista de rasters directamente, pero está limitada a la covarianza y la correlación de Pearson y es muy lenta.
+Mientras _rcorr_ y _cor_ dan mayor flexibilidad y son muchísimo más rápidas, pero implican la transformación a una matriz de los rasters para su uso.
+
+
+```{r}
+# Benchmarking
+microbenchmark::microbenchmark(
+  covar_mat %>% cor(method = "spearman"),
+  covar_mat %>% Hmisc::rcorr(type = "spearman"),
+  times = 3
+) %>%
+  saveRDS(file = path(proj$res, "cor_bench-spearman", ext = "rds") ) 
+```
+
+```{r, eval=TRUE, echo=FALSE}
+( readRDS(file = path(proj$res, "cor_bench-spearman", ext = "rds")) )
+```
+
+
+
+
+# Visualización
+
+Si bien la búsqueda en MetaCRAN devuelve más resultados, el único paquete de visualización compatible con la gramática _ggplot_ y _tidyverse_ y que cuente con un desarrollo activo es [**ggcorrplot**][ggcorrplot], el cuál está inspirado en **corrplot**.
+
+[ggcorrplot]: <https://www.r-pkg.org/pkg/ggcorrplot>
+
+Se prueba a visualizar las matrices de correlación generadas durante la fase anterior.
+
+```{r}
+library(ggcorrplot)
+
+ggcorrplot(cor_rcorr$r, method = "square",
+           hc.order = TRUE, type = "upper",
+           ggtheme = ggplot2::theme_gray,
+           colors = RColorBrewer::brewer.pal(n = 3, name = "RdBu"),
+           lab = TRUE)
+```
+
+```{r}
+ggcorrplot(cor_layerStats$`pearson correlation coefficient`, method = "square",
+           hc.order = TRUE, type = "upper",
+           ggtheme = ggplot2::theme_gray,
+           colors = RColorBrewer::brewer.pal(n = 3, name = "RdBu"),
+           lab = TRUE)
+```
+
+El paquete permite la correcta visualización y la [personalización][ggcorvis] de ambas matrices.
+
+[ggcorvis]: <https://github.com/cran/ggcorrplot>
+
+# ~~Paralelización~~
+
+**DEPRECATED** 
+
+Ninguno de los paquetes encontrados paralelizan los cálculos de manera automática. 
+Si bien durante la fase de prueba no se ha encontrado cuellos de botellas significativos con un único hilo de cálculo en ninguna de las funciones, el número de variables utilizado ha sido el mínimo (3).
+Dado que este número aumentará considerablemente (>20), se espera un crecimiento exponencial del tiempo de cálculo, ll que haría determinante el empleo de cálculos en paralelo.
+
+Ante esto, la alternativa más accesible resultaría paralelizar manualmente una de las funciones.
+Existen desarrollos que así lo muestran, como [**bigcor**][bigcor] y su fork paralelizado [**bigcorPar**][bigcorPar], que toman la función base **cor** y permiten su uso en matrices con gran número de columnas y además su paralelización respectivamente.
+
+[bigcor]: <https://github.com/cran/propagate/blob/master/R/bigcor.R>
+
+[bigcorPar]: <https://gist.github.com/bobthecat/5024079>
+
+El problema principal de estas funciones es el uso de un sistema de objetos de R fuera de memoria, que tienen su sentido en el uso de matrices de salidas muy grandes, no así las de entradas. 
+El caso de matrices provenientes de covariables sería inverso y no requiere este extra de complejidad. 
+Por ello, se adapta la función al sistema base de matrices y se corrige el uso incorrecto de la librería **foreach**.
+
+```{r}
+source("src/legacy.R")
+
+cor_bigcor <- bigmat_fun(covar_mat, func = cor, method = "pearson")
+```
+
+Se hace una comparativa (_benchmarking_) entre ambas funciones.
+
+```{r}
+microbenchmark::microbenchmark(
+  covar_mat %>% cor(method = "pearson"),
+  covar_mat %>% bigmat_fun(func = cor, method = "pearson"),
+  times = 5
+)
+```
+
+Donde la función base tiene mucho mayor rendimiento. 
+Se buscará repetir el mismo procedimiento con más covariables a la vez para comparar su uso.
+
+```{r}
+covar_matbig <- covar_mat %>%
+  cbind(covar_mat, covar_mat, covar_mat, covar_mat, covar_mat, covar_mat, covar_mat, covar_mat, covar_mat)
+
+microbenchmark::microbenchmark(
+  covar_matbig %>% cor(method = "pearson"),
+  covar_matbig %>% bigmat_fun(func = cor, method = "pearson"),
+  times = 2
+) %>%
+  saveRDS(file = path(proj$res, "matpar_bench", ext = "rds") ) 
+  
+```
+
+```{r, eval=TRUE, echo=FALSE}
+if (file_exists( path_wd(proj$res, "matpar_bench", ext = "rds")) == TRUE ) {
+  (readRDS( file = path(proj$res, "matpar_bench", ext = "rds") ))
+}
+```
+
+En contra de lo previsto, el uso de la función base es mucho más rápida y sigue siendo preferible. 
+Por este motivo, no hay ganancia en el uso de la versión paralelizada, sino al contrario.
+
+```{r}
+microbenchmark::microbenchmark(
+  covar_matbig %>% cor(method = "pearson"),
+  covar_matbig %>% Hmisc::rcorr(type = "pearson"),
+  times = 2
+) %>%
+  saveRDS(file = path(proj$res, "matbig_bench", ext = "rds") ) 
+```
+
+```{r, eval=TRUE, echo=FALSE}
+if (file_exists( path_wd(proj$res, "matbig_bench", ext = "rds")) == TRUE ) {
+  (readRDS( file = path(proj$res, "matbig_bench", ext = "rds") ))
+}
+```
+
+Lo mismo ocurre con la función **rcorr**.
+
+
+# Resultado
+
+Como conclusión, los paquetes y las funciones más adaptadas al flujo de trabajo actual es **Hmisc::rcor** para el cálculo, que permite el uso de matrices y devuelve la correlación con el *p-value* asociado, y **ggcorrplot** para su visualización posterior.
+**raster::layerStats** solo sería adecuado para el caso de querer representación gráfica en un ráster cómodamente.
