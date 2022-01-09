@@ -1,0 +1,1508 @@
+---
+title: "Conventional Soil Map refinement for DiCSM"
+author: "Alberto Lázaro-López"
+date: "4th July 2019"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+abstract: A conventional soil map forms the cornerstone of a disaggregation process, where it was elaborated under a smaller scale rule than the one envisioned. That's why it may happen that some elements on the land wasn't considered at that time, but now they are relevant. This document analyses the genuine conventional soil map and develops the incorporation of new miscellaneous areas to the original conventional soil map in order to get it ready for disaggregation its SMU.
+bibliography: ../ref/dicsm.bib
+---
+
+```{r core, include=FALSE}
+for (.i in paste0("src/", c("spatial", "dbms", "core", "raster"), ".R")) {
+  source(.i)
+}
+
+proj <- dir_ls(regexp = "sources") %>% 
+  .proj_subdir()
+```
+
+# Introducción
+
+El mapa de suelos convencional constituye el elemento fundamental de la disgregación, que ha sido elaborado a una escala inferior de la que se intenta alcanzar. 
+En este caso, el mapa objeto de disgregación proviene del proyecto de zonificación de la DO Campo de Borja [@Gomez-Miguel2015ZonificacionTerroirEstudio], cuya escala original es 1:25.000.
+
+Por este motivo, es posible que en el delineamiento no se considerasen elementos del territorio que serían conflictivos a la nueva escala. 
+Así, es necesario analizar y, en su caso, realizar un ajuste de las delineaciones e incorporar nuevas áreas misceláneas reconocibles a una mayor escala.
+
+
+
+# Mapa de suelos original
+
+Durante la previsualización del mapa de suelos original, se detecta que este contiene errores en las delineaciones, con ciertas SMU que son cubiertas por completo por otras SMU. 
+De forma **excepcional**, se corrigen esos errores en origen (*TEZISdb*).
+
+```{r, eval=TRUE}
+con2 <- DBI::dbConnect(odbc::odbc(), driver = "PostgreSQL Driver", 
+    database = "tezisdb", UID = keyring::key_list("psql-su")[1,2], PWD = keyring::key_get("psql-su"), 
+    host = "localhost", port = 5432)
+```
+
+```{sql, connection=con2}
+-- Some SMU are covered completed by others SMU
+select s.suelosid, upid
+from suelos.suelo as s, LATERAL (select suelosid AS upid
+							from suelos.suelo as up
+							where st_coveredby(s.geom, up.geom) and s.suelosid != up.suelosid) up
+-- 5 rows
+```
+
+```{sql, connection=con2}
+-- Saving the correct shape of the covering SMU
+CREATE TABLE suelos.suelo_cov AS
+select upid, dif as geom
+from suelos.suelo as s, LATERAL (select suelosid AS upid, ST_Difference(up.geom, s.geom) as dif
+							from suelos.suelo as up
+							where st_coveredby(s.geom, up.geom) and s.suelosid != up.suelosid) up
+
+```
+
+```{sql, connection=con2}
+-- Updating geometries of the covering SMU
+UPDATE suelos.suelo
+SET geom = suelo_cov.geom
+ FROM suelos.suelo_cov
+ WHERE suelo.suelosid = suelo_cov.upid
+```
+
+```{sql, connection=con2}
+-- Dropping intermediary tables
+DROP TABLE suelos.suelo_cov ;
+```
+
+
+## Región del proyecto
+
+De cara a limitar la extensión de los futuros trabajos, se define un área o región de trabajo. 
+Esta se ajustará a los límites fijados en el mapa convencional original.
+
+```{sql connection=con_odbc}
+BEGIN ; 
+
+CREATE MATERIALIZED VIEW csm.region AS
+SELECT 	row_number() over() as sid, 
+		ST_MakePolygon(ST_ExteriorRing(ST_Union(geom))) as geom
+FROM csm.soil ;
+
+COMMENT ON MATERIALIZED VIEW csm.region IS 'Project region by the extent of the original conventional soil map.' ;
+
+CREATE INDEX ON csm.region USING gist (geom) ;
+
+COMMIT ; 
+```
+
+
+
+
+
+# Áreas misceláneas
+
+La delineación manual de las nuevas áreas misceláneas sería un trabajo costoso que consumiría una gran cantidad de recursos. 
+Por ello, se opta por utilizar información vectorizada disponible que potencialmente incluya la mayor parte de las áreas misceláneas a la escala deseada. 
+Para el territorio estatal se distribuyen diferentes conjuntos capas vectorizados, dentro de los cuales se se consideran el **Catastro** y la **Base Topográfica Nacional** a escala 1:25.000.
+
+El **Catastro** de cada municipio puede ser descargado individualmente desde la [sede electrónica del Catastro](http://www.catastro.meh.es/esp/sede.asp). 
+Mientras, la **Base Topográfica Nacional** está disponible en el [Centro de Descargas del CNIG](http://centrodedescargas.cnig.es) por cada hoja de la Cuadrícula Cartográfica 1:25.000.
+
+
+## Análisis preliminar
+
+Los principales elementos de acción antrópica sobre el paisaje son carreteras y edificaciones. 
+En el análisis preliminar se buscará si los conjuntos de datos incluyen representaciones de los mismos y su calidad.
+
+El procesamiento será el mismo en ambos casos: los datos serán extraídos, comprobados y consolidados en el caso de que vayan a ser incluidos.
+
+### Catastro
+
+Los ficheros del catastro se obtienen mediante descarga manualmente de cada municipio. Una vez conseguidos, son extraídos.
+
+```{r}
+# Unzip files from every municipality.
+catastro <- path("raw", "catastro") %>%
+  dir_ls() %>% 
+  enframe()
+
+for (i in catastro$value) {
+  unzip(zipfile = i, exdir = path(path_dir(i), path_ext_remove(path_file(i))) )
+}
+```
+
+Después, se analiza la estructura del contenido por municipio para determinar la información disponible es de interés. Dentro de cada archivo comprimido se encuentran diferentes capas.
+
+```{r}
+# Check the structure within a municipality directory.
+path("raw", "catastro") %>%
+  dir_ls(regexp = "zip", invert = TRUE) %>%
+  enframe() %>%
+  top_n(1) %>%
+  select(value) %>%
+  flatten_chr() %>% 
+  dir_ls()
+```
+
+Se toma como ejemplo un municipio y se realiza un análisis visual en QGIS de las diferentes capas. Así, se detecta que las que incluyen información de importancia son **subparce** y **constru**. De la primera, los elementos de tipo *X* y de la segunda, todos los registros.
+
+### Base Topográfica Nacional 1:25.000 (BTN25)
+
+El Centro de Descargas del CNIG permite seleccionar todas las hojas de la BTN25 en base a su localización y descargarlas en grupo. De igual forma, se extraen todos los archivos obtenidos.
+
+```{r}
+# Unzip files from every cartographic sheet.
+btn25 <- path("raw", "btn25") %>%
+  dir_ls(regexp = "zip") %>% 
+  enframe()
+
+for (i in btn25$value) {
+  unzip(zipfile = i, exdir = path_ext_remove(i) )
+}
+```
+
+Según la documentación de metadatos de la BTN25, las geometrías están distribuidas por capas con una nomenclatura específica, que pueden estar o no presentes para una hoja y donde cada una cuenta con una estructura de atributos propia.
+
+
+### Selección definitiva
+
+A través de esta documentación y del análisis visual de los datos adquiridos tomando algunos ficheros como ejemplos, se selecciona para formar parte de las áreas misceláneas a las geometrías de líneas **carreteras** (0605) y las líneas de **ferrocarriles convencionales** (0641) y a las geometrías de polígonos **explotaciones mineras** (0540), **cementerios** (0522), **instalaciones industriales** (0513), **edificaciones** (0507), **entidades de población** (0502), **depósitos de aguas** (0331) y **almacenamiento de aguas** (0328).
+
+> Para la próxima sería interesante incluir a los ríos para intentar discernir automáticamente entre carreteras y ríos, aunque es difícil por el uso de los cauces secos o intermitentes como carreteras.
+
+Las geometrías de estas capas tienen tamaños y ajustes espaciales variables, encontrando que algunas están dispersas y son muy reducidas.
+En el momento de fijar la escala definitiva del mapa disgregado podría ocurrir que algunas de ellas no llegaran a la superficie mínima requerida y que tuviesen que ser integradas en geometrías adyacentes.
+Sin embargo, hasta conocer este dato, se incluirán todas las geometrías existentes.
+
+
+
+
+## Introducción en la base de datos
+
+Para el tratamiento conjunto de todas las nuevas delineaciones, los datos son cargados en la base de datos.
+
+### Catastro
+
+La carga de los elementos será en tablas temporales individuales para cada tipo de capa.
+
+#### Descompresión de archivos ZIP
+
+En primer lugar de descomprimen los archivos que contienen las capas seleccionadas para cada municipio.
+
+```{r}
+# Record all zip files of selected layers from every municipality.
+catastro <- path("raw", "catastro") %>%
+  dir_ls(regex = 'zip', recurse = TRUE) %>% 
+  enframe() %>% 
+  mutate(name = path_ext_remove(path_file(name))) %>%
+  filter(str_detect(name, regex('constru|^subparce', ignore_case = TRUE) )) %>%
+  mutate(value = path_wd(value)) %>% 
+  select(value) %>%
+  flatten_chr()
+
+# Unzip them
+for (i in catastro) {
+  unzip(zipfile = i, exdir = path(path_dir(i), path_ext_remove(path_file(i))) )
+}
+```
+
+```{r}
+# Record all SHP files from "constru"
+constru <- path("raw", "catastro") %>%
+  dir_ls(regex = 'zip', invert = TRUE, recurse = TRUE) %>% 
+  enframe() %>%
+  mutate(name = path_ext_remove(path_file(name)), 
+         value = path_wd(value)) %>%
+  filter(str_detect(name, regex('constru', ignore_case = TRUE)), str_detect(value, 'SHP$') ) 
+
+# Record all SHP files from "subparce"
+subparce <- path("raw", "catastro") %>%
+  dir_ls(regex = 'zip', invert = TRUE, recurse = TRUE) %>% 
+  enframe() %>%
+  mutate(name = path_ext_remove(path_file(name)),
+         value = path_wd(value)) %>%
+  filter(str_detect(name, regex('^subparce', ignore_case = TRUE)), str_detect(value, 'SHP$') ) 
+```
+
+#### Comprobación de SRID
+
+Se comprueba el SRID de las capas provenientes del Catastro.
+
+```{r}
+# Checking SRID and attributes of the layers
+glue("ogrinfo -al -so {src}",
+  src = path(constru$value[[1]])) %>%
+  system()
+```
+
+Usan el EPSG *25830*, que es el deseado, por lo que no hace falta hacer ninguna reproyección.
+
+#### Carga
+
+En primer lugar, se crea el *schema* donde se alojarán las tablas definitivas a través del apartado *csm* de la base de datos. Después, se efectúa la carga de cada conjunto de capas en su tabla correspondiente.
+
+```{r, eval=FALSE}
+# Specific schema for the refinement process
+sch <- "misc"
+
+# Create the new schema
+glue_sql("
+CREATE SCHEMA IF NOT EXISTS {`sch`} ;", .con = con) %>% dbExecute(conn = con)
+
+# Comment on new schema
+glue_sql("
+COMMENT ON SCHEMA {`sch`} IS {txt} ;",
+txt = paste("Temporal schema for miscellaneous areas"), .con = con) %>% dbExecute(conn = con)
+```
+
+```{r, eval=FALSE}
+# Loading "constru" shapefiles
+## While loading the first SHP file, a table is set up
+glue('shp2pgsql -c -D -s 25830 -I {constru$value[[1]]} misc.constru', 
+     ' | psql -h localhost -U {keyring::key_list("psql-su")[1,2]} -d dicsm') %>% system()
+
+## The rest of the SHP files belonging to the same set area appended to this new table
+pgis <- foreach(i = 2:length(constru$value)) %do% {
+  glue('shp2pgsql -a -D -s 25830 {constru$value[[i]]} misc.constru', 
+       ' | psql -h localhost -U {keyring::key_list("psql-su")[1,2]} -d dicsm') %>% system()
+}
+```
+
+```{r, eval=FALSE}
+# Loading "subparce" shapefiles
+## While loading the first SHP file, a table is set up
+glue('shp2pgsql -c -D -s 25830 -I {subparce$value[[1]]} misc.subparce', 
+     ' | psql -h localhost -U {keyring::key_list("psql-su")[1,2]} -d dicsm') %>% system()
+
+## The rest of the SHP files belonging to the same set area appended to this new table
+pgis <- foreach(i = 2:length(subparce$value)) %do% {
+  glue('shp2pgsql -a -D -s 25830 {subparce$value[[i]]} misc.subparce', 
+       ' | psql -h localhost -U {keyring::key_list("psql-su")[1,2]} -d dicsm') %>% system()
+}
+
+rm(pgis)
+```
+
+#### Filtrado
+
+Se filtran las delineaciones de **subparce** que no coinciden con el tipo *X*.
+
+```{sql, connection=con_odbc}
+BEGIN; 
+
+DELETE FROM misc.subparce
+WHERE tipo NOT LIKE 'X' ;
+
+SELECT count(*)
+FROM misc.subparce ;
+-- Everything looks correct
+
+COMMIT ;
+```
+
+#### Limpieza de archivos
+
+Se eliminan los archivos extraídos y se conservan las versiones comprimidas originales.
+
+```{r}
+# Delete extracted files and keep original compressed ones.
+path("raw", "catastro") %>%
+  dir_ls(regexp = "zip", invert = TRUE) %>% 
+  enframe() %>% 
+  mutate(value = path_wd(value)) %>%
+  select(value) %>% 
+  flatten_chr() %>% 
+  dir_delete()
+```
+
+### BTN25
+
+Se quiere disponer de todas las delineaciones pertenecientes a un mismo tipo de elemento de forma conjunta, que son servidas en origen divididas por hojas. Para ello, se agrupan todos los archivos de una misma capa y se introduce cada grupo en tablas independientes.
+
+```{r}
+# All records from every layer will be saved in the same table.
+# Every group table will be stored in a list.
+misc <- vector(mode = "list")
+
+# Record all files from "carretera" (0605)
+misc[["carretera"]] <- path("raw", "btn25") %>%
+  dir_ls(regex = 'zip', invert = TRUE, recurse = TRUE) %>% 
+  enframe() %>%
+  mutate(name = path_ext_remove(path_file(name)), 
+         value = path_wd(value)) %>%
+  filter(str_detect(name, '0605'), str_detect(value, 'shp$') )
+
+
+# Record all files from "fc_conv" (0641)
+misc[["fc_conv"]] <- path("raw", "btn25") %>%
+  dir_ls(regex = 'zip', invert = TRUE, recurse = TRUE) %>% 
+  enframe() %>%
+  mutate(name = path_ext_remove(path_file(name)), 
+         value = path_wd(value)) %>%
+  filter(str_detect(name, '0641'), str_detect(value, 'shp$') ) 
+
+
+# Record all files from "exp_min" (0540)
+misc[["exp_min"]] <- path("raw", "btn25") %>%
+  dir_ls(regex = 'zip', invert = TRUE, recurse = TRUE) %>% 
+  enframe() %>%
+  mutate(name = path_ext_remove(path_file(name)), 
+         value = path_wd(value)) %>%
+  filter(str_detect(name, '0540'), str_detect(name, 'point$', negate = TRUE), str_detect(value, 'shp$') ) 
+
+
+# Record all files from "cement" (0522)
+misc[["cement"]] <- path("raw", "btn25") %>%
+  dir_ls(regex = 'zip', invert = TRUE, recurse = TRUE) %>% 
+  enframe() %>%
+  mutate(name = path_ext_remove(path_file(name)), 
+         value = path_wd(value)) %>%
+  filter(str_detect(name, '0522'), str_detect(name, 'point$', negate = TRUE), str_detect(value, 'shp$') ) 
+
+
+# Record all files from "ins_ind" (0513)
+misc[["ins_ind"]] <- path("raw", "btn25") %>%
+  dir_ls(regex = 'zip', invert = TRUE, recurse = TRUE) %>% 
+  enframe() %>%
+  mutate(name = path_ext_remove(path_file(name)), 
+         value = path_wd(value)) %>%
+  filter(str_detect(name, '0513'), str_detect(name, 'point$', negate = TRUE), str_detect(value, 'shp$') ) 
+
+
+# Record all files from "edific" (0507)
+misc[["edific"]] <- path("raw", "btn25") %>%
+  dir_ls(regex = 'zip', invert = TRUE, recurse = TRUE) %>% 
+  enframe() %>%
+  mutate(name = path_ext_remove(path_file(name)), 
+         value = path_wd(value)) %>%
+  filter(str_detect(name, '0507'), str_detect(name, 'point$', negate = TRUE), str_detect(value, 'shp$') ) 
+
+
+# Record all files from "ent_pob" (0502)
+misc[["ent_pob"]] <- path("raw", "btn25") %>%
+  dir_ls(regex = 'zip', invert = TRUE, recurse = TRUE) %>% 
+  enframe() %>%
+  mutate(name = path_ext_remove(path_file(name)), 
+         value = path_wd(value)) %>%
+  filter(str_detect(name, '0502'), str_detect(name, 'point$', negate = TRUE), str_detect(value, 'shp$') ) 
+
+
+# Record all files from "dep_agu" (0331)
+misc[["dep_agu"]] <- path("raw", "btn25") %>%
+  dir_ls(regex = 'zip', invert = TRUE, recurse = TRUE) %>% 
+  enframe() %>%
+  mutate(name = path_ext_remove(path_file(name)), 
+         value = path_wd(value)) %>%
+  filter(str_detect(name, '0331'), str_detect(name, 'point$', negate = TRUE), str_detect(value, 'shp$') ) 
+
+# Record all files from "alm_agu" (0328)
+misc[["alm_agu"]] <- path("raw", "btn25") %>%
+  dir_ls(regex = 'zip', invert = TRUE, recurse = TRUE) %>% 
+  enframe() %>%
+  mutate(name = path_ext_remove(path_file(name)), 
+         value = path_wd(value)) %>%
+  filter(str_detect(name, '0328'), str_detect(name, 'point$', negate = TRUE), str_detect(value, 'shp$') ) 
+```
+
+#### Comprobación de SRID
+
+Se comprueba el SRID de las capas.
+
+```{r}
+# Checking SRID and attributes of the layers
+glue("ogrinfo -so -al {src}",
+  src = misc$ent_pob$value[[1]]) %>%
+  system()
+```
+
+Usan el EPSG *25830*, que es el deseado, por lo que no hace falta hacer ninguna re-proyección.
+
+#### Carga
+
+Carga de cada conjunto de capas en su tabla correspondiente.
+
+```{r}
+# Looping on every element in the list.
+# Loading shapefiles for every layer.
+for (i in seq_along(misc)) {
+  tb <- names(misc[i])
+  print(tb)
+  
+  ## While loading the first SHP file, a table is set up
+  glue('shp2pgsql -c -D -s 25830 -I {misc[[tb]]$value[[1]]} misc.{tb}', 
+     ' | psql -h localhost -U {keyring::key_list("psql-su")[1,2]} -d dicsm') %>% 
+    system() # ignore.stdout = TRUE, ignore.stderr = TRUE, intern = FALSE, wait = FALSE
+  
+  ## The rest of the SHP files belonging to the same set area appended to this new table
+  for (j in 2:length(misc[[tb]]$value)) {
+    glue('shp2pgsql -a -D -s 25830 {misc[[tb]]$value[[j]]} misc.{tb}', 
+         ' | psql -h localhost -U {keyring::key_list("psql-su")[1,2]} -d dicsm') %>% 
+      system()
+  }
+  rm(db)
+}
+```
+
+#### Filtrado
+
+Las geometrías cargadas se distribuyen a lo largo de las hojas del 1:25.000. Sin embargo, el área de la región de trabajo es inferior. Así, se eliminan todas las geometrías cuya *bounding box* no intercepte con la de ella. Se prefiere este método al de *cover*, dado que algunas geometrías se extienden por fuera de los límites de la región de trabajo y necesitan ser recogidas también.
+
+```{r}
+# Looping on every element in the _misc_ list.
+# Delete delineations outside the bounding box of the project region.
+for (i in seq_along(misc)) {
+  glue_sql("
+  DELETE FROM misc.{`names(misc[i])`} AS misc 
+  USING csm.region 
+  WHERE ST_Intersects(misc.geom, region.geom) IS FALSE ;", .con = con) %>% dbExecute(conn = con)
+}
+```
+
+#### Limpieza de archivos
+
+Se eliminan los archivos extraídos y se conservan las versiones comprimidas originales.
+
+```{r}
+# Delete extracted files and keep original compressed ones.
+path("raw", "btn25") %>%
+  dir_ls(regexp = "zip", invert = TRUE) %>% 
+  enframe() %>% 
+  mutate(value = path_wd(value)) %>%
+  select(value) %>% 
+  flatten_chr() %>% 
+  dir_delete()
+```
+
+
+## Integración
+
+Las nuevas áreas misceláneas han sido recogidas inicialmente bajo sus propias categorías, pero que no son equivalentes a las establecidas en el mapa original. 
+Con el fin de respetar la división original de las áreas misceláneas, se desarrolla la integración de las nuevas categorías en ellas. 
+Allí donde ya existieran delineaciones, estas serán fusionadas. 
+
+
+### Reglas de asignación de categorías
+
+Para llevar a cabo la integración se definen unas reglas de asignación de las categorías del BTN y el Catastro a las originales. 
+Estas se apoyan en el contraste visual de las delineaciones con una ortofoto de máxima actualidad.
+
+1.  JMu: poblaciones
+
+    *   edific
+    *   ent_pob
+    *   *constru*
+    *   *subparce*
+
+2.  JMi: industria
+
+    *   ins_ind
+    *   cement
+    *   dep_agua
+    *   *constru*
+    *   *subparce*
+
+3.  JMk: minería
+
+    *   exp_min
+
+4.  JMb: pastoreo
+
+5.  JMa: masas de agua
+
+    *   alm_agua
+    *   *subparce*
+
+6.  JMv : transporte
+
+    *   fc_conv
+    *   carretera
+    *   *subparce*
+
+Además, se detecta que ciertas categorías resultan muy gruesas y, específicamente, que las categorías del Catastro recogen polígonos con asignaciones diferentes a las capas provenientes del BTN25. 
+Por ello, se establecen reglas de equivalencias más complejas con el fin de evitar conflictos y pérdida de detalle categórico.
+
+#### ent_pob
+
+En un análisis visual, se observa que las geometrías de mayor tamaño tienen un ajuste espacial muy grosero, menor del presente en el mapa original. 
+Por ello, se limita la incorporación a las más pequeñas, cuyo *ratio A/P sea inferior a 20*.
+
+> El ratio podría haberse incrementado hasta 25.
+
+```{sql connection=con_odbc}
+-- Instead of deleting the rows, selected ones are gathered in a new table.
+CREATE TABLE misc.ent_pob_20 AS
+WITH ratio AS (
+  SELECT gid, st_area(geom) as area, (st_area(geom) / st_perimeter(geom)) as ratio  
+  FROM misc.ent_pob 
+), filter AS (
+  SELECT *
+  FROM ratio
+  WHERE ratio < 20
+)
+SELECT *
+FROM misc.ent_pob
+WHERE gid IN (SELECT gid FROM filter)
+```
+
+
+#### Constru
+
+Las geometrías de esta capa son divididas entre *industria* y *población*.
+
+```{r}
+# All 'constru' polygons intersected by another layer polygon (Point on Surface)
+glue_sql("
+CREATE TABLE misc.constru_pos AS
+WITH pos AS (
+	SELECT st_pointonsurface(geom) as pos, 'industria' as cat
+	FROM misc.ins_ind
+	UNION ALL
+	SELECT st_pointonsurface(geom) as pos, 'industria' as cat
+	FROM misc.cement
+	UNION ALL
+	SELECT st_pointonsurface(geom) as pos, 'industria' as cat
+	FROM misc.dep_agu
+	UNION ALL
+	SELECT st_pointonsurface(geom) as pos, 'poblacion' as cat
+	FROM misc.edific
+)
+SELECT c.gid, p.cat
+FROM misc.constru as c, pos as p
+WHERE ST_Intersects(c.geom, p.pos)", .con = con) %>% dbExecute(conn = con)
+
+# As there are only two categories, 'industria' and 'poblacion', 
+# sorting the rows DESC by category can do the trick poblacion > industria
+glue_sql("
+CREATE TABLE misc.constru_if AS
+WITH x AS (
+	SELECT gid, cat, count(*)
+	FROM misc.constru_pos
+	GROUP BY gid, cat
+)
+SELECT DISTINCT ON (gid) gid, cat
+FROM x
+ORDER BY gid ASC, count DESC, cat DESC", .con = con) %>% dbExecute(conn = con)
+
+
+glue_sql("
+CREATE TABLE misc.constru_else AS
+WITH exc AS (
+	SELECT gid
+	FROM misc.constru
+	EXCEPT
+	SELECT gid
+	FROM misc.constru_if
+)
+SELECT gid, 'poblacion' AS cat
+FROM exc", .con = con) %>% dbExecute(conn = con)
+```
+
+Se unifica ambas tablas con una vista. 
+
+```{sql connection=con_odbc}
+CREATE VIEW misc.constru_cat AS
+-- IF
+SELECT gid, geom, n.cat
+FROM misc.constru_if as n JOIN misc.constru USING (gid)
+UNION ALL 
+-- ELSE
+SELECT gid, geom, n.cat
+FROM misc.constru_else as n JOIN misc.constru USING (gid)
+```
+
+Mediante el análisis visual del resultado del ajuste automático mediante PoS se identifican algunas imperfecciones. 
+
+```{sql connection=con_odbc}
+DELETE FROM misc.constru_else WHERE gid IN (2741, 2742)
+```
+
+
+
+
+#### Subparce
+
+Las geometrías de esta capa son divididas entre *industria*, *población*, *agua* y *carretera*.
+
+```{r}
+# All 'constru' polygons intersected by another layer polygon (Point on Surface)
+glue_sql("
+CREATE TABLE misc.subparce_pos AS
+WITH pos AS (
+	-- Industria
+	SELECT st_pointonsurface(geom) as pos, 'industria' as cat
+	FROM misc.ins_ind
+	UNION ALL
+	SELECT st_pointonsurface(geom) as pos, 'industria' as cat
+	FROM misc.cement
+	UNION ALL
+	SELECT st_pointonsurface(geom) as pos, 'industria' as cat
+	FROM misc.dep_agu
+	UNION ALL
+	--- Mix
+	SELECT st_pointonsurface(geom) as pos, cat
+	FROM misc.constru INNER JOIN misc.constru_if USING (gid)
+	UNION ALL
+	-- Poblacion
+	SELECT st_pointonsurface(geom) as pos, 'poblacion' as cat
+	FROM misc.edific
+	UNION ALL
+	SELECT st_pointonsurface(geom) as pos, cat
+	FROM misc.constru INNER JOIN misc.constru_else USING (gid)
+	UNION ALL
+	-- Agua
+	SELECT st_pointonsurface(geom) as pos, 'agua' as cat
+	FROM misc.alm_agu
+	UNION ALL
+	SELECT st_pointonsurface(geom) as pos, 'agua' as cat
+	FROM csm.soil
+	WHERE smu_id ~* 'JMa'
+)
+SELECT c.gid, p.cat
+FROM misc.subparce as c, pos as p
+WHERE ST_Intersects(c.geom, p.pos)", .con = con) %>% dbExecute(conn = con)
+
+# As there are only two categories, 'industria' and 'poblacion', 
+# sorting the rows DESC by category can do the trick poblacion > industria
+glue_sql("
+CREATE TABLE misc.subparce_if AS
+WITH x AS (
+	SELECT gid, cat, count(*)
+	FROM misc.subparce_pos
+	GROUP BY gid, cat
+)
+SELECT DISTINCT ON (gid) gid, cat
+FROM x
+ORDER BY gid ASC, count DESC, cat DESC", .con = con) %>% dbExecute(conn = con)
+
+
+glue_sql("
+CREATE TABLE misc.subparce_else AS
+WITH exc AS (
+	SELECT gid
+	FROM misc.subparce
+	EXCEPT
+	SELECT gid
+	FROM misc.subparce_if
+)
+SELECT gid, 'carretera' AS cat
+FROM exc", .con = con) %>% dbExecute(conn = con)
+```
+
+Mediante el análisis visual del resultado del ajuste automático mediante PoS se identifican algunas imperfecciones. 
+Estas serán corregidas a través la actualización de las categorías asociadas a las geometrías de forma manual.
+
+```{r}
+# Table to collect manual categories
+glue_sql("
+CREATE TABLE misc.subparce_adj (
+  cat varchar(25) NOT NULL,
+  gid integer PRIMARY KEY NOT NULL
+)", .con = con) %>% dbExecute(conn = con)
+
+glue_sql("
+COPY misc.subparce_adj FROM {file} WITH NULL 'NULL' CSV", file = path_wd("tmp", "subparce_adj", ext = "csv"), .con = con) %>% dbExecute(conn = con)
+```
+
+Se comprueba que todos los registros pueden ser utilizados durante la actualización. 
+Como los registros en las tablas originales son únicos, si la suma de las futuras modificaciones coincide con el total, el proceso se dará por válido.
+
+```{r}
+local({
+  adj <- glue_sql("
+  SELECT *
+  FROM misc.subparce_adj", .con = con) %>% dbGetQuery(conn = con) %>% nrow()
+  
+  subparce <- vector("integer")
+  for (i in c("if","else")) {
+    subparce[i] <- glue_sql("
+    SELECT *
+    FROM misc.subparce_adj INNER JOIN misc.{`tb`} using (gid)", tb = paste("subparce", i, sep = "_"), .con = con) %>% dbGetQuery(conn = con) %>% nrow()
+  }
+  
+  adj == sum(subparce)
+})
+```
+
+Finalmente, se consolidan los cambios.
+
+```{r}
+subparce <- vector("list")
+for (i in c("if","else")) {
+subparce[[i]] <- glue_sql("
+  UPDATE misc.{`tb`} as main 
+  SET cat = adj.cat 
+  FROM misc.subparce_adj AS adj 
+  WHERE adj.gid = main.gid
+  RETURNING main.gid, main.cat", tb = paste("subparce", i, sep = "_"), .con = con) %>% dbGetQuery(conn = con) %>% nrow()
+}
+```
+
+Se unifica ambas tablas con una vista. 
+
+```{sql connection=con_odbc}
+CREATE VIEW misc.subparce_cat AS
+-- IF
+SELECT gid, geom, n.cat
+FROM misc.subparce_if as n JOIN misc.subparce USING (gid)
+UNION ALL 
+-- ELSE
+SELECT gid, geom, n.cat
+FROM misc.subparce_else as n JOIN misc.subparce USING (gid)
+```
+
+
+
+### Asignaciones
+
+```{sql connection=con_odbc}
+-- Pattern table to miscellaneous categories.
+CREATE TABLE misc.jmisc (
+  sid		  integer GENERATED ALWAYS AS IDENTITY,
+  geom		geometry(POLYGON,25830) NOT NULL,
+  smu_id	varchar(10) NOT NULL,
+  PRIMARY KEY (sid)
+) ;
+```
+
+
+#### JMu
+
+En primer lugar, se construyen las nuevas áreas de la categoría **JMu**, poblaciones, en las que se incluyen *edific* y *ent_pob*, más algunas de *constru* y *subparce*.
+Primero, se analizan visualmente las nuevas incorporaciones de las categorías previas. 
+
+```{sql, connection=con_odbc}
+BEGIN ; 
+
+CREATE TABLE misc.jmu ()
+INHERITS (misc.jmisc) ;
+
+
+INSERT INTO misc.jmu (sid, geom, smu_id)
+-- All geometries belonging to the _JMu_ category are collected (CTE).
+-- They are clustered based on distances between geometries and then their boundaries are dissolved within this groups.
+WITH misc AS (
+  -- Ent_pob
+	SELECT (ST_Dump(geom)).geom as geom
+	FROM misc.ent_pob_20
+	UNION ALL
+	-- Edific
+	SELECT (ST_Dump(geom)).geom as geom
+	FROM misc.edific
+	UNION ALL
+	-- Constru and Subparce
+	SELECT (ST_Dump(geom)).geom as geom
+	FROM misc.constru_cat
+	WHERE cat LIKE 'poblacion'
+	UNION ALL
+	SELECT (ST_Dump(geom)).geom as geom
+	FROM misc.subparce_cat
+	WHERE cat LIKE 'poblacion'
+), one AS (
+  -- Original geometries
+	SELECT geom
+	FROM csm.soil 
+	WHERE smu_id ~ 'JMu'
+	UNION ALL
+	-- Misc with buffer
+	SELECT ST_Buffer(ST_Force2D(geom), 0.5) AS geom
+  FROM misc
+), clust AS (
+  -- Force 2D of new geometries, 1 metre within clusters
+  SELECT unnest(ST_ClusterWithin(ST_Force2D(geom), 1)) AS grp 
+	FROM one
+), unioned AS (
+  SELECT (ST_Dump(ST_UnaryUnion(grp))).geom as geom
+  FROM clust
+)
+SELECT row_number() over() as sid, geom, 'JMu' as smu_id
+FROM unioned ;
+	  
+	  
+CREATE INDEX ON misc.jmu USING gist (geom) ;
+
+COMMIT ; 
+```
+
+
+
+#### JMi
+
+En siguiente lugar, la categoría **JMi**, industria, a las que se añaden *cement*, *dep_agua* y *ins_ind*, más algunas de *constru* y *subparce*.
+
+```{sql, connection=con_odbc}
+BEGIN ; 
+
+CREATE TABLE misc.jmi_one ()
+INHERITS (misc.jmisc) ;
+
+
+INSERT INTO misc.jmi_one (sid, geom, smu_id)
+-- All geometries belonging to the _JMu_ category are collected (CTE).
+-- They are clustered based on distances between geometries and then their boundaries are dissolved within this groups.
+WITH misc AS (
+-- Extras
+	SELECT (ST_Dump(geom)).geom as geom
+	FROM misc.cement
+	UNION ALL
+	SELECT (ST_Dump(geom)).geom as geom
+	FROM misc.dep_agu
+	UNION ALL
+	SELECT (ST_Dump(geom)).geom as geom
+	FROM misc.ins_ind
+	UNION ALL
+	-- Constru and Subparce
+	SELECT (ST_Dump(geom)).geom as geom
+	FROM misc.constru_cat
+	WHERE cat LIKE 'industria'
+	UNION ALL
+	SELECT (ST_Dump(geom)).geom as geom
+	FROM misc.subparce_cat
+	WHERE cat LIKE 'industria'
+), one AS (
+  -- Original geometries
+	SELECT geom
+	FROM csm.soil 
+	WHERE smu_id ~ 'JMi'
+	UNION ALL
+	-- Mis with buffer
+	SELECT ST_Buffer(ST_Force2D(geom), 0.5) AS geom
+  FROM misc
+), clust AS (
+  -- Force 2D of new geometries, 1 metre within clusters
+  SELECT unnest(ST_ClusterWithin(ST_Force2D(geom), 1)) AS grp 
+	FROM one
+), unioned AS (
+  -- Force single geometries after union
+  SELECT (ST_Dump(ST_UnaryUnion(grp))).geom as geom
+  FROM clust
+)
+SELECT row_number() over() as sid, geom, 'JMi' as smu_id
+FROM unioned ;
+	  
+	  
+CREATE INDEX ON misc.jmi_one USING gist (geom) ;
+
+COMMIT ; 
+```
+
+
+
+
+#### JMk
+
+Después, la categoría **JMk**, minería, que incluyen *exp_min*
+
+```{sql, connection=con_odbc}
+BEGIN ; 
+
+CREATE TABLE misc.jmk_one ()
+INHERITS (misc.jmisc) ;
+
+
+INSERT INTO misc.jmk_one (sid, geom, smu_id)
+-- All geometries belonging to the _JMu_ category are collected (CTE).
+-- They are clustered based on distances between geometries and then their boundaries are dissolved within this groups.
+WITH misc AS (
+  -- Exp_min
+	SELECT (ST_Dump(geom)).geom as geom
+	FROM misc.exp_min
+), one AS (
+  -- Original geometries
+	SELECT geom
+	FROM csm.soil
+	WHERE smu_id ~ 'JMk'
+	UNION ALL
+	-- Misc with buffer
+	SELECT ST_Buffer(ST_Force2D(geom), 0.5) AS geom
+  FROM misc
+), clust AS (
+  -- Force 2D of new geometries, 1 metre within clusters
+  SELECT unnest(ST_ClusterWithin(ST_Force2D(geom), 1)) AS grp 
+	FROM one
+), unioned AS (
+  -- Force single geometries after union
+  SELECT (ST_Dump(ST_UnaryUnion(grp))).geom as geom
+  FROM clust
+)
+SELECT row_number() over() as sid, geom, 'JMk' as smu_id
+FROM unioned ;
+	  
+	  
+CREATE INDEX ON misc.jmk_one USING gist (geom) ;
+
+COMMIT ; 
+```
+
+
+#### JMb
+
+La categoría **JMb** no tiene nuevas adscripciones. 
+Aún así, se crea una referencia aislada a las geometrías del mapa original de forma semejante al resto de categorías.
+
+```{sql connection=con_odbc}
+BEGIN ; 
+
+CREATE TABLE misc.jmb_one ()
+INHERITS (misc.jmisc) ;
+
+
+INSERT INTO misc.jmb_one (sid, geom, smu_id)
+WITH single AS (
+  SELECT (ST_Dump(geom)).geom AS geom
+  FROM csm.soil
+  WHERE smu_id ~ 'JMb'
+)
+SELECT row_number() over() as sid, geom, 'JMb' as smu_id
+FROM single ;
+
+
+CREATE INDEX ON misc.jmb_one USING gist (geom) ;
+
+COMMIT ;
+```
+
+
+#### JMa
+
+Después, la categoría *JMa*, masas de aguas, en la que se incluyen *alm_agua*, más algunas de *subparce*.
+
+```{sql, connection=con_odbc}
+BEGIN ; 
+
+CREATE TABLE misc.jma_one ()
+INHERITS (misc.jmisc) ;
+
+
+INSERT INTO misc.jma_one (sid, geom, smu_id)
+-- All geometries belonging to the _JMu_ category are collected (CTE).
+-- They are clustered based on distances between geometries and then their boundaries are dissolved within this groups.
+WITH misc AS (
+-- Extras
+	SELECT (ST_Dump(geom)).geom as geom
+	FROM misc.alm_agu
+	UNION ALL
+	SELECT (ST_Dump(geom)).geom as geom
+	FROM misc.subparce_cat
+	WHERE cat LIKE 'agua'
+), one AS (
+  -- Original geometries
+	SELECT geom
+	FROM csm.soil 
+	WHERE smu_id ~ 'JMa'
+	UNION ALL
+	-- Mis with buffer
+	SELECT ST_Buffer(ST_Force2D(geom), 0.5) AS geom
+  FROM misc
+), clust AS (
+  -- Force 2D of new geometries, 1 metre within clusters
+  SELECT unnest(ST_ClusterWithin(ST_Force2D(geom), 1)) AS grp 
+	FROM one
+), unioned AS (
+  -- Force single geometries after union
+  SELECT (ST_Dump(ST_UnaryUnion(grp))).geom as geom
+  FROM clust
+)
+SELECT row_number() over() as sid, geom, 'JMa' as smu_id
+FROM unioned ;
+	  
+	  
+CREATE INDEX ON misc.jma_one USING gist (geom) ;
+
+COMMIT ; 
+```
+
+
+
+
+#### JMv
+
+Por último, se unifican las áreas bajo *JMv*, transporte, en la que se incluyen geometrías de *fc_conv* y *carretera*, más algunas de *subparce*.
+Se decide heurísticamente emplear un *buffer* de 15 metros sobre las representaciones lineales para generar las áreas, considerando el tamaño de malla del raster (5 m.) y de la cobertura de los elementos constructivos como las autopistas.
+
+> El buffer podría ser reducido a 5 m.
+
+```{sql, connection=con_odbc}
+BEGIN ; 
+
+CREATE TABLE misc.jmv_one ()
+INHERITS (misc.jmisc) ;
+
+
+INSERT INTO misc.jmv_one (sid, geom, smu_id)
+-- All geometries belonging to the _JMu_ category are collected (CTE).
+-- They are clustered based on distances between geometries and then their boundaries are dissolved within this groups.
+WITH lineal AS (
+  SELECT (ST_Dump(geom)).geom as geom
+	FROM misc.fc_conv
+	UNION ALL
+	SELECT (ST_Dump(geom)).geom as geom
+	FROM misc.carretera
+), high AS (
+  SELECT (ST_Dump(geom)).geom as geom
+	FROM misc.carretera
+	WHERE etiqueta ~* 'AP.*'
+), misc AS (
+	SELECT (ST_Dump(geom)).geom as geom
+	FROM misc.subparce_cat
+	WHERE cat LIKE 'carretera'
+), one AS (
+  -- Original geometries
+	SELECT geom
+	FROM csm.soil 
+	WHERE smu_id ~ 'JMa'
+	UNION ALL
+	-- Misc with buffer
+	SELECT ST_Buffer(ST_Force2D(geom), 0.5) AS geom
+  FROM misc
+  UNION ALL
+  -- Lineal with mid buffer
+  SELECT ST_Buffer(ST_Force2D(geom), 7.5) AS geom
+  FROM lineal
+  UNION ALL 
+  -- Highways
+  SELECT ST_Buffer(ST_Force2D(geom), 15) AS geom
+  FROM high
+) 
+SELECT row_number() over() as sid, geom, 'JMv' as smu_id
+FROM one ;
+	  
+	  
+CREATE INDEX ON misc.jmv_one USING gist (geom) ;
+
+COMMIT ; 
+```
+
+
+
+### Intersecciones entre categorías
+
+A través de un análisis visual, se identifica la existencia de intersecciones entre las geometrías de las nuevas áreas misceláneas que pertenecen a diferentes categorías y que darían lugar a áreas solapadas no admisibles en el mapa disgregado.
+Para solucionarlas se establece la preferencia de las áreas misceláneas según el orden de presentación de las reglas de asignación, de forma que se descartarían los solapes de aquellas áreas de menor valor. 
+Por ejemplo, las pertenecientes a **JMu** predominarán sobre **JMv**, consiguiendo así que sus formas sean respetadas respecto al resto. 
+Específicamente, una carretera que cruce un pueblo verá eliminada la fracción que lo atraviesa y el pueblo conservará su forma completa.
+
+```{sql connection=con_odbc}
+CREATE MATERIALIZED VIEW misc.jm_inter AS
+SELECT a.smu_id as aid, b.smu_id as bid, count(*)
+FROM misc.jmisc as a, misc.jmisc as b
+WHERE ST_Intersects(a.geom, b.geom) AND a.smu_id != b.smu_id
+GROUP BY a.smu_id, b.smu_id
+ORDER BY aid, bid
+```
+
+#### JMi 
+
+En primer lugar, se comprueban si existen solapes entre poblaciones (**JMu**) y zonas industriales (**JMi**). 
+
+```{sql connection=con_odbc}
+SELECT *
+FROM misc.jm_inter
+WHERE aid ~* 'jmi'
+```
+
+Y se ejecuta la intersección. 
+
+```{sql connection=con_odbc}
+BEGIN ; 
+
+CREATE TABLE misc.jmi (
+  LIKE misc.jmisc INCLUDING ALL 
+) ;
+
+
+INSERT INTO misc.jmi (geom, smu_id)
+-- Lower rank parts intersecting those above are removed by difference.
+-- This step is done with a single multi-geometry for every category, so the process is executed at once.
+WITH up AS (
+  -- jmu
+	SELECT ST_Collect(geom) AS geom
+	FROM misc.jmu
+), low AS (
+  -- jmi
+	SELECT ST_Collect(geom) AS geom, max(smu_id) AS smu_id
+	FROM misc.jmi_one
+), diff AS (
+  SELECT (ST_Dump(ST_Difference(low.geom, up.geom))).geom as geom, smu_id
+  FROM up, low
+)
+SELECT geom, smu_id
+FROM diff ;
+
+
+CREATE INDEX ON misc.jmi USING gist (geom) ;
+
+COMMIT ; 
+```
+
+```{sql connection=con_odbc}
+BEGIN ; 
+
+ALTER TABLE misc.jmi_one NO INHERIT misc.jmisc ;
+
+ALTER TABLE misc.jmi INHERIT misc.jmisc ;
+
+COMMIT ; 
+```
+
+
+#### JMk
+
+Después, entre estas capas con **JMk**.
+
+```{sql connection=con_odbc}
+SELECT *
+FROM misc.jm_inter
+WHERE bid ~* 'jmk' AND aid ~* 'jm[ui]'
+```
+
+```{sql connection=con_odbc}
+BEGIN ; 
+
+CREATE TABLE misc.jmk (
+  LIKE misc.jmisc INCLUDING ALL 
+) ;
+
+
+INSERT INTO misc.jmk (geom, smu_id)
+-- Lower rank parts intersecting those above are removed by difference.
+-- This step is done with a single multi-geometry for every category, so the process is executed at once.
+with up_clust as (
+	SELECT unnest(ST_ClusterWithin(ST_Force2D(geom), 1)) AS grp
+	FROM misc.jmisc
+	WHERE smu_id ~* 'jm[ui]'
+), up AS (
+	SELECT ST_Collect(ST_UnaryUnion(grp)) as geom
+  	FROM up_clust
+), low AS (
+  -- jmk
+	SELECT ST_Collect(geom) AS geom, max(smu_id) AS smu_id
+	FROM misc.jmk_one
+), diff AS (
+  SELECT (ST_Dump(ST_Difference(low.geom, up.geom))).geom as geom, smu_id
+  FROM up, low
+)
+SELECT geom, smu_id
+FROM diff ;
+
+
+CREATE INDEX ON misc.jmk USING gist (geom) ;
+
+COMMIT ; 
+```
+
+```{sql connection=con_odbc}
+BEGIN ; 
+
+ALTER TABLE misc.jmk_one NO INHERIT misc.jmisc ;
+
+ALTER TABLE misc.jmk INHERIT misc.jmisc ;
+
+COMMIT ; 
+```
+
+
+#### JMb
+
+Después, entre todas las capas anteriores con **JMb**.
+
+```{sql connection=con_odbc}
+SELECT *
+FROM misc.jm_inter
+WHERE bid ~* 'jmb' AND aid ~* 'jm[uik]'
+```
+
+Como no existe ningún caso, se sigue al siguiente punto.
+Previamente, se consolida esta categoría como si se hubiese intersectado.
+
+
+```{sql connection=con_odbc}
+ALTER TABLE misc.jmb_one RENAME TO jmb ;
+```
+
+
+#### JMa
+
+Nuevamente, entre todas las capas anteriores con **JMa**.
+
+```{sql connection=con_odbc}
+SELECT *
+FROM misc.jm_inter
+WHERE bid ~* 'jma' AND aid ~* 'jm[uikb]'
+```
+
+```{sql connection=con_odbc}
+BEGIN ; 
+
+CREATE TABLE misc.jma (
+  LIKE misc.jmisc INCLUDING ALL 
+) ;
+
+
+INSERT INTO misc.jma (geom, smu_id)
+-- Lower rank parts intersecting those above are removed by difference.
+-- This step is done with a single multi-geometry for every category, so the process is executed at once.
+with up_clust as (
+	SELECT unnest(ST_ClusterWithin(ST_Force2D(geom), 1)) AS grp
+	FROM misc.jmisc
+	WHERE smu_id ~* 'jm[uikb]'
+), up AS (
+	SELECT ST_Collect(ST_UnaryUnion(grp)) as geom
+  	FROM up_clust
+), low AS (
+	SELECT ST_Collect(geom) AS geom, max(smu_id) AS smu_id
+	-- jma
+	FROM misc.jma_one
+), diff AS (
+  SELECT (ST_Dump(ST_Difference(low.geom, up.geom))).geom as geom, smu_id
+  FROM up, low
+)
+SELECT geom, smu_id
+FROM diff ;
+
+
+CREATE INDEX ON misc.jma USING gist (geom) ;
+
+COMMIT ; 
+```
+
+```{sql connection=con_odbc}
+BEGIN ; 
+
+ALTER TABLE misc.jma_one NO INHERIT misc.jmisc ;
+
+ALTER TABLE misc.jma INHERIT misc.jmisc ;
+
+COMMIT ; 
+```
+
+
+#### JMv
+
+Por último, entre todas las capas anteriores con **JMv**.
+
+```{sql connection=con_odbc}
+SELECT *
+FROM misc.jm_inter
+WHERE bid ~* 'jmv' AND aid ~* 'jm[uikba]'
+```
+
+
+```{sql connection=con_odbc}
+BEGIN ; 
+
+CREATE TABLE misc.jmv (
+  LIKE misc.jmisc INCLUDING ALL 
+) ;
+
+
+INSERT INTO misc.jmv (geom, smu_id)
+SELECT (ST_Dump(ST_Difference(low.geom, up_one.geom))).geom as geom, smu_id
+FROM misc.jmv_one AS low, LATERAL (SELECT ST_Union(geom) AS geom
+					   		FROM misc.jmisc AS up
+					   		WHERE ST_Intersects(low.geom, up.geom) AND smu_id ~* 'jm[uikba]'
+						   ) up_one ;
+
+INSERT INTO misc.jmv (geom, smu_id)
+WITH up AS ( 
+	SELECT geom
+	FROM misc.jmisc AS up
+	WHERE smu_id ~* 'jm[uikba]'
+), sel AS (
+	SELECT low.sid, low.geom, smu_id
+	FROM misc.jmv_one as low, up
+	WHERE ST_Intersects(low.geom, up.geom)
+) 
+SELECT geom, smu_id
+FROM misc.jmv_one
+WHERE sid NOT IN (SELECT sid FROM sel) ;
+
+
+CREATE INDEX ON misc.jmv USING gist (geom) ;
+
+COMMIT ; 
+```
+
+```{sql connection=con_odbc}
+BEGIN ; 
+
+ALTER TABLE misc.jmv_one NO INHERIT misc.jmisc ;
+
+ALTER TABLE misc.jmv INHERIT misc.jmisc ;
+
+COMMIT ; 
+```
+
+
+
+#### Recorte con la región de trabajo
+
+Finalmente, se recorta el resultado a la región de trabajo.
+
+```{sql connection=con_odbc}
+BEGIN ; 
+
+CREATE TABLE misc.jmisc_one (
+  LIKE misc.jmisc INCLUDING ALL 
+) ;
+
+INSERT INTO misc.jmisc_one (geom, smu_id)
+SELECT (ST_Dump(ST_Intersection(jm.geom, r.geom))).geom as geom, jm.smu_id
+FROM misc.jmisc as jm, csm.region as r 
+WHERE ST_Intersects(jm.geom, r.geom) ;
+
+CREATE INDEX ON misc.jmisc_one USING gist (geom) ;
+
+COMMIT ;
+```
+
+
+
+
+
+# Mapa de suelos refinado
+
+Este mapa será el utilizado durante el proceso de disgregación. 
+Con él se busca reducir en gran medida los elementos constructivos antrópicos que modifican el paisaje y alteran la percepción a través del MDT y las imágenes de teledetección. 
+Incluye todas las nuevas áreas misceláneas generadas.
+
+## Refinado de las SMU
+
+Primero se modifican aquellas SMU que se ven afectadas por las nuevas áreas misceláneas recién construidas. 
+Como las áreas misceláneas originales están ya incluidas en estas últimas, se descartan.
+
+```{sql, connection=con_odbc}
+BEGIN ; 
+CREATE VIEW csm.soil_base AS
+SELECT *
+  FROM csm.soil
+  WHERE smu_id !~ '^JM' ;
+--
+COMMENT ON VIEW csm.soil_base IS 'Delineations of SMU excluding miscellaneous areas' ;
+COMMIT ;
+```
+
+```{sql, connection=con_odbc}
+BEGIN ; 
+-- New miscellaneous parts intersecting with SMU are removed by difference. 
+CREATE MATERIALIZED VIEW csm.soil_mod AS
+SELECT suelosid, ST_Difference(base.geom, jm.geom) as geom, smu_id
+FROM csm.soil_base AS base, LATERAL (SELECT ST_Union(geom) as geom
+				   	                    FROM misc.jmisc_one as j
+				   	                    WHERE ST_Intersects(base.geom, j.geom)
+				  	                    ) jm ;
+--
+CREATE INDEX ON soil_mod USING gist (geom)	;
+--
+COMMIT ; 
+```
+
+> Se detecta visualmente que una porción de una de las delineaciones (suelosid = 111) no devuelve un resultado favorable.
+> Se opta por generarlo manualmente seleccionando las áreas misceláneas inmediatamente limítrofes a la zona de interés. 
+Posteriormente, se integra en la tabla.
+
+Y se aíslan aquellas que no lo han sido. 
+
+```{sql, connection=con_odbc}
+-- Collecting all unmodified SMU.
+CREATE MATERIALIZED VIEW csm.soil_unmod AS
+SELECT *
+FROM csm.soil_base
+WHERE suelosid IN (SELECT DISTINCT suelosid 
+                  FROM csm.soil_mod
+					        WHERE geometrytype(geom) IS NULL)
+```
+
+Posteriormente, se comprueba visualmente el resultado.
+
+## Consolidación
+
+### Consolidación de las referencias foráneas
+
+El nuevo mapa va a sustituir al anterior como mapa de suelos base para el estudio. 
+La nueva tabla de delineaciones de este mapa necesitará tomar como referencia las SMU existentes. 
+Por este motivo, se consolida la tabla foránea *smu* en la base de datos de disgregación (DiCSM). 
+Como no será modificada la tabla, no es necesario su recreación desde cero y se opta por su copia literal.
+
+```{sql, connection=con_odbc}
+BEGIN ; 
+-- Rename foreign table that is going to be sustituted. 
+ALTER FOREIGN TABLE csm.smu RENAME TO _smu ;
+
+-- Copying the table, defining the PRIMARY KEY and creating the index of the new _SMU_ table.
+CREATE TABLE csm.smu AS
+SELECT *
+FROM csm._smu ;
+--
+ALTER TABLE csm.smu ADD PRIMARY KEY (smu_id) ;
+--
+CREATE INDEX ON csm.smu (smu_id) ;
+--
+COMMENT ON TABLE csm.smu IS 'Soil Map Units (SMU). With phases ' ;
+
+COMMIT ;
+```
+
+
+
+### Consolidación de las SMU modificadas
+
+El nuevo mapa es alojado en una única relación que responde a la estructura de *soil*.
+
+```{sql connection=con_odbc}
+-- Creating table for the new map.
+BEGIN ;
+
+ALTER TABLE csm.soilref ADD FOREIGN KEY (smu_id) REFERENCES smu(smu_id) ;
+
+COMMIT ; 
+```
+
+
+Y se rellena con los nuevos datos.
+
+```{sql, connection=con_odbc}
+-- Geometries from unmodified SMU
+INSERT INTO csm.soilref (geom, smu_id)
+SELECT (ST_Dump(geom)).geom as geom, smu_id
+FROM soil_unmod ;
+```
+
+```{sql, connection=con_odbc}
+-- Geometries from modified SMU
+INSERT INTO csm.soilref (geom, smu_id)
+SELECT geom, smu_id
+FROM ( SELECT (ST_Dump(geom)).geom as geom, smu_id
+        FROM soil_mod ) x
+WHERE geometrytype(geom) !~ 'LIN'
+```
+
+
+### Consolidación de las áreas misceláneas
+
+```{sql, connection=con_odbc}
+-- Geometries from new miscellaneous areas
+INSERT INTO csm.soilref (geom, smu_id)
+SELECT geom, smu_id
+FROM misc.jmisc_one ;
+```
+
+
+## Limpieza
+
+Finalmente, se elimina las relaciones intermedias y sus dependencias.
+
+```{sql, connection=con}
+-- Drop intermediary tables
+DROP MATERIALIZED VIEW csm.soil_mod CASCADE ;
+```
+
+```{sql, connection=con}
+-- Drop intermediary tables
+DROP SCHEMA misc CASCADE ;
+```
+
+
+
+# Bibliografía
+
+::: {#refs}
+:::

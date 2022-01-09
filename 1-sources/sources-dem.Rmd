@@ -1,0 +1,756 @@
+---
+title: "DEM processing for DiCSM"
+author: "Alberto Lázaro-López"
+date: "27th March 2019"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+abstract: A Digital Elevation Model (DEM) is a key data source for covariates calculation in Digital Soil Mapping (DSM), mainly for geomorphometric and hydrologic kind. This document collect the methodology for selection, procesing and loading of a DEM. 
+bibliography: ../ref/dicsm.bib
+---
+
+```{r core, include=FALSE }
+for (.i in paste0("src/", c("spatial", "dbms", "core", "raster", "vector"), ".R" ) ) source(.i)
+
+proj <- dir_ls(regexp = "sources") %>% 
+  .proj_subdir()
+```
+
+
+# Introducción
+
+Se parte de un mapa de suelos convencional cuyas SMU son politáxicas, del tipo asociaciones, con el objetivo de desagregarlas en unidades monotáxicas o consociaciones, donde el principio básico de la desagregación es que *el patrón de distribución de las STU puede ser delimitado a una mayor escala o resolución*.
+
+
+# Resolución
+
+El mapa objeto de desagregación proviene del proyecto de zonificación de la DO Campo de Borja [@Gomez-Miguel2015ZonificacionTerroirEstudio], cuya escala original es 1:25.000. Para la correcta delimitación de las SMU del tipo consociaciones la escala objetivo debería ser cercana a 1:10.000, lo que supondría aproximadamente el doble de la escala actual.
+
+Siguiendo las indicaciones de [@Hengl2006FindingRightPixel], se determina la escala adecuada de trabajo: 
+`p = denominador de escala * MLA`
+, donde el *p*, tamaño de malla (*grid size*), para un *MLA* (*Maximum Legible Area*) de 0,5 mm sería de **5 m**.
+
+$$p = 10,000 * 0.0005$$
+
+# Fuentes
+
+Se buscan y descargan MDT de una resolución de 5 m desde diferentes fuentes. 
+
+| Fuentes | Año | Resolución (m) |
+|----|----|:----:|
+| CNIG[^cnig] | 2009 | 5 |
+| IGA[^iga] | 2015* | 5 |
+  : Metadatos de los MDT considerados.
+
+[^cnig]: <http://centrodedescargas.cnig.es/CentroDescargas/index.jsp>
+  "Centro de Descargas del IGN"
+[^iga]: <https://idearagon.aragon.es/>
+  "IDE Aragón"
+
+Son comparados mediante el resumen de sus atributos y su visualización a través de QGIS. 
+Realmente, se trata del mismo MDT generado por el IGN, pero distribuido por diferentes entidades. 
+IDE Aragón no está reseñando correctamente la información sobre el MDT, e incluso presenta dos versiones de años diferentes, 2012 y 2015, en su web sin especificar sus diferencias.
+
+Por ello, se decide utilizar el MDT original obtenido desde el CNIG.
+
+
+# Comprobaciones previas y preparación
+
+> Como alternativa, podrían analizarse los datos por gdalinfo y, luego, unirse en mosaico con SAGA para evitar la carga y descarga 
+
+Se analizan los raster-tiles correspondientes a las hojas de la cuadrícula 1:50.000.
+
+```{r}
+# Get all raster-tiles
+dem <- path("raw/dem/cnig_2009") %>% 
+  dir_ls(regexp = "asc")
+
+# Analize its details with GDAL
+glue('gdalinfo {dem[[1]]}') %>% 
+  system()
+```
+Comprobamos que los raster tienen la misma resolución (*5 m*) y número de bandas (*1*), así como que tienen el mismo tipo de dato de pixel (*32BF*) y el mismo tipo de no valor (*-999*).
+
+# Mosaico ~ Unión
+
+Se emplea la herramienta mosaico para integrar todos los raster-tiles en un único ráster.
+Se comprueba manualmente en QGIS que para un mismo pixel los valores en diferentes raster son los mismos, por lo que el mosaico o la unión de los raster-tiles en un único raster puede ser realizada fácilmente.
+Esta se efectuará con el módulo [**Mosaico**][mosaic] de *SAGA GIS*.
+Fuera de lo que podría esperarse, el módulo es capaz de interpretar los archivos de partida en su formato original, por lo que se aprovecha el proceso también para conseguir un único archivo en el formato propio de *SAGA*.
+
+[mosaic]: <http://www.saga-gis.org/saga_tool_doc/7.4.0/grid_tools_3.html>
+
+```{r}
+# Mosaicking
+saga_grids <- dem %>% 
+  path_wd() %>% 
+  paste0(collapse = ";")
+
+dem <- path_wd("gis", "dem", "dem_one", ext = "sdat")
+
+rsaga.geoprocessor(lib = "grid_tools", module = 3, # Mosaicking
+                   param = list(GRIDS = saga_grids,
+                                TARGET_TEMPLATE = path_wd(dem[[1]]),
+                                TARGET_OUT_GRID = dem,
+                                NAME = "DEM", 
+                                TYPE = 9, # Default
+                                RESAMPLING = 3, # Default
+                                OVERLAP = 1, # Last. Default
+                                BLEND_DIST = 10, # Default
+                                BLEND_BND = 0, # Default
+                                MATCH = 2 # Match histogram of overlapping area
+                                ),
+                   env = env )
+```
+
+
+
+# Región de trabajo
+
+La región que abarcan las hojas de las cuadrículas y sus raster-tiles correspondientes es muy superior a la superficie de la DO. 
+Para optimizar los tiempos de cálculo y el tamaño final de la base de datos, se busca reducir la región de trabajo y que sus límites sean más próximos a los de la DO.
+
+El criterio de fijación de los límites es que la reducción no suponga pérdida de información necesaria para los cálculos posteriores de las covariables.
+Para ello, se hace uso de la herramienta [*Edge contamination*][edge] de *SAGA*, que analiza si los límites de los MDT condicionan los resultados en el área de interés.
+
+[edge]: <http://www.saga-gis.org/saga_tool_doc/7.4.0/ta_hydrology_13.html>
+
+
+```{r}
+# Edge Contamination process
+rsaga.geoprocessor(lib = "ta_hydrology", module = 13, # Edge Contamination
+                   param = list(ELEVATION = dem,
+                                CONTAMINATION = path_wd("gis", "dem", "edgecon", ext = "sdat"),
+                                METHOD = "1"),
+                   env = env)
+```
+
+El resultado se visualiza en QGIS y se observa que contando con la contaminación desde la región original de las cuadrículas hay mucho margen de reducción. 
+
+Para la búsqueda del nuevo límite se escoge una distancia de partida de 2.000 m para un *buffer* desde los límites de la DO, con lo que se recortará el raster mediante la herramienta [**Clip**][clip] de *SAGA*. 
+Se repite el procedimiento de comprobación usando ambos módulos hasta encontrar una distancia en la que no exista contaminación. 
+Este proceso en bucle es manual en la medida que la comprobación de la contaminación se realiza visualmente.
+
+[clip]: <http://www.saga-gis.org/saga_tool_doc/7.4.0/shapes_grid_7.html>
+
+## Búsqueda
+
+```{r}
+# Region generation
+glue('pgsql2shp -f {path_wd("gis", "dem", "buffer-3_5k", ext = "shp")} {pgsql} ',
+     double_quote('SELECT ROW_NUMBER () OVER () as sid, ST_Transform(ST_ConvexHull(ST_Buffer(geom, 3500)), 25830) as geom FROM csm.region'),
+     pgsql = glue("-h localhost -u {keyring::key_list(\"psql-su\")[1,2]} -P {keyring::key_get(\"psql-su\")} dicsm")) %>% system()
+```
+
+```{r}
+# DEM clip with the generated region
+rsaga.geoprocessor(lib = "shapes_grid", module = 7, # Clip Grid with Polygon
+                   param = list(INPUT = dem, 
+                                POLYGONS = path_wd("gis", "dem", "buffer-3_5k", ext = "shp"),
+                                OUTPUT = path_wd("gis", "dem", "dem-3_5k", ext = "sdat"),
+                                EXTENT = "1"),
+                   env = env)
+
+# Edge contamination geoprocess
+rsaga.geoprocessor(lib = "ta_hydrology", module = 13, # Edge Contamination
+                   param = list(ELEVATION = path_wd("gis", "dem", "dem-3_5k", ext = "sgrd"), 
+                                CONTAMINATION = path_wd("gis", "dem", "edgecon-3_5k-m", ext = "sgrd"),
+                                METHOD = "1"),
+                   env = env)
+```
+
+Se considera el cálculo con un método de dirección de flujo múltiple ya que es el que se prevee utilizar. 
+Cuando se usa el método simple (*D8*), los efectos de los bordes son menores.
+
+```{r}
+# Edge contamination with single flow method
+rsaga.geoprocessor(lib = "ta_hydrology", module = 13, # Edge Contamination
+                   param = list(ELEVATION = path_wd("gis", "dem", "dem-3_5k", ext = "sdat"), 
+                                CONTAMINATION = path_wd("gis", "dem", "edgecon-3_5k-s", ext = "sdat"),
+                                METHOD = "0"),
+                   env = env)
+```
+
+Finalmente, la distancia determinada es **3.500 m**
+
+
+## Región de trabajo definida
+
+Se crea una vista en la base de datos que guarde la región de trabajo seleccionada con índice y comentarios.
+
+```{sql, connection=con}
+CREATE MATERIALIZED VIEW IF NOT EXISTS csm.mask AS
+SELECT ROW_NUMBER() OVER() AS sid, ST_ConvexHull( ST_Buffer(geom, 3500)) AS geom 
+  FROM csm.region
+```
+
+```{sql, connection=con}
+BEGIN ;
+CREATE INDEX ON csm.mask USING gist (geom) ;
+COMMENT ON MATERIALIZED VIEW csm.mask IS 'Minimum region for raster processing without edge contamination made with a 3.500 m buffer. / DO Campo de Borja' ;
+COMMIT ;
+```
+
+
+## Reducción del MDT a la región de trabajo
+
+Y se recorta el MDT con esta región para desechar el resto.
+
+```{r}
+# DEM clip with the generated region
+dem[[2]] <- path_wd("gis", "dem", "dem_clip", ext = "sdat")
+
+rsaga.geoprocessor(lib = "shapes_grid", module = 7, # Clip Grid with Polygon
+                   param = list(INPUT = dem[[1]], 
+                                POLYGONS = path_wd("gis", "buffer-3_5k", ext = "shp"),
+                                OUTPUT = dem[[2]],
+                                EXTENT = "1"),
+                   env = env)
+
+dem <- dem[[2]]
+```
+
+
+# Filtrado
+
+Uno de los principales problemas encontrados con las covariables generadas durante las fases iniciales de pruebas era el nivel de ruido que presentaban, que se podía observar en la alta variación de sus valores en distancias cortas y que afectaba después a la formación de grupos.
+El origen de este ruido (o *"speckles"*) puede encontrarse en el alto nivel de detalle de los datos originales, unido a los métodos utilizados para el cálculo de las covariables, la ventana de análisis seleccionada, o, simplemente, debido a anomalías en la elaboración del MDT.
+
+Para minizar lo máximo posible la incidencia del ruido existen técnicas de filtrado específicas para superficies 3D, como los MDT, que emplean algoritmos que reducen el ruido de las variables geomorfométricas (_land surfaces variables_), preservando las formas marcadas en las pendientes a la vez que eliminan las pequeñas variaciones en las zonas más llanas.
+
+El algortimo seleccionado es *"Denoise"* [@Sun2007FastEffectiveFeaturePreserving] que ha sido puesto a punto para su aplicación en MDT  [@Stevenson2010DespecklingSRTMOther] y cuya aplicación es posible través de la caja de geoprocesos SAGA [@Conrad2015SystemAutomatedGeoscientific].
+
+El algoritmo[^denoise] requiere que sean establecidos ciertos parámetros para ser ejecutado. 
+Dos de ellos, las iteraciones de orientación de las caras normales, *n*, y las localizaciones de los vérticos, *v*, tienen valores recomendados para los MDT, 50 y 5 respectivamente. 
+Mientras, el valor límite coplanar, *t*, debe ser ajustado para cada caso en función de los niveles de ruidos presentes, en un rango entre sugerido 0.88 ~ 0.94.
+
+Para determinar el valor *t* se aplica el rango de valores sugerido sobre el MDT original.
+La comparación visual y el análisis de la distribución de los valores en los resultados serán utilizados como criterio de selección.
+De forma complementaria, se derivarán desde los MDT filtrados las covariables pendiente y orientación, cuyos patrones espaciales y distribuciones también se emplearán en la selección.
+
+[^denoise]: <http://www.saga-gis.org/saga_tool_doc/7.4.0/grid_filter_10.html>
+
+
+## Niveles de filtrado según parámetro *t*
+
+En primer lugar, se calculan los MDT bajo diferentes niveles del parámetro *t* en el rango sugerido 0.88 ~ 0.94.
+
+```{r, warning=FALSE}
+# Tibble of denoise rasters to be tested
+
+#' Denoise levels
+dem_proc <- tibble(
+  treat = rep("Mesh Denoise", 4),
+  sigma = seq(0.88, 0.94, by = 0.02),
+  file = path("gis", "dem", "denoise", glue('dem-dn{sg}', sg = sigma*100))
+) 
+
+#' Raw DEM 
+dem_proc <- tibble(
+  treat = "Raw DEM",
+  sigma = NA,
+  file = path("gis", "dem", "dem_clip")
+) %>%
+  bind_rows(dem_proc)
+
+dir_create(path_dir(dem_proc$file[2]))
+```
+
+
+```{r denoise, warning=FALSE}
+# Denoise geoprocesses
+# Run-time: ~23 minutes
+
+#----- ¡¡WARNING!! This loop eat a huge amount of resources. It shouldn't run in parallel mode
+saga <- foreach( sg = seq_along(dem_proc$sigma), .combine = 'rbind' ) %do% { 
+  if ( file_exists(path_wd(dem_proc$file[[sg]], ext = "sgrd")) == FALSE & is.na(dem_proc$sigma[[sg]]) == FALSE ) {
+    rsaga.geoprocessor(lib = "grid_filter", module = 10, # Mesh Denoise
+                     param = list(INPUT = path_wd(filter(dem_proc, is.na(sigma) == TRUE )$file, ext = "sdat"),
+                                  OUTPUT = path_wd(dem_proc$file[[sg]], ext = "sdat"),            
+                                  SIGMA = dem_proc$sigma[[sg]] ),
+                     env = env)
+  }
+}
+```
+
+
+## Comparación visual
+
+La comparación visual entre los diferentes MDT filtrados no presenta diferencias sustanciales y se considera apropiado apoyar la selección en parámetros estadísticos.
+
+## RMSE
+
+Se calcula el RMSE entre los MDT generados y el MDT original como medida de la variación provocada por el filtrado, siguiendo sugerencias [@Stevenson2012FeaturePreservingDenoising].
+
+```{r load_as_list}
+# Loading DEM and variables into R
+## DEM
+dems <- dem_proc$file %>% 
+  path_wd(ext = "sdat") %>% 
+  filerast()
+
+## Slopes
+slopes <- dem_proc$slope %>% 
+  path_wd(ext = "sdat") %>% 
+  filerast()
+
+## Aspects
+aspects <- dem_proc$aspect %>% 
+  path_wd(ext = "sdat") %>% 
+  filerast()
+```
+
+```{r}
+dems_rmse <- dems %>%
+  tblcolraster() %>%
+  summarise(
+    rmse_dn88 = rmse(dem.dn88, dem_clip ),
+    rmse_dn90 = rmse(dem.dn90, dem_clip ),
+    rmse_dn92 = rmse(dem.dn92, dem_clip ),
+    rmse_dn94 = rmse(dem.dn94, dem_clip )
+  )
+
+saveRDS(dems_rmse, file = path(proj$res, "dems_rmse", ext = "rds") ) 
+```
+
+```{r, eval=TRUE, echo=FALSE}
+if (file_exists( path_wd(proj$res, "dems_rmse", ext = "rds")) == TRUE ) {
+  (readRDS( file = path(proj$res, "dems_rmse", ext = "rds") )) %>%
+     knitr::kable(caption = "Resumen de RMSE por MDT.", 
+                  digits = 4, col.names = paste("T =", seq(0.88, 0.94, by = 0.02)), align = c("c") )
+}
+```
+
+Los valores resultantes son bajos y con poca diferencia entre los tratamientos, correspondiendo el RMSE más bajo al parámetro *t* más grande. 
+==QUITAR no tiene que ver Esto tiene sentido en la medida que un valor de *t* más grande se traduce en una diferencia de ángulos más estricta en el filtrado y, por lo tanto, en un menor efecto==.
+
+
+## Distribución de frecuencias
+
+Se analiza la diferencia entre las distribuciones de elevaciones en cada MDT.
+
+```{r}
+# Transforming the raster list of DEM into a tibble.
+dems <- dems %>% 
+  tblrowraster() %>% 
+  mutate(elev = covar) %>%
+  select(-covar)
+
+# Gráfica
+fig <- dems %>%
+  group_by(raster) %>%
+  sample_n( (length(dems$raster)/nlevels(dems$raster)*0.25) ) %>%
+  ungroup() %>%
+  ggplot() +
+    geom_freqpoly(aes(x = elev, colour = raster), binwidth = 10 ) +
+    xlim(250, 750)
+  
+ggsave(fig, filename = path(proj$img, "dems_freq", ext = "svg") )
+```
+
+```{r, eval=TRUE, echo=FALSE, fig.cap='Frecuencia de elevaciones en cada MDT.'}
+if (file_exists( path_wd(proj$img, "dems_freq", ext = "svg")) == TRUE ) {
+  path_wd(proj$img, "dems_freq", ext = "svg")  %>%
+     knitr::include_graphics()
+}
+```
+
+Las líneas de frecuencias se solapan y no se perciben diferencias notables entre ellas, por lo que es de esperar que la estructura de la información del MDT no haya sido alterada a la vez que se elimina parte del ruido. 
+Sin embargo, no aporta un criterio de selección para el parámetro *t*.
+
+## Parámetros estadísticos básicos
+
+Los parámetros estadísticos básicos considerados son la media, mínimo, mediana, máximo y desviación estándar.
+
+```{r}
+# Parameters
+dems_summ <- dems %>%
+  group_by(raster) %>%
+  rast_basic(elev) %>%
+  arrange( desc(stdev) )
+
+saveRDS(dems_summ, file = path(proj$res, "dems_summ", ext = "rds") ) 
+```
+
+```{r, eval=TRUE, echo=FALSE}
+if (file_exists( path_wd(proj$res, "dems_summ", ext = "rds")) == TRUE ) {
+  (readRDS( file = path(proj$res, "dems_summ", ext = "rds") )) %>%
+     knitr::kable(caption = "Parámetros estadísticos básicos por MDT.", 
+                  digits = 2, col.names = c("MDT", "Media", "Mínimo", "Mediana", "Máximo", "Desv. Estándar", "Pixeles"), align = c("c") )
+}
+```
+
+Estos muestran la misma imagen de similitud entre tratamientos.
+
+
+## Comparación de covariables geomorfológicas derivadas
+
+En primer lugar, se calculan dos variables geomorfológicas básicas, la pendiente (*slope*) y orientación (*aspect*).
+
+```{r, warning=FALSE}
+dem_proc <- dem_proc %>%
+  mutate(slope = path(paste0(file, "-slope")), 
+         aspect = path(paste0(file, "-aspect")) )
+```
+
+```{r slope_aspect, echo=FALSE}
+# Slope and aspect
+# Run-time: ~1 min
+
+saga <- foreach( rt = seq_along(dem_proc$file) ) %dopar% {
+  if (all(file_exists(path_wd(c(dem_proc$slope[[rt]], 
+                                dem_proc$aspect[[rt]]), ext = "sgrd"))) == FALSE ) { # If no all the files exist (any is missing)
+    rsaga.geoprocessor(lib = "ta_morphometry", module = 0, # Slope, Aspect, Curvature
+                       param = list(ELEVATION = path_wd(dem_proc$file[[rt]], ext = "sdat"), 
+                                    # Outputs
+                                    SLOPE = path_wd(dem_proc$slope[[rt]], ext = "sdat"),        
+                                    ASPECT = path_wd(dem_proc$aspect[[rt]], ext = "sdat"),
+                                    # Options
+                                    METHOD = 6, # 6 is the default -> 9 parameter 2nd order polynom (Zevenbergen & Thorne 1987)
+                                    UNIT_SLOPE = 1,
+                                    UNIT_ASPECT = 1),
+                       env = env)
+  }  
+}
+```
+
+Es en la comparación visual entre las variables geomorfológicas o de superficie derivadas de los diferentes MDT donde se pueden apreciar los efectos del filtrado y evaluar su conveniencia.
+De no filtrado a filtrado la diferencia es muy notable, incluso a baja escala, especialmente para la orientación en las zonas bajas de cultivo. Esto potencialmente mejorará la clasificación posterior e identifica el filtrado como un procesado básico del MDT para DSM.
+La comparación visual entre los diferentes resultados no arroja diferencias sustanciales y se considera apropiado apoyar la selección en parámetros estadísticos.
+
+## Parámetros estadísticos sobre la *orientación*
+
+El mismo resumen de parámetros estadísticos básicos es obtenido para la variable geomorfológica orientación, *aspect*.
+
+```{r}
+aspects <- aspects %>% 
+  tblrowraster() %>% 
+  mutate(aspect = covar) %>%
+  select(-covar)
+
+aspects_summ <- aspects %>%
+  group_by(raster) %>%
+  rast_basic(aspect) %>%
+  arrange( desc(stdev) )
+
+saveRDS(aspects_summ, file = path(proj$res, "aspects_summ", ext = "rds") ) 
+```
+
+```{r, eval=TRUE, echo=FALSE}
+if (file_exists( path_wd(proj$res, "aspects_summ", ext = "rds")) == TRUE ) {
+  (readRDS( file = path(proj$res, "aspects_summ", ext = "rds") )) %>%
+     knitr::kable(caption = "Parámetros estadísticos básicos por orientación.", 
+                  digits = 2, col.names = c("MDT", "Media", "Mínimo", "Mediana", "Máximo", "Desv. Estándar", "Pixeles"), align = c("c") )
+}
+```
+
+De igual forma, tampoco permiten determinar un criterio de selección para alguno de los valores de *t* para el rango establecido.
+
+## Parámetro *t* definitivo
+
+Como los diferentes análisis no han permitido establecer un criterio claro de selección, se opta por tomar el valor por defecto y recomendado por el sistema de filtrado, donde *t* es **0.90**.
+
+```{r}
+dem_proc <- dem_proc %>%
+  filter(sigma == 0.9) %>% 
+  select(-slope, -aspect, -sigma)
+
+dem <- dem_proc %>%
+  select(file) %>% 
+  flatten_chr() 
+
+dir_ls(path = path_dir(dem), regexp = path_file(dem), invert = TRUE) %>%
+  path_wd() %>% 
+  file_delete()
+```
+
+
+
+# Relleno de depresiones
+
+Otra fuente de problemas en el cálculo de covariables desde un MDT es la presencia de hundimientos espúreos (*spurious sinks*), que desestructuran la red de drenajes y cuyo origen puede deberse a errores puntuales o a los efectos de la interpolación durante la generación del MDT.
+
+Por este motivo, el relleno de estos hundimientos se recomienda en la fase de preprocesacimento de los MDT [@Wilson2000TerrainAnalysisPrinciples; @Hengl2009GeomorphometryConceptsSoftware; @Gallant2015DerivationTerrainCovariates], de forma que se fuerce a un modelo hidrológico plenamente conectado y sin artefactos.
+
+Se opta por el método de [relleno de depresiones][^sink] desarrollado por @Wang2006EfficientMethodIdentifying y disponible través de la caja de geoprocesos SAGA [@Conrad2015SystemAutomatedGeoscientific]. 
+Para su aplicación se utilizarán los parámetros estandar. 
+
+[^sink]: <http://www.saga-gis.org/saga_tool_doc/7.4.0/ta_preprocessor_4.html>
+ 
+## Aplicación del relleno
+ 
+```{r}
+dem_proc <- dem_proc %>%
+  mutate(filled = path(paste0(file, "-fill")),
+         fdir = path(paste0(file, "-fdir")),
+         water = path(paste0(file, "-water"))) %>% 
+  mutate_at(vars(filled, fdir, water), str_replace_all, c("denoise" = "fill"))
+
+dir_create(path_dir(dem_proc$filled[1]))
+```
+
+```{r}
+# Fill Sinks
+if ( file_exists(path_wd(dem_proc$filled, ext = "sgrd")) == FALSE ) {
+  rsaga.geoprocessor(lib = "ta_preprocessor", module = 4, # Fill Sinks (Wang & Liu)
+                     param = list(ELEV = path_wd(dem_proc$file, ext = "sdat"), 
+                                  # Outputs
+                                  FILLED = path_wd(dem_proc$filled, ext = "sdat"), # Depression-free DEM
+                                  FDIR = path_wd(dem_proc$fdir, ext = "sdat"), # Flow directions
+                                  WSHED = path_wd(dem_proc$water, ext = "sdat"), # Delineated watershed basins
+                                  # Options
+                                  MINSLOPE = 0.10), # Default
+                     env = env)
+  }
+```
+
+## Comparación visual
+
+A primera vista, no se aprecian diferencias visuales entre el MDT filtrado respecto al rellenado a través de QGIS.
+
+## Parámetros estadísticos
+
+De manera complementaria, se analizan parámetros estadísticos básicos de ambos MDT como método de contraste.
+
+```{r}
+dems <- list("Denoise" = raster(path(dem_proc$file, ext = "sdat")))
+dems[["Filled"]] <- raster(path(dem_proc$filled, ext = "sdat"))
+
+dems <- dems %>% 
+  tblrowraster()
+```
+ 
+```{r}
+# Parameters
+dems_fill <- dems %>%
+  group_by(raster) %>%
+  rast_basic(covar) %>%
+  arrange( desc(stdev) )
+
+saveRDS(dems_fill, file = path(proj$res, "dems_fill", ext = "rds") ) 
+```
+
+```{r, eval=TRUE, echo=FALSE}
+if ( file_exists( path(proj$res, "dems_fill", ext = "rds")) == TRUE ) {
+  (readRDS( file = path(proj$res, "dems_fill", ext = "rds") )) %>%
+     knitr::kable(caption = "Parámetros estadísticos básicos por MDT.", 
+                  digits = 2, col.names = c("MDT", "Media", "Mínimo", "Mediana", "Máximo", "Desv. Estándar", "Pixeles"), align = c("c") )
+  }
+```
+
+Con el relleno de hundimientos los valores máximos, mínimos y de media y mediana prácticamente no se ven alterados, mientras que la desviación estandar disminuye. 
+
+```{r}
+# Deleting files that aren't going to be used again (fdir and water)
+dem <- dem_proc %>%
+  select(filled) %>% 
+  flatten_chr() 
+
+dir_ls(path = path_dir(dem), regexp = path_file(dem), invert = TRUE) %>%
+  path_wd() %>% 
+  file_delete()
+
+# Deleting corresponding variables
+dem_proc <- dem_proc %>%
+  select(-fdir, -water)
+```
+
+
+```{r}
+# As both DEM are going to be compared, they are treated as separated records 
+dem_proc <- dem_proc %>% 
+  select(-treat) %>% 
+  pivot_longer(everything(), names_to = "treat", values_to = "file") %>% 
+  mutate(treat = ifelse (str_detect(treat, "file"), "denoise", treat ) )
+```
+
+## Comparación de la red de drenaje derivada
+
+Habiendo contrastado que la estructura general del MDT no se ve alterada, la mejor comprobación posible pasa por el cálculo de redes de drenaje o en covariables hidrológicas basadas en ambos MDT y analizar su resultado visualmente.
+
+Se escoge el geoproceso [_Downslope Distance Gradient_][^downslope] disponible en SAGA.
+
+[^downslope]: <http://www.saga-gis.org/saga_tool_doc/7.4.0/ta_morphometry_9.html>
+
+```{r}
+dem_proc <- dem_proc %>%
+  mutate(grad = path(paste0(file, "-grad")) )
+```
+
+```{r, echo=FALSE}
+# Downslope Distance Gradient
+saga <- foreach( rt = seq_along(dem_proc$file) ) %dopar% {
+  if ( file_exists( path(dem_proc$grad[[rt]], ext = "sgrd") ) == FALSE ) { # If no all the files exist (any is missing)
+    rsaga.geoprocessor(lib = "ta_morphometry", module = 9, # Downslope Distance Gradient
+                       param = list(DEM = path_wd(dem_proc$file[[rt]], ext = "sdat"), 
+                                    # Outputs
+                                    GRADIENT = path_wd(dem_proc$grad[[rt]], ext = "sdat"), 
+                                    # Options
+                                    DISTANCE = 10.0, # Default
+                                    OUTPUT = 2), # 2, gradient (degree). Default
+                       env = env)
+    }  
+  }
+```
+
+La diferencia en el resultado entre ambos MDT es enorme, como se aprecia en las siguientes figuras:
+
+```{r}
+dems <- list("denoise" = raster(path( filter(dem_proc, str_detect(treat, 'denoise'))$grad, ext = "sdat"))  )
+dems[["filled"]] <- raster(path( filter(dem_proc, str_detect(treat, 'filled'))$grad, ext = "sdat"))
+```
+
+```{r}
+fig <- c("denoise_grad" = path(proj$img, "denoise-downslope_dist_grad", ext = "png"),
+         "filled_grad" = path(proj$img, "filled-downslope_dist_grad", ext = "png") )
+
+mapping <- vector(mode = "list")
+
+mapping[[1]] <- tm_shape(dems$denoise) +
+  tm_grid(alpha = 0.25, n.x = 8, n.y = 8, labels.inside.frame = FALSE) +
+  tm_raster(col = "dem.dn90.grad", palette = "viridis", style = "cont", title = " ") +
+  tm_layout(main.title = "Denoise", inner.margins = rep(0.05, 4), outer.margins = rep(c(0.05, 0.02), 2),
+            legend.position = c("left", "bottom"))  +
+  tm_scale_bar(width = 0.20) +
+  tm_compass(type = "arrow", position = c("right", "top"))
+
+mapping[[2]] <- tm_shape(dems$filled) +
+  tm_grid(alpha = 0.25, n.x = 8, n.y = 8, labels.inside.frame = FALSE) +
+  tm_raster(col = "dem.dn90.fill.grad", palette = "viridis", style = "cont", title = " ") +
+   tm_layout(main.title = "Denoise + Filled", inner.margins = rep(0.05, 4), outer.margins = rep(c(0.05, 0.02), 2),
+            legend.position = c("left", "bottom"))  +
+  tm_scale_bar(width = 0.20) +
+  tm_compass(type = "arrow", position = c("right", "top"))
+
+walk2(mapping, fig, tmap_save) # Walk doesn't give any result, compared to map.
+```
+
+```{r}
+# Cropping images usign Image Magick pack
+for (f in fig) {
+  glue("convert {path_wd(f)} -shave 50x50 {path_wd(f)}") %>% # Width x height
+    system()
+}
+
+# Appending both images side by side
+fig[["grad"]] <- path(proj$img, "downslope_dist_grad", ext = "png")
+
+glue("convert {img} +append {out}",
+     img = paste(path_wd(fig[["denoise_grad"]]), path_wd(fig[["filled_grad"]])),
+     out = path_wd(fig[["grad"]]) ) %>%
+  system()
+
+# Deleting unnecessary files
+map_chr(fig[-3], path_wd) %>%
+  file_delete()
+```
+
+```{r, eval=TRUE, echo=FALSE, out.width='100%', fig.cap='Disminución de artefactos después del rellenado de hundimientos espúreos en covariable Downslope Dist. Grad.'}
+knitr::include_graphics( path_wd(proj$img, "downslope_dist_grad", ext = "png") )
+```
+
+Mediante este geoproceso se eliminan innumerables artefactos distribuidos por toda la región de trabajo y se confirma su adecuación al preprocesado para Cartografía Digital de Suelos.
+
+# MDT procesado
+
+El procesado del MDT se ha completado mediante la aplicación secuencial de un filtrado y un rellenado de depresiones, consiguiendo un producto óptimo para el cálculo de covariables geomorfológicas derivadas. 
+Además, se ha reducido su tamaño a la región de trabajo de superficie mínima que no se vé afectada por la contaminación de bordes en el cálculo de dichas covariables.
+
+```{r}
+# Final DEM path
+dem <- dem_proc %>%
+  filter(treat == "filled") %>% 
+  select(file) %>% 
+  flatten_chr() 
+
+# Deleting files from downslope covariate within final DEM directory
+dir_ls(path = path_dir(dem), regexp = path_file(dem), invert = TRUE) %>%
+  path_wd() %>% 
+  file_delete()
+```
+
+
+
+
+# Registro en la base de datos
+
+Finalmente, el MDT procesado por completo es registrado en la base de datos.
+
+## Introducción de los metadatos
+
+Para realizar el registro del raster del MDT es necesario primero describir los atributos de la fuente de los datos, así como de las bandas si las hubiera.
+De esta manera se genera automáticamente la tabla que acogerá el raster gracias al sistema desarrollado en la base de datos.
+
+
+```{sql, connection=con}
+INSERT INTO sources.src (src_id, descr, spectrum, author, date, proc)
+VALUES ('dem', 'Digital Elevation Model (DEM)', 'LIDAR', 'CNIG', make_date(2009, 1, 1), 'Denoised and filled sinks') ;
+```
+
+```{sql, connection=con}
+INSERT INTO sources.src_band (src_id, band_id, descr, wave, unit)
+VALUES ('dem', 0, 'Elevation', 0, 'm') ;
+```
+
+
+## Registro del MDT
+
+Por último, se registra el modelo procesado a la base de datos y supone almacenar el archivo origen en el directorio del proyecto designado para los datos raster, `data`.
+
+```{r}
+# Rename definitive files and move them to _data_ directory
+dem_proc <- dir_ls(path = path_dir(dem), regexp = path_file(dem), invert = FALSE)
+
+dem_final <- dem_proc %>% 
+  str_replace(path_file(dem), "dem") %>% 
+  str_replace(path_dir(dem), path("data", "sources"))
+
+file_move(dem_proc, dem_final)
+```
+
+
+```{r, eval=FALSE}
+glue('raster2pgsql -a -C -r -s 25830 -t 100x100 -P -R -I -Y {dem_path} sources.dem', 
+     ' | psql -h localhost -U {keyring::key_list(\"psql-su\")[1,2]} -d dicsm',
+     dem_path = path_wd( dem_final[str_which(dem_final, ".sdat$")] ) ) %>% system()
+```
+
+
+
+## Overview
+
+```{sql, connection=con}
+BEGIN ; 
+
+SELECT ST_CreateOverview('sources.dem'::regclass, 'rast'::name, 5, 'CubicSpline') ;
+CREATE INDEX ON sources.o_5_dem USING gist (ST_ConvexHull (rast)) ;
+COMMENT ON TABLE sources.o_5_dem IS 'Overview of Digital Elevation Model (DEM)';
+
+COMMIT ;
+```
+
+
+
+# Limpieza
+
+Tras el almacenamiento del MDT procesado en el directorio definitivo y su registro en la base de datos, se eliminan todos los archivos intermedios generados durante el tratamiento.
+
+```{r}
+dir_delete(path_wd("gis", "dem"))
+```
+
+
+
+# Conclusión
+
+El procesado del MDT se ha completado mediante la aplicación secuencial de un filtrado y un rellenado de depresiones, consiguiendo un producto óptimo para el cálculo de covariables geomorfológicas derivadas. 
+Además, se ha reducido su tamaño a la región de trabajo de superficie mínima que no se vé afectada por la contaminación de bordes en el cálculo de dichas covariables.
+Dicho MDT ha quedado registrado en la base de datos, quedando a la vez disponible su archivo en el directorio de almacenamiento permanente del proyecto. 
+
+
+# Bibliografía
+
+::: {#refs}
+:::

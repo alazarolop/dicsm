@@ -1,0 +1,126 @@
+---
+title: "DEM"
+author: "Alberto Lázaro-López"
+date: "12th March 2019"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+abstract: Filter of a DEM to be used in Digital Soil Mapping. 
+---
+
+```{r core, include=FALSE }
+for (.i in paste0("src/", c("spatial", "dbms", "core", "raster", "vector"), ".R" ) ) source(.i)
+
+proj <- .proj_envi("sources") %>% 
+  path_file() %>% 
+  .proj_subdir()
+```
+
+
+# Introducción
+
+Uno de los principales problemas encontrados con las covariables generadas originalmente era el nivel de ruido que presentaban, que se podía observar en la alta variación de grupos en distancias cortas. 
+
+Para solventar este problema existen diferentes alternativas: 
+
+* Suavizar los datos originales mediante filtros, para derivar covariables también suavizadas.
+* Establecer valores límites de cálculo para las covariables.
+* Aplicar filtros de suavizado a las covariables directamente.
+* La combinación de filtros en los datos originales y en las covariables.
+
+La decisión depende fundamentalmente de los datos originales, por lo que se realiza un estudio reducido para tomar la más adaptada.
+Se van generar los mismos parámetros de la superficie, slope y aspect, de tres maneras diferentes que serán después comparadas:
+
+1. Directa
+  MDT -> covariables
+1. Filtro sobre MDT
+  MDT -> filtro de ruido -> covariables
+1. Filtro sobre covariables
+  MDT -> covariables -> filtro focal
+
+La región de trabajo se extiende a toda la región del proyecto, por lo que se renombra el MDT con el buffer de 3.5 km y lo tomo como base.
+
+
+```{r}
+glue('for fn in {file.path(getwd(), "gis/tmp/dem-3_5k.*")} ;
+    do
+        mv "$fn" "{file.path(getwd(), "gis/tmp/")}{name}.${{fn#*.}}"
+    done', name = "dem") %>%
+  system()
+```
+
+
+## Directa
+
+```{r}
+rsaga.geoprocessor(lib = "ta_morphometry", module = "Slope, Aspect, Curvature",
+                   param = list(ELEVATION = file.path(getwd(), "gis/tmp/dem.sgrd"), 
+                                SLOPE = file.path(getwd(), "gis/tmp/dem-slope.sgrd"),
+                                ASPECT = file.path(getwd(), "gis/tmp/dem-aspect.sgrd"),
+                                METHOD = "2",
+                                UNIT_SLOPE = "1",
+                                UNIT_ASPECT = "1"),
+                   env = env)
+```
+
+## MDT filtrado
+
+```{r}
+rsaga.geoprocessor(lib = "grid_filter", module = "Mesh Denoise",
+                     param = list(INPUT = file.path(getwd(), "gis/tmp/dem.sgrd"), 
+                                OUTPUT = file.path(getwd(), "gis/tmp/dem_denoise.sgrd"),
+                                SIGMA = 0.95),
+                                #ITER = "2",
+                                #VITER = "1",
+                                #NB_CV = "1"),
+                   env = env)
+
+rsaga.geoprocessor(lib = "ta_morphometry", module = "Slope, Aspect, Curvature",
+                   param = list(ELEVATION = file.path(getwd(), "gis/tmp/dem_denoise.sgrd"), 
+                                SLOPE = file.path(getwd(), "gis/tmp/dem_denoise-slope.sgrd"),
+                                ASPECT = file.path(getwd(), "gis/tmp/dem_denoise-aspect.sgrd"),
+                                METHOD = "2",
+                                UNIT_SLOPE = "1",
+                                UNIT_ASPECT = "1"),
+                   env = env)
+```
+
+
+## Covariables filtradas
+
+```{r}
+rsaga.geoprocessor(lib = "grid_filter", module = "Gaussian Filter",
+                   param = list(INPUT = file.path(getwd(), "gis/tmp/dem-slope.sgrd"),
+                                RESULT = file.path(getwd(), "gis/tmp/dem-slope-gauss.sgrd"),
+                                SIGMA = 20,
+                                #KERNEL_TYPE = "1",
+                                KERNEL_RADIUS = 5),
+                   env = env)
+
+rsaga.geoprocessor(lib = "grid_filter", module = "Gaussian Filter",
+                   param = list(INPUT = file.path(getwd(), "gis/tmp/dem-aspect.sgrd"),
+                                RESULT = file.path(getwd(), "gis/tmp/dem-aspect-gauss.sgrd"),
+                                SIGMA = 20,
+                                #KERNEL_TYPE = "1",
+                                KERNEL_RADIUS = 5),
+                   env = env)
+
+```
+
+
+# Conclusión
+Se observa que: 
+
+1. La elección del método de cálculo de la pendiente y la orientación influyen en el resultado final, alterando el ruido obtenido y la percepción visual.
+Sería interesante evaluar la elección entre los dos métodos más recientes de (2) Costa-Cabral & Burgess, 1996 vs (6) Zevenbergen & Thorne, 1987 dentro de la fase de covariables.
+
+1. La aplicación de un filtro al MDT reduce el ruido y mejora la percepción visual de las covariables calculadas notablemente. 
+Sería interesante evaluar la elección de los parámetros, como la Sigma Threslhold, o entre métodos.
+
+1. Los filtro posteriores no sólo reducen el ruido, sino que difuman. 
+Serían más útiles como método de ventana de análisis cuando el proceso no permita determinarla (sustitutivo de elección de ventana de análisis en el proceso).
+
+
+

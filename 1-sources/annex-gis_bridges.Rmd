@@ -1,0 +1,281 @@
+---
+title: "GIS bridges"
+author: "Alberto Lázaro-López"
+date: "22th March 2019"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+abstract: Filter of a DEM to be used in Digital Soil Mapping. 
+---
+
+```{r core, include=FALSE }
+for (.i in paste0("src/", c("core", "raster"), ".R" ) ) source(.i)
+```
+
+
+# SAGA
+
+## RSAGA
+Install and load the [RSAGA](https://github.com/r-spatial/RSAGA) package from CRAN.
+
+```{r rsaga}
+#install.packages("RSAGA")
+```
+
+In order to use SAGA, we need to set up an environment variable which will be pass to each geoprocess calling.
+We can either specify the cmd and modules paths or supply the main folder of installation. 
+I choose the latter, as it's safe againts version uppgrades.
+
+```{r rsaga_env, echo=FALSE}
+library(RSAGA)
+
+env <- rsaga.env(root = "/usr/local/opt/saga-gis",
+                 parallel = TRUE)
+```
+
+The saga_cmd, the core behind of RSAGA, just read data directly from file: SAGA specific file format for rasters and Shapefile for vectors.
+So, for every process, one needs to follow a read / write workflow in the workspace folder.
+
+When we are working with rasters from a PostGIS database, there is an option to avoid the R step and to directly convert them to SAGA through GDAL.
+RSAGA package has a function for that:
+
+```{r rsaga_write}
+pgis <- pgiscon("mdt", "dsm", .db = "tezisdb")
+
+rsaga.import.gdal(in.grid = pgis,
+                  out.grid = "test",
+                  env = env)
+```
+
+It does it in two septs though, and its notes suggests that a direct translation using GDAL is a faster approach.
+That's why we need to call gdal_translate from system
+
+```{r gdal_write}
+glue('gdal_translate -of SAGA -a_srs EPSG:25830 "{pgis}" {file.path(getwd(), "_tmp/dem.sdat")}'  ) %>% system()
+```
+
+Testing a geoprocess 
+
+```{r geoprocess_test}
+rsaga.geoprocessor(lib = "ta_morphometry", module = "Slope, Aspect, Curvature",
+                   param = list(ELEVATION = file.path(getwd(), "_tmp/dem.sgrd"), 
+                                SLOPE = file.path(getwd(), "_tmp/slope.sgrd"),
+                                UNIT_SLOPE = "1"),
+                   env = env)
+```
+
+
+
+
+## Rsagacmd
+
+Install the [rsagacmd](https://github.com/stevenpawley/Rsagacmd) package.
+
+```{r rsagacmd}
+#devtools::install_github("stevenpawley/Rsagacmd")
+```
+
+Automatic build of all SAGA functions
+```{r rsagacmd_func}
+library(Rsagacmd)
+
+saga <- saga_gis(saga_bin = "/usr/local/opt/osgeo-saga/bin/saga_cmd")
+```
+
+`Rsagacmd` has a more R-notion approach, as all functions for SAGA area readibly within R in a form of nested lists, it suggests parameters of functions and conversion between filetypes is made in the background transparently to the user. 
+Whereas `RSAGA`seems to use a lowerlevel language because you need to take care of filetypes and to implement correctly every function.
+
+Testing a geoprocess
+
+```{r rsagacmd_proc}
+# Getting DEM for test
+pgis <- pgiscon("mdt", "_dsm", .db = "tezisdb", .where = glue::glue('smu1_id~ $${smu1}$$ ', smu1='J04') )
+
+dem <- readGDAL(pgis, silent = TRUE)
+  brick() %>% 
+  raster(layer="band6")
+
+# Geoprocessing
+tri <- saga$ta_morphometry$Terrain_Ruggedness_Index_TRI(DEM = dem)
+```
+
+It took a long time to get processed a small piece of DEM. It seems `RSAGA` is more efficient and let you pick desired outputs, so it's going to be the standard package in a normal basis. 
+
+
+
+
+# GRASS
+
+## RGRASS7
+
+Install the `rgrass7` package.
+
+```{r rgrass7_ins}
+#install.packages("rgrass7")
+```
+
+GRASS GIS demand to work under a GRASS database, which collects locations with at least a mapset.
+During standard workflow, a temporal database can be set up. 
+Whereas during development on an fix area, a location with a mapset can be buildreuse in order to avoid the configuration process.
+
+A minimum requirement is to configure the Coordinate Reference System of the location before loading any data.
+
+```{r grass_setup}
+library(rgrass7)
+
+grass_path <- initGRASS(gisBase = "/usr/local/opt/osgeo-grass/grass-base", 
+          home = tempdir(),
+          gisDbase = tempdir(), 
+          location = "rstudio", 
+          mapset = "PERMANENT", 
+          override = TRUE )
+
+execGRASS("g.proj", flags = c("c", "quiet"),
+          epsg = 3042 )
+
+gmeta()
+```
+
+After that any data source accepted by GDAL can be used, which is quite powerful!. 
+This is a way to transfer data from a PostGIS database to GRASS database using a GDAL string.
+The result can be checked with the corresponding GRASS module. 
+
+When the first raster data is ready, the [Computational region][^reg] can be set.
+This is an important concept, as every calculation on raster will be reduced to this area. 
+
+[^reg]: https://grasswiki.osgeo.org/wiki/Unleash_the_power_of_GRASS_GIS_at_US-IALE_2017#Scripting_with_R
+
+```{r pgis_grass}
+pgis <- pgiscon("mdt", "dsm", .db = "tezisdb")
+
+execGRASS("r.in.gdal", flags = c("o"),
+          input = pgis,
+          output = "dem"  )
+
+execGRASS("g.list", flags = c(),
+          type="all")
+
+execGRASS("g.region", raster="dem", flags=c("a","p"))
+```
+
+When data isn't in the CRS of the project, `r.import` module can be used, which reprojects on the fly.
+
+```{r reproj}
+execGRASS("r.import", flags = c("o"),
+          input = pgis,
+          output = "dem2"  )
+
+execGRASS("g.list", flags = c(),
+          type="all")
+
+execGRASS("g.remove", flags = c("f"),
+          type = "raster",
+          name = "dem2"  )
+```
+
+Generally, executing a GRASS geoprocess is done with `execGRASS` which produces the message as a system call.
+
+```{r grass_proc}
+execGRASS("r.slope.aspect", flags = c("n"),
+          elevation="dem",
+          slope="slope",
+          aspect="aspect",
+          format="degrees",
+          min_slope=5.0)
+```
+
+`doGRASS` is another alternative to `execGRASS`, which executes a process but gives a string and, therefore, it can be used within a loop.
+
+After the process, the new raster bands can be read into R session and plot to check.
+
+```{r}
+geograss_raw <- rgrass7::readRAST(c("slope", "aspect"))
+geograss <- brick(geograss_raw)
+
+plot(geograss$slope)
+```
+
+Or can be exported to an intermediate file to be loaded into a PostGIS database
+
+```{r}
+output <- glue('_tmp/{name}.tiff', name="slope" )
+
+execGRASS("r.out.gdal", flags = c(),
+          input="slope",
+          output=output,
+          format="GTiff")
+
+execGRASS("r.out.gdal", flags = c("l"))
+```
+
+
+When we want to pass data ready within the R session, it can be loaded into GRASS database as:
+
+```{r}
+dem_grid <- as(dem, 'SpatialGridDataFrame')
+writeRAST(dem_grid, "dem_j04c")
+
+execGRASS("g.list", flags = c(),
+          type="all")
+```
+
+Vector data too
+
+```{r}
+cons <- dbConnect(RPostgres::Postgres(),  
+                 dbname="tezisdb", host="localhost", port=5432, 
+                 user={keyring::key_list("psql-su")[1,2]}, 
+                 password=keyring::key_get("psql-su"))
+space <- st_read(cons,
+  query = "select * from do_cbj")
+
+b_box = st_bbox(space) 
+execGRASS("g.region", flags = c("quiet"), 
+          n = as.character(b_box["ymax"]), s = as.character(b_box["ymin"]), 
+          e = as.character(b_box["xmax"]), w = as.character(b_box["xmin"]), 
+          res = "1")
+```
+
+
+
+
+
+
+
+
+# QGIS
+
+## RQGIS3
+
+Install and load the `RQGIS3` package.
+```{r rqgis3, echo=FALSE}
+devtools::install_github("jannes-m/RQGIS3", ref = "mac" )
+```
+
+
+```{r rqgis3_env, echo=FALSE}
+library(RQGIS3)
+
+set_env(root = "/usr/local/Cellar/qgis/3.6.0_4/QGIS.app", dev = FALSE, new = TRUE)
+open_app()
+```
+
+When running the last function RStudio crashes. 
+If this is done in a Terminal session, it works with an adjustment: it will ask you to duplicate a symlink of actual Python 3 as version 3.6.
+
+```{r}
+alg <- find_algorithms(search_term = "slope", name_only = TRUE)
+get_usage(alg = alg[2])
+param <- get_args_man(alg = alg[2])
+get_options(alg[2])
+
+param$elevation <- dem
+```
+
+
+
+
+
+
