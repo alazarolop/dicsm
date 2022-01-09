@@ -1,0 +1,54 @@
+---
+title: "Disaggregation of polytaxic SMU: Analysis after divison for optimal Minimum Delineation Area and scale"
+author: "Alberto Lázaro-López"
+date: "10/14/2020"
+output:
+  html_document:
+    toc: yes
+    toc_depth: '3'
+    df_print: paged
+    number_sections: yes
+abstract: 
+bibliography: ../ref/dicsm.bib
+---
+
+```{r core, include=FALSE }
+for (.i in paste0("src/", c("dbms", "core"), ".R" ) ) source(.i)
+
+proj <- .proj_key("disagg") 
+proj <- dir_ls(regexp = proj$key) %>% 
+  .proj_subdir() %>% 
+  append(proj, .)
+```
+
+
+# Introducción
+
+La propuesta metodológica de disgregación de SMU politáxicas de un mapa convencional de suelos se inició con la división de las SMU en áreas homogéneas mediante un sistema de clasificación no supervisado y al considerar una colección de covariables ambientales.
+
+El proceso de disgregación contempla una segunda fase en la que se asignan las categorías de suelos a las nuevas divisiones o grupos, estableciendo con ello las relaciones suelo-entorno.
+Estos grupos serían potencialmente asimilables a nuevas SMU monotáxicas. 
+
+Un análisis previo de los grupos obtenidos desde diferentes colecciones de covariables estudió las relaciones inter (entre) e intra (internas) grupos y permitió definir aquel conjunto de grupos que mejor captura la variabilidad derivado a partir de una colección de covariables representativas (**1**).
+Durante este estudio también se observó cómo un número elevado de las delineaciones tenían superficies pequeñas, relacionadas a píxeles aislados y que podrían asociarse a ruido durante la clasificación.
+Además, la publicación final del nuevo mapa con las nuevas SMU y sus delineaciones requiere de una escala final fijada, que es regulada por el tamaño mínimo y medio de las propias delineaciones de los grupos y sobre la que dichas delineaciones menores influye.
+Por todo ello, se incorpora a la fase de disgregación una etapa de refinado, en el que se estudia específicamente el conjunto de delineaciones óptimas para determinar la necesidad del refinamiento, su grado de aplicación y las características de dicho acción.
+
+
+En definitiva, el proceso final de disgregación se completaría en dos objetivos parciales: 
+  
+  * La asignación de las categorías de suelos, en nuestro caso STU. 
+  * El refinamiento de las delineacciones obtenidas durante la división y de las áreas misceláneas ligado una escala de publicación óptima.
+
+
+
+# Creación de la estructura de trabajo
+
+Los diferentes resultados de esta última etapa se alojarán en un schema propio en la base de datos.
+
+```{r}
+# Create the schema
+sql <- path_wd("db") %>% 
+  dir_ls(type = "directory", regexp = proj$key) %>% 
+  dir_walk(type = "file", fun = function(f) {pg_exec(db = "dicsm", sql = f)})
+```

@@ -1,0 +1,765 @@
+---
+title: 'Soil~landscape correlation of new SMU divisions'
+author: "Alberto Lázaro-López"
+date: "26th October 2020"
+output:
+  html_document:
+    df_print: kable
+    toc: yes
+    toc_depth: 3
+    number_sections: true
+bibliography: ../ref/dicsm.bib
+abstract: New delineations from division designate potential homogeneous zone which need to be named according to STU and relate between them. This step is known as soil~landscape correlation. In this case, it considers profiles sites collected as a ground truth to establish these relations. A high correlation rate would mean that new zones collect similar soils, which would also imply a validation for the disaggregation process itself.
+---
+
+```{r core, include=FALSE }
+for (.i in paste0("src/", c("dbms", "core", "raster"), ".R")) {
+  source(.i)
+}
+knitr::opts_chunk$set(eval = TRUE)
+
+proj <- .proj_key("disagg") 
+proj <- dir_ls(regexp = proj$key) %>% 
+  .proj_subdir() %>% 
+  append(proj, .)
+```
+
+
+# Introduction
+
+El proceso de correlación entre los grupos delimitados durante la división de las SMU y las STU recogidas en la leyenda del mapa original buscar establecer el contenido categórico de las primeras en función de las segundas.
+La propuesta metodológica que se expone considera las distancias en el espacio de las covariables entre los medoides de los grupos y los perfiles de suelos asociados a STU, de forma que aquellos más próximos a los medoides sirvan para definirlos.
+Se trata de un paso crítico en la producción del mapa disgregado y que da lugar a una primera versión de este, a falta del refinamiento definitivo. 
+
+
+
+# Datos
+
+La correlación establece sus relaciones en base a la información de los medoides y los perfiles en el espacio de las covariables y necesita de esta información.
+A su vez, requiere la información taxonómica asociada a los perfiles que actúe de unión entre centroides y STU. 
+Además, se recopilan los porcentajes que representan los grupos en cada SMU, así como la información de la leyenda del mapa referente a las STU, con el objetivo de utilizarlos en un contraste detallado. 
+
+Se continúa trabajando sobre el conjunto de delineaciones derivadas de la colección 2 con CLARA.
+
+```{r}
+div <- list("met" = "clara",
+            "sel" = 1
+            )
+```
+
+
+## Covariables de medoides y perfiles
+
+Valores de las covariables en las localizaciones de los medoides y los perfiles.
+No se encuentran escaladas, pero todos ellos toman el mismo sistema de referencia, lo que permite su comparación.
+
+> En lugar de intersección con un único pixel, hacerla con un 3x3 basado en st_buffer + st_envelope sobre los puntos.
+Pasarlos a una tabla con índices para cruzarlo con los rásters.
+Se basaría en un st_intersection + st_dumpvalues para cada polígono
+Se debe mantener el schema generado durante la división con las covar_smu1.
+
+```{r, eval=FALSE}
+medoids <- paste(div$met, div$sel, "ctd", sep = "_")
+
+glue_sql("
+CREATE MATERIALIZED VIEW disagg.pt_covars AS
+-- Observations from soil profiles and medoids
+WITH pt AS (
+  SELECT pf_id::varchar as pid, geom 
+  FROM csm.pf
+  UNION ALL
+  SELECT concat(lower(smu1_id), grp::varchar) as pid, geom
+  FROM division.{`medoids`}
+-- Rasters of the covariates collection
+), collection AS (
+  SELECT row_number() over() as rid, st_addband(NULL, array_agg(rast)) AS rast
+  FROM (SELECT cvb.tableoid::regclass::character varying::text AS covar_id, ST_UpperLeftX(rast) AS upx,
+  			  ST_UpperLeftY(rast) AS upy, rast
+    	  FROM  covars._covar_rast AS cvb, pt
+    	  WHERE st_intersects(cvb.rast, pt.geom)
+    	  ORDER BY upx, upy, covar_id ASC ) AS cv -- ORDER BY to make sure alphabetically bands order
+  WHERE covar_id IN (SELECT covar_id FROM covar_select WHERE select_id = {div$sel} )
+  GROUP BY upx, upy 
+-- Number of band of the collection
+), covars AS (
+  SELECT covar_id, dense_rank() over (ORDER BY covar_id) AS band
+  FROM covars.covar_select
+  WHERE select_id = {div$sel}
+-- Values 
+), vals AS (
+  SELECT pid, b AS band, ST_Value(col.rast, b, pt.geom) as val
+  FROM collection AS col, pt, generate_series(1, (SELECT max(band)::integer FROM covars)) as b
+  WHERE ST_Intersects (col.rast, pt.geom) 
+  ORDER BY pid ASC, b ASC 
+)
+-- Values with covariates names
+SELECT pid, covar_id, val
+FROM vals JOIN covars USING (band) ; ", .con = con) %>% dbExecute(conn = con)
+```
+
+```{r}
+obs <- vector("list")
+obs[["ctd"]] <- glue_sql("
+SELECT *
+FROM disagg.pt_covars
+WHERE pid ~* '^j' ;", .con = con) %>% dbGetQuery(conn = con)
+
+obs[["pf"]] <- glue_sql("
+SELECT *
+FROM disagg.pt_covars
+WHERE pid !~* '^j' --'^[0-9]' ;", .con = con) %>% dbGetQuery(conn = con)
+
+obs <- obs %>% 
+  map(pivot_wider, names_from = covar_id, values_from = val) 
+```
+
+
+
+## Clasificación taxonómica de perfiles
+
+Datos de la clasificación taxonómica de los perfiles.
+
+```{r}
+pf_stu <- glue_sql("
+SELECT pf_id, stu_id
+FROM csm.pf ;", .con = con) %>% dbGetQuery(conn = con)
+```
+
+
+
+## Superficie de los grupos
+
+Datos relativos a la superficie de los nuevos grupos según son generados en la división. 
+
+```{r, eval=FALSE}
+glue_sql("
+CREATE OR REPLACE VIEW disagg.div_raw AS
+SELECT sid, geom, smu1_id, grp
+FROM division.{`tb`}",
+  tb = paste(div$met, div$sel, "div", sep = "_"), .con = con) %>% dbExecute(conn = con)
+
+glue_sql("
+COMMENT ON VIEW disagg.div_raw IS 'Raw output from the selected division method (CLARA)' ;", 
+  .con = con) %>% dbExecute(conn = con)
+```
+
+```{sql connection=con_odbc, eval=FALSE}
+BEGIN ; 
+CREATE OR REPLACE VIEW disagg.grp_raw AS
+WITH grp AS (
+	SELECT smu1_id, grp, sum(ST_Area(geom)) as area
+	FROM disagg.div_raw
+	GROUP BY smu1_id, grp
+), grp_smu1 AS (
+	SELECT  *, sum(area) OVER (PARTITION BY smu1_id) as area_smu1
+	FROM grp
+)
+SELECT  smu1_id, grp, area, round((area/area_smu1*100)) AS pc --, 
+        --dense_rank() OVER (PARTITION BY smu1_id ORDER BY area DESC NULLS LAST) AS rank
+FROM grp_smu1 ;
+--
+COMMENT ON VIEW disagg.grp_raw IS 'Area stats for raw grops of division' ;
+COMMIT ;
+```
+
+```{r}
+grp_raw <- glue_sql("
+SELECT *
+FROM disagg.grp_raw ;", .con = con) %>% dbGetQuery(conn = con) %>% 
+  mutate(smu1_id = tolower(smu1_id),
+         grp = as.character(grp))
+```
+
+
+
+## Leyenda del mapa
+
+Datos de la leyenda del mapa.
+
+```{sql connection=con_odbc, eval=FALSE}
+BEGIN ; 
+CREATE OR REPLACE VIEW csm.stu_rank AS
+SELECT  smu1_id, stu_id, stupc,
+        rank, 
+        CASE
+          WHEN (r.stupc IS NULL) THEN (0)::bigint
+          ELSE r.rank
+        END AS tp
+FROM (  SELECT smu1_id, stu_id, stupc,
+        dense_rank() OVER (PARTITION BY smu1_id ORDER BY stupc DESC NULLS LAST) AS rank
+        FROM csm.smu1_stu JOIN csm.stu USING (stu_id) ) r ;
+--
+COMMENT ON VIEW csm.stu_rank IS 'Rank and type of STU within primary SMU' ;
+COMMIT ;
+```
+
+```{r}
+smu1_stu <- glue_sql("
+SELECT *
+FROM csm.stu_rank ;", .con = con) %>% dbGetQuery(conn = con) %>% 
+  mutate(smu1_id = tolower(smu1_id))
+```
+
+
+
+# Cálculo de la distancia
+
+La distancia es la medida básica para establecer la correlación. 
+Se toma la distancia Euclídea.
+
+Se calcula la distancia desde los medoides a cada perfil. 
+Posteriormente, se toma la STU asociada a cada perfil y con ello se obtiene una distancia de cada medoide a cada STU, como valor medio representativo de todos los perfiles que la componen.
+Para el análisis sólo se consideran aquellas STU registradas en cada SMU en la leyenda del mapa. 
+Esto busca incluir el factor SMU utilizado durante la división, además de las covariables, en la correlación.
+
+```{r}
+local({
+  pt <- obs %>% 
+    bind_rows() %>% 
+    mutate(across(where(is.numeric), round, digits = 7))
+  
+  covar_pt <- pt %>% 
+    select(-pid) %>% 
+    as.matrix(dimnames = list(as.character(x$pid), colnames(.)))
+  
+  rownames(covar_pt) <- pt$pid
+  
+dist_pt <- dist(covar_pt, method = "euclidean") %>% 
+  as.matrix()
+
+# Matrix distance holds distances between grp and obs, doubled. 
+# The desired chunk is selected. 
+dist_pt <- dist_pt[(nrow(obs$ctd)+1):nrow(covar_pt) , 1:nrow(obs$ctd)]
+
+dist_pt <<- dist_pt %>% 
+  as_tibble(rownames = "pid") %>% 
+  pivot_longer(-pid, names_to = "ctd", values_to = "dist") %>% 
+  inner_join(pf_stu, by = c("pid"= "pf_id"))
+})
+```
+
+```{r}
+dist_stu <- dist_pt %>%
+    # Distances
+    mutate(dist = round(dist, digits = 4)) %>% 
+    group_by(ctd, stu_id) %>% 
+    summarise(dist = mean(dist)) %>% # What about median?
+    ungroup() %>% 
+    arrange(ctd, dist) %>% 
+    # Add STU stats 
+    separate(ctd, sep = 4, into = c("smu1_id", "grp"), remove = FALSE) %>% 
+    group_by(ctd, smu1_id, grp) %>% 
+    summarise(stu_id, dist, distrank = dense_rank(dist)) %>% 
+    ungroup() %>% 
+    # Filter STU within SMU and merge STU information from map legend
+    inner_join(smu1_stu, by = c("smu1_id", "stu_id")) %>% 
+    rename(sturank = rank, stutp = tp) %>% 
+    select(-sturank) %>% 
+    # Merge area information from division groups
+    inner_join(grp_raw, by = c("smu1_id", "grp")) %>% 
+    rename(grppc = pc)
+```
+
+
+
+# Asignación
+
+La asignación de las STU a los grupos se establece en un proceso manual que considera, por un lado, la distancia media de los medoides de los grupos a cada STU y también la distancia individiual a cada perfil asociado a dichas STU. 
+Mediante el primero se analiza la visión global de la SMU y el predominio de cada STU, mientras con el segundo apartado, las relaciones entre grupos y STU en el espacio de las covariables.
+
+
+## Tabla de distancias entre STU
+
+```{r}
+# Index for kable styling in row packs ----
+local({
+  # Title for groups
+  dist_tittle <<- dist_stu %>% 
+    transmute(smu1_id = toupper(smu1_id)) %>% 
+    distinct(smu1_id) %>% 
+    flatten_chr()
+  
+  # Count the number of STU series described within groups
+  dist_pack <<- dist_stu %>% 
+    count(smu1_id) %>% 
+    select(n) %>% 
+    flatten_int()
+  
+  #' Named vector with number of rows for each primary SMU.
+  dist_pack <<- dist_tittle %>% 
+    setNames(object = dist_pack, nm = . )
+})
+```
+
+\newpage
+
+```{r}
+dist_stu %>% 
+  select(smu1_id, grp, grppc, stu_id, stutp, stupc, dist, distrank) %>% 
+  arrange(smu1_id, desc(grppc), grp, dist) %>% 
+  select(-smu1_id) %>% 
+  knitr::kable(format = "html", escape = F, # Escape is mandatory when cell_spec is used
+               digits = 4, align = c("c"), col.names = c("Grupo", "Grp %", "STU", "Órden STU", "STU %", "Distancia", "Posición")) %>% 
+  pack_rows(index = dist_pack) %>% 
+  collapse_rows(columns = 1, valign = "middle") %>% 
+  kable_styling(bootstrap_options = c("striped"), full_width = TRUE, position = "center") 
+```
+
+
+## Gráficas de distancias entre perfiles
+
+Para una SMU dada, se calcula un PCA y se genera de él una gráfica usando de ejes los componentes mayoritarios y representando la distribución de los medoides y los perfiles asociados a sus STUs.
+
+```{r}
+covar_pt <- vector("list")
+
+covar_pt[["pf"]] <- obs$pf %>% 
+  inner_join(pf_stu, by = c("pid"= "pf_id")) %>% 
+  inner_join(smu1_stu, by = "stu_id") %>% 
+  select(-stupc, -rank, -tp)
+
+covar_pt[["ctd"]] <- obs$ctd %>% 
+  separate(pid, sep = 4, into = c("smu1_id", "grp"), remove = FALSE) %>% 
+  select(-grp) %>% 
+  mutate(stu_id = "ctd")
+
+covar_pt <- covar_pt %>% 
+  map(select, pid, smu1_id, stu_id, everything())
+```
+
+
+```{r, eval=FALSE}
+dir <- path(proj$img, "asg_pca")
+dir_create(dir)
+
+for (i in tolower(dist_tittle)) {
+  # Covariates date of every point related to an SMU
+  covar_smu1 <- covar_pt %>% 
+    map(filter, str_detect(smu1_id, i)) %>% 
+    bind_rows() %>% 
+    select(-smu1_id) %>% 
+    as.data.frame()
+
+  rownames(covar_smu1) <- covar_smu1$pid
+  covar_smu1$pid <- NULL
+  
+  # PCA
+  smu1_pca <- FactoMineR::PCA(covar_smu1, 
+                              quali.sup = 1,
+                              scale.unit = TRUE,
+                              graph = FALSE)
+  
+  ctd_coord <- smu1_pca[["ind"]]$coord %>% 
+    as_tibble(rownames = "pid") %>% 
+    filter(str_detect(pid, "^j"))
+  
+  pic <- factoextra::fviz_pca_ind(smu1_pca, 
+                           habillage = "stu_id",
+                           geom = "point",
+                           # addEllipses = TRUE,
+                           repel = TRUE # Avoid text overlapping
+                           ) +
+    ggrepel::geom_text_repel(data = ctd_coord, 
+                             mapping = aes(x = Dim.1, y = Dim.2, label = pid),
+                             colour = "#F8766F") +
+    ggtitle(paste(toupper(i), "Individuals PCA", sep = " - "))
+  
+  #' Saving the PCA graph 
+  ggsave(path(dir, paste(i, "pca", sep = "_"), ext = "svg"), pic)
+}
+
+```
+
+
+## Análisis conjunto
+
+Del análisis conjunto de ambos elementos, se extrae una asignación manual de STUs para los grupos de la división. 
+
+Para su consolidación, se aprovecha la estructura de grupos y STUs creada y se edita manualmente.
+
+```{r, eval=FALSE}
+asg_manual <- path(proj$res, glue("{div$met}_{div$sel}-asg_manual"), ext = "csv")
+
+dist_stu %>% 
+  select(smu1_id, grp, grppc, stu_id, stutp, stupc, dist) %>% 
+  arrange(smu1_id, desc(grppc), grp, dist) %>%
+  mutate(dist = round(dist, digits = 5)) %>% 
+  write_csv(path = asg_manual, na = "")
+```
+
+Para la asignación se toman las relaciones registradas, buscando que las distancias entre STU y los grupos sean lo menor posible y que los niveles de ocupación sean aproximados en cierto grado.
+De esta forma, se define la composición en términos de STU de las nuevas SMU y que pueden ser tanto monotáxicas como politáxicas.
+En este último caso, se conoce la tipologia de las STU, pero no su predominio.
+Se decide fijar estos en base a los ratios de ocupación descritos en la leyenda del mapa original.
+Por ejemplo, una nueva SMU compuesta por una STU previamente descrita con un porcentaje del 30% y otra del 10% dan lugar a unos nuevos niveles del 75% (30/(30+10)) y del 25% (10/(30+10)) respectivamente.
+
+Se genera una tabla foránea que lea los datos directamente del *CSV* utilizado. 
+De esta forma, es posible su edición, en caso de necesitarse, sin necesidad de repetir el proceso de importación.
+
+```{r, eval=FALSE}
+glue_sql("
+CREATE SERVER disagg_asg
+FOREIGN DATA WRAPPER ogr_fdw
+OPTIONS ( datasource {path_wd(asg_manual)},
+  format 'CSV' )", .con = con) %>% dbExecute(conn = con)
+
+local({
+  layer <- str_replace_all(path_ext_remove(path_file(asg_manual)), c("-" = "_"))
+  glue_sql("
+  IMPORT FOREIGN SCHEMA ogr_all
+	LIMIT TO ({`layer`})
+	FROM SERVER disagg_asg
+	INTO disagg ;", .con = con) %>% dbExecute(conn = con)
+  
+  glue_sql("
+  ALTER TABLE disagg.{`layer`} 
+  RENAME TO _asg_manual ;", .con = con) %>% dbExecute(conn = con)
+})
+```
+
+```{sql connection=con_odbc, eval=FALSE}
+BEGIN ;
+CREATE VIEW disagg.asg_manual AS 
+SELECT smu1_id, grp::integer, grppc::integer, stu_id, stutp::integer, stupc::numeric, nstutp::integer, nstupc::integer
+FROM disagg._asg_manual
+-- Remove empty rows generated to ease the manual edition
+WHERE smu1_id IS NOT NULL ;
+--
+COMMENT ON VIEW disagg.asg_manual IS 'Results of the manual assignment' ;
+COMMIT ; 
+```
+
+
+## Revisión del análisis
+
+Se analizan los datos enlazados con el fin de detectar cualquier error que se hubiese podido cometer.
+Así, se deberán cumplir las siguientes condiciones:
+  
+  * Todas las STU con una ocupación potencial superior al 15% son definidas como STU y no como inclusiones.
+  Esto ocurre cuando existe una STU al 80% y una única inclusión complementaria (20%), o dos (potencialmente al 10% cada una).
+  * El conjunto de STU dentro de una SMU deben dar lugar a una ocupación total del 100%.
+  * Todos los grupos definidos durante la división deben tener algún.
+  * Todas las STU del mapa original deben quedar recogidas en el nuevo mapa.
+  
+```{sql connection=con_odbc, eval=FALSE}
+-- Those STU potentially greater than 10% are defined as STU (nipc >= 15)
+WITH stupc AS (
+	SELECT 	smu1_id, grp, nstutp,
+		CASE 
+			WHEN nstutp = 1 THEN coalesce(nstupc, 100)
+			ELSE NULL 
+		END AS nstupc
+	FROM disagg.asg_manual
+), sumpc AS (
+  SELECT smu1_id, grp, sum(nstupc) AS pc, count(*) AS nstu,
+    CASE 
+      WHEN count(*) > 1 THEN ((100-sum(nstupc))/(count(*)-1))::numeric(5,2) 
+      ELSE NULL 
+    END AS nipc
+  FROM stupc
+  GROUP BY smu1_id, grp
+  ORDER BY pc ASC 
+)
+SELECT *
+FROM sumpc
+WHERE nipc >= 15 
+ORDER BY smu1_id ASC ;
+```
+
+```{sql connection=con_odbc, eval=FALSE}
+-- Those ocupation sums greater than 100%
+WITH stupc AS (
+	SELECT 	smu1_id, grp, nstutp,
+		CASE 
+			WHEN nstutp = 1 THEN coalesce(nstupc, 100)
+			ELSE NULL 
+		END AS nstupc
+	FROM disagg.asg_manual
+), sumpc AS (
+  	SELECT smu1_id, grp, sum(nstupc) AS pc, count(*) AS nstu
+	FROM stupc
+	GROUP BY smu1_id, grp
+	ORDER BY pc ASC 
+) 
+SELECT *
+FROM sumpc
+WHERE pc > 100 ;
+```
+
+```{sql connection=con_odbc, eval=FALSE}
+-- All groups must have an assignment, so the number should be the same as groups area stats. 
+SELECT count(*)
+FROM (
+	SELECT DISTINCT smu1_id, grp
+	FROM disagg.asg_manual
+) asg
+UNION
+SELECT count(*)
+FROM disagg.grp_raw ;
+```
+
+```{sql connection=con_odbc}
+WITH x AS (
+	SELECT DISTINCT stu_id
+	FROM csm.smu1_stu
+	WHERE smu1_id !~* '^jm'
+	EXCEPT
+	SELECT DISTINCT stu_id
+	FROM disagg.asg_manual
+)
+SELECT *
+FROM csm.smu1_stu
+WHERE stu_id IN (SELECT stu_id FROM x)
+ORDER BY smu1_id
+```
+Existe un número reducido de STU que no han sido asignadas a ningún grupo. 
+
+```{sql connection=con_odbc}
+WITH x AS (
+	SELECT DISTINCT stu_id
+	FROM csm.smu1_stu
+	WHERE smu1_id !~* '^jm'
+	EXCEPT
+	SELECT DISTINCT stu_id
+	FROM disagg.asg_manual
+)
+SELECT *
+FROM csm.pf 
+WHERE stu_id IN (SELECT stu_id FROM x) ;
+```
+
+La mayoría que no tienen asociado ningún perfil y, por lo tanto, han sido excluidas del proceso de correlación.
+La excepción es la STU recogida en la SMU *J31C*, que no ha sido posible asociarla, al haber sido descartada la SMU durante su división.
+
+
+## Resultado
+
+En la mayoría de los casos (*129*), las asignaciones son únicas y dan lugar a SMU monotáxicas, aunque también se registran politáxicas con varias STU e inclusiones.
+A falta de la validación de la asignación, estos resultados son prometedores en la línea de los objetivos marcados.
+
+```{sql connection=con_odbc, eval=FALSE}
+WITH nstu AS (
+	SELECT 	smu1_id, grp, count(*) AS nstu
+	FROM disagg.asg_manual
+	GROUP BY smu1_id, grp
+)
+SELECT DISTINCT nstu, count(*) OVER(PARTITION BY nstu), percent_rank() OVER(ORDER BY nstu)
+FROM nstu
+--GROUP BY nstu
+```
+
+
+
+
+# Consolidación de las asignaciones
+
+## Consolidación previa de las STU
+
+La nueva tabla de relación entre SMU y STU necesitará tomar como referencia las STU existentes.
+Por este motivo, se consolida la tabla foránea _STU_ del mapa original.
+Como no será modificada la tabla, no es necesario su recreación desde cero y se opta por su copia literal.
+
+```{sql, connection=con_odbc, eval=FALSE}
+-- Rename foreign table that is going to be sustituted. 
+ALTER FOREIGN TABLE csm.stu RENAME TO _stu ;
+```
+
+```{sql, connection=con_odbc, eval=FALSE}
+-- Copying the table, defining the PRIMARY KEY and creating the index of the new _STU_ table.
+BEGIN ;
+CREATE TABLE csm.stu AS
+SELECT *
+FROM csm._stu ;
+--
+ALTER TABLE csm.stu ADD PRIMARY KEY (stu_id) ;
+--
+COMMENT ON TABLE csm.stu IS 'Soil Taxonomy Units (STU)' ;
+COMMENT ON COLUMN csm.stu.stu_id IS 'Símbolo de la STU' ;
+COMMENT ON COLUMN csm.stu.okey_id IS 'Sistema de clasificación taxonómica original' ;
+COMMENT ON COLUMN csm.stu.serie_id IS 'Símbolo de la Serie de suelo a la que se adscribe' ;
+--
+CREATE INDEX ON csm.stu (stu_id) ;
+COMMIT;
+```
+
+## Modelo lógico
+
+Posteriormente, se crean las tablas necesarias para alojar las nuevas SMU y sus relaciones i) con las STU, y ii) con los grupos de la división.
+Estas respoden al modelo lógico de almacenamiento utilizado en la base de datos de suelos del mapa original, con una tabla que recoge las **SMU** y después dos relaciones más con las **STU** y con los **grupos** de las divisiones. 
+De esta forma, se podrá obtener el mapa final de SMU.
+
+```{r}
+# Create the schema
+path_wd("db") %>% 
+  dir_ls(type = "directory", regexp = proj$key) %>% 
+  dir_ls(type = "directory", recurse = TRUE) %>% 
+  dir_walk(type = "file", fun = function(f) {pg_exec(db = "dicsm", sql = f)})
+```
+
+
+## Combinaciones de las SMU potenciales 
+
+El primer paso es la identificación de las potenciales SMU disgregados, esto es, aquellas combinaciones de STU únicas.
+Para ello, se obtienen las combinaciones para cada grupo de las divisiones.
+
+```{sql connection=con_odbc}
+CREATE OR REPLACE VIEW disagg.predsmu AS
+WITH stupc AS (
+  -- Add pc to all main STUs
+	SELECT 	smu1_id, grp, grppc, stu_id, nstutp,
+		CASE 
+			WHEN nstutp = 1 THEN coalesce(nstupc, 100)
+			ELSE NULL 
+		END AS nstupc
+	FROM disagg.asg_manual
+	-- Force ordering within new combinations: high nstupc and by alphabetical stu_id
+), nstu AS (
+	SELECT *
+	FROM stupc
+	ORDER BY smu1_id, grp, nstupc DESC NULLS LAST, stu_id
+)
+-- Group then by groups
+SELECT smu1_id, grp, array_agg(stu_id) AS stu, array_agg(nstupc) AS pc
+FROM nstu
+GROUP BY smu1_id, grp ;
+```
+
+La mayor parte de los grupos recogen una combinación de una única STU (63%) de un total de **207**.
+
+```{sql connection=con_odbc}
+WITH len AS (
+	SELECT smu1_id, grp, array_length(stu, 1) as l
+	FROM disagg.predsmu
+	ORDER BY l ASC
+)
+SELECT DISTINCT l, count(*) OVER(PARTITION BY l), percent_rank() OVER(ORDER BY l)::numeric(5,3)
+FROM len ;
+```
+
+
+De estas, existen **143** combinaciones únicas de STU y su predominio asociado. 
+Dicho valor también se obtiene si sólo se consideran las STU independientemente de su predominio.
+
+```{sql connection=con_odbc}
+SELECT count(*)
+FROM (
+	SELECT stu
+	FROM disagg.predsmu
+	GROUP BY stu
+) AS i	
+UNION 
+SELECT count(*)
+FROM (
+	SELECT stu, pc
+	FROM disagg.predsmu
+	GROUP BY stu, pc
+) AS i	;
+```
+
+De estas combinaciones, la mayoría siguen siendo combinaciones monotáxicas.
+
+```{sql connection=con_odbc}
+WITH len AS (
+	SELECT stu, pc, array_length(stu, 1) as l
+	FROM disagg.predsmu
+	GROUP BY stu, pc
+	ORDER BY l ASC
+)
+
+SELECT DISTINCT l, count(*) OVER(PARTITION BY l), percent_rank() OVER(ORDER BY l)::numeric(5,3)
+FROM len
+```
+
+Con todo, se definen las nuevas SMU disgregadas. 
+El nombre único de cada SMU se compone por una letra, *m* para aquellas monotáxicas y *p* para las politáxicas, seguida de un número de dos dígitos adjudicados en orden decreciente de importancia, esto es, de número de repeticiones. 
+
+```{sql connection=con_odbc}
+CREATE MATERIALIZED VIEW disagg.stu_dsmu AS
+WITH cnt AS (
+	SELECT stu, 
+			CASE 
+				WHEN array_length(stu, 1) = 1 THEN 'm'
+				WHEN array_length(stu, 1) > 1 THEN 'p'
+			END tp,
+			count(*)
+	FROM disagg.predsmu
+	GROUP BY stu
+	ORDER BY tp, count DESC, stu
+), num AS (
+	SELECT stu, tp, count, lpad(row_number() over(partition by tp)::varchar, 2, '0') as n
+	FROM cnt
+)
+SELECT stu, concat(tp, n) AS dsmu_id
+FROM num ;
+```
+
+```{sql connection=con_odbc}
+-- Update dsmu_id from c to m for monotaxics
+BEGIN ; 
+UPDATE disagg.dsmu as main 
+  SET dsmu_id = concat('m', right(dsmu_id, -1)) 
+  WHERE left(dsmu_id, 1) LIKE 'c' 
+  RETURNING main.dsmu_id ;
+ROLLBACK; --Security code. It should be changed to COMMIT to apply the changes.
+```
+
+
+
+
+
+Así, se consolidan las **143** SMU disgregadas.
+
+```{sql connection=con_odbc}
+INSERT INTO disagg.dsmu (dsmu_id)
+SELECT dsmu_id
+FROM disagg.stu_dsmu ;
+```
+
+Y las STU que los constituyen.
+
+```{sql connection=con_odbc}
+INSERT INTO disagg.dsmu_stu (dsmu_id, stu_id, stupc)
+SELECT DISTINCT dsmu_id::varchar, unnest(stu) AS stu_id, unnest(pc) AS stupc
+FROM disagg.predsmu JOIN disagg.stu_dsmu USING (stu) ;
+```
+
+Por último, se registran las **207** asociaciones entre cada uno de los grupos creados durante la división y las nuevas SMU disgregadas.
+
+```{sql connection=con_odbc}
+INSERT INTO disagg.grp_dsmu (smu1_id, grp, dsmu_id)
+SELECT upper(smu1_id) AS smu1_id, grp, dsmu_id
+FROM disagg.predsmu JOIN disagg.stu_dsmu USING (stu) ;
+```
+
+
+
+# Resultado final
+
+El resultado último de correlación es la composición de un mapa que toma las delineaciones de los grupos divididos y les asigna una de las nuevas SMU definidas. 
+De esta forma, se redibujan los límites originales ganando en detalle cartográfico y categórico.
+
+```{sql connection=con_odbc}
+CREATE OR REPLACE VIEW disagg.dsoil_raw AS
+SELECT sid, geom, dsmu_id
+FROM disagg.div_raw JOIN disagg.grp_dsmu USING (smu1_id, grp) ;
+```
+
+Es posible realizar una análisis visual comparativo a través de la siguiente consulta en QGIS y examinar las características asociadas a delineaciones colidantes.
+
+```{sql connection=con_odbc}
+SELECT sid, geom, dsmu_id, stu, smu1_id, grp 
+FROM disagg.div_raw 
+  JOIN disagg.grp_dsmu USING (smu1_id, grp) 
+  JOIN disagg.stu_dsmu USING (dsmu_id) ;
+```
+
+
+
+
+# Conclusión
+
+A través del proceso de correlación se han asignado STU a los grupos creados durante la división y, en base a las combinaciones de STU descritas, se han definido las nuevas SMU del mapa disgregado.
+En total, se han descrito **143** combinaciones únicas de STU y su predominio asociado que han dado lugar a las nuevas SMU.
+De ellas, el **52%** se trata de SMU monotáxicas y el **36%** politáxicas con 2 STU, e.g. una STU principal con una inclusión.
+El resto son SMU politáxicas con 3 o más componentes.
+Además, de los **207** grupos, la mayor parte (63%) están asociados a una SMU monotáxicas. 

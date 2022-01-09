@@ -1,0 +1,959 @@
+---
+title: 'Refinement of new group divisions: Minimum Delineation Area and optimised scale'
+author: "Alberto Lázaro-López"
+date: "10/16/2020"
+output:
+  html_document:
+    toc: yes
+    toc_depth: '3'
+    df_print: paged
+    number_sections: yes
+  pdf_document:
+    toc: yes
+    toc_depth: 3
+    number_sections: yes
+abstract: Proceso de refinamiento del resultado de la división de las SMU del mapa
+  convencional.El proceso se llevó a cabo a través de un algoritmo diseñado específicamente
+  que consideraba la asociación entre píxeles próximos de la misma SMU 1 y grupos
+  y la asignación a delineaciones adyacentes con la menor superficie, pero superior
+  a la considerada; y cuya ejecución es recursiva. El nivel de refinamiento óptimo
+  obtenido se sitúa en un MLA de 825 m^{2}.
+bibliography: ../ref/dicsm.bib
+---
+
+```{r core, include=FALSE }
+for (.i in paste0("src/", c("dbms", "core", "mapping"), ".R")) source(.i)
+
+proj <- dir_ls(regexp = "disagg") %>% 
+  .proj_subdir()
+
+knitr::opts_chunk$set(eval = TRUE)
+```
+
+
+# Introducción
+
+Una de las acciones que comprende la etapa final de la disgregación es el refinamiento de las delineaciones ligado a una escala de publicación óptima del mapa definitivo.
+
+Un mapa de suelos es un documento gráfico que, como tal, requiere unas cualidades asociadas con la legibilidad de todos los elementos incluidos. 
+En ella, el tamaño de las delineaciones definidas resulta un factor clave y, convencionalmente, como referencia de su distribución se toman el tamaño medio y mínimo de las delineaciones. 
+Ambos parámetros deben guardar un equilibrio con el fin de asegurar la legibilidad global y que se refleja en el Índice Máximo de Reducción.
+Dichas referencias sirven a su vez para establecer la escala óptima de publicación del mapa resultante [@Rossiter2000MethodologySoilResource].
+
+Con el objetivo de ajustar el mapa para su publicación, se toman las delineaciones de las SMU disgregadas definidas durante la correlación y se lleva a cabo un análisis de la distribución de sus tamaños con el que se determina la necesidad de un refinamiento que disuelva las delineaciones más pequeñas, su grado de aplicación y las características de dicho acción.
+En este sentido, este refinamiento sólo contempla áreas con suelos y excluye las áreas misceláneas. 
+
+Específicamente se abordan los siguientes objetivos parciales;
+
+  1. El análisis de la distribución de las superficies de las delineaciones pertenecientes a las nuevas SMU disgregadas.
+
+  1. El cálculo del límite para el área óptima de las delineaciones más pequeñas.  
+  
+  1. Establecer un sistema de adscripción de aquellas áreas a disolver.
+
+  1. Fijar un método de refinamiento atendiendo a ambas características y su aplicación.
+  
+  1. Evaluación del proceso.
+
+
+
+# Datos
+
+Se trabaja sobre el conjunto de delineaciones de las SMU disgregadas definidas durante la correlación derivadas de la colección 2 con CLARA, ligados a un tamaño de malla concreto.
+
+```{r}
+# Grid size from db
+pix <- glue_sql("
+  SELECT st_pixelwidth(rast) AS pix
+  FROM division.clara_1_grp
+  LIMIT 1", .con = con) %>% RPostgres::dbGetQuery(conn = con) 
+
+pix <- pix %>% 
+  flatten_dbl()
+```
+
+Estas delineaciones están construidas sobre una malla cuya celda tiene un tamaño de *5 m*.
+
+Se recopila el área de cada una de las delineaciones y se le asocia la unidad de medida[^units] de superficie correspondiente.
+
+[^units]: Introducción al paquete de unidades de medidas "units"
+<https://cran.r-project.org/web/packages/units/vignettes/measurement_units_in_R.html>
+
+```{r}
+del <- glue_sql("
+  SELECT dsmu_id, smu1_id, grp, (ST_Area(geom)) as area
+  -- Instead of dsoil_raw, the original JOIN is used to keep _smu1_id_ and _grp_
+  FROM disagg.div_raw JOIN disagg.grp_dsmu USING (smu1_id, grp)", .con = con) %>% RPostgres::dbGetQuery(conn = con)
+
+del <- del %>% 
+  mutate(area = units::set_units(area, "m^2"))
+```
+
+
+
+# Análisis de la superficie de las delineaciones
+
+```{r}
+nrow(del)
+```
+
+El proceso de división inicial dió lugar a un total de **426.704** delineaciones. 
+
+En primer lugar, se analiza la distribución del área de estas delineaciones.
+
+```{r}
+# Surficial area distribution 
+del %>% 
+  mutate(area = units::set_units(area, "ha"),
+         area = units::drop_units(area)) %>% 
+ggplot() +
+  geom_boxplot(aes(area)) +
+  scale_x_continuous(n.breaks = 8) +
+  labs(x = "Area (ha)")
+```
+
+Se comprueba que se mantiene el patrón cuando se consideran todas las SMU, frente al 50% de las SMU del análisis inicial.
+Este patrón está fuertemente sesgado hacia un gran número de delineaciones de pequeño tamaño, pero cuenta con un rango muy amplio en forma de una cola muy alargada que representa la existencia de delineaciones con áreas muy grandes, de casi 140 ha.
+
+```{r}
+pic <- del %>% 
+  mutate(area = units::drop_units(area)) %>% 
+ggplot() +
+  geom_freqpoly(aes(area, stat(count)), binwidth = 25 ) +
+  labs(linetype = "Collection", x = "Area (m)", y = "Number of delineations") +
+  theme(legend.position = c(0.9, 0.85), 
+        plot.margin = margin(t = 5, r = 15, b = 5, l = 10, unit = "pt") ) +
+  coord_cartesian(xlim = c(0, 150))
+
+pic
+```
+
+En concreto, las delineaciones de pequeño tamaño se concentran entre 25 m^{2} y 100 m^{2}, con un pico en el primero.
+
+```{r}
+( del_big <- del %>% 
+    filter(area > units::set_units(60, "ha")) %>% 
+    arrange(desc(area)))
+
+del_big %>% 
+  count(smu1_id) %>% 
+  arrange(desc(n))
+
+del_big %>% 
+  count(dsmu_id) %>% 
+  arrange(desc(n))
+```
+
+Respecto a las delineaciones de gran tamaño (>60 ha), hay un total de 17 y que se concentran en 13 grupos de 9 SMU, fundamentalmente de 46C (5), 08C (3), y 20C y 43C (2 cada una).
+En términos de SMU disgregadas, se concentran principalmente en las SMU politáxicas *p03*, *p31* y *p39*.
+Su visualización a través de QGIS muestra que están compuestas principalmente por delineaciones sobre bosques o zonas limítrofes de la DO que han sufrido grandes alteraciones antrópicas.
+Así, su exclusión del resto de análisis favorecería una interpretación más realista, ajustada a los suelos. 
+
+```{r}
+rm(del_big)
+```
+
+
+
+
+# Características del refinamiento
+
+El refinamiento supone la disolución de aquellas delineaciones inferiores al Área Mínima Legible (*MLA*), las cuales no serían perceptibles a la escala óptima de publicación.
+
+
+## Área Mínima Legible
+
+El Área Mínima Legible (*MLA*) es la superficie sobre el terreno asociada a la Delineación Mínima Legible (*MLD*) representada en el mapa. 
+Para su cálculo, se consideran dos aproximaciones.
+Durante los cálculos a priori, se considerará el 99% de las delineaciones excluyendo equitativamente en ambas colas de la distribución, con el fin de evitar el efecto de los *outliers* detectados durante el análisis de la distribución.
+
+```{r}
+# del <- del %>% 
+#  filter(area < units::set_units(60, "ha"))
+
+
+#' Alternativa: Eliminar el 1% de las delineaciones extremas repartidas equitativamente entre ambos extremos
+trim <- 0.01
+del_trim <- del %>%
+  arrange(area) %>%
+  filter(between(row_number(), n()*(trim/2), n()*(1-trim/2)) )
+```
+
+
+### Estática
+
+Por un lado, se aplica una regla heurística [@Hengl2006FindingRightPixel] mediante la cual el MLD para mapas cuyas delineaciones han sido derivadas desde mallas puede definirse como el área de 2x2 píxeles.
+
+```{r}
+( static <- tibble(mla = ss_mla(2, pix), 
+                 asa = ss_asa(del_trim$area), 
+                 imr = ss_imr(mla, asa), 
+                 sn_cornell = ss_sn_cornell(units::set_units(mla, "m^2")),
+                 sn_vink = ss_sn_vink(units::set_units(mla, "m^2"))) %>% 
+  mutate(across(! matches("imr"), round), 
+         imr = round(imr, 2)) ) 
+```
+
+
+
+### Dinámica
+
+La determinación estática del MLD no considera el la superficie media de las delineaciones (**ASA**) sobre el terreno para fijar el MLA.
+Por eso, es posible definir un MLA que responda al equilibrio entre esta y el ASA en base al denominado Índice de Máxima Reducción (**IMR**) [@Rossiter2000MethodologySoilResource].
+Por convención, se ha establecido su valor óptimo para mapas convencionales originales en *2*, si bien existen metodologías nacionales que lo han modificado según criterios propios. 
+
+Con estos factores, se calcula el **IMR** considerando diferentes MLA's definidos a partir de superficies equivalentes a ventanas de análisis rectangulares donde se aumenta regularmente el tamaño con el fin de alcanzar un **IMR** inferior a 2.
+De este análisis se excluyen aquellas delineaciones menores que la **MLA**, si bien se trata de un análisis exploratorio donde dichas superficies no se adscriben a nuevas delineaciones.
+
+```{r}
+#' Calcs start from a surficial area equivalent to 2x2 pixels. 
+#' It grows adding one pixel at a time to every directions i.e 3x3, 4x4
+ngb <- 2-1
+imr = NA
+dynamic <- vector("list")
+while(imr > 2 || is.na(imr)) {
+  ngb = ngb + 1
+  
+  local({
+    mla <- ss_mla(ngb, pix)
+    
+    asa <- del_trim %>% 
+      filter(area >= mla) %>% 
+      select(area) %>% 
+      flatten_dbl() %>% 
+      ss_asa()
+    
+    dynamic[[as.character(ngb)]] <<- tibble(mla = mla, 
+                            asa = asa, 
+                            imr = ss_imr(mla, asa), 
+                            sn_cornell = ss_sn_cornell(units::set_units(mla, "m^2")),
+                            sn_vink = ss_sn_vink(units::set_units(mla, "m^2"))) %>% 
+      mutate(across(! matches("imr"), round), 
+            imr = round(imr, 2))
+  })
+  
+  imr <- dynamic[[as.character(ngb)]]$imr
+} 
+
+dynamic <- dynamic %>% 
+  bind_rows(.id = "ngb")
+```
+
+
+```{r}
+dynamic %>% 
+  ggplot(aes(x = as.integer(mla), y = imr)) +
+  geom_point() +
+  geom_smooth(se = FALSE)
+```
+
+```{r}
+dynamic %>% 
+  mutate(diff = abs(2 - imr)) %>% 
+  arrange(diff)
+```
+
+Los resultados muestran como el valor más próximo a *2* se consigue potencialmente a través de una superficie equivalente a 10x10 píxeles, que se corresponde con una **MLA** de 0,25 ha. 
+Sin embargo, valores en ese entorno se alcanzan desde superficies equivalentes 6x6 y 7x7 píxeles, desde una **MLA** de 900 m^{2}.
+
+La escala óptima de publicación derivada desde la **MLA** de 10x10 píxeles, según autores como Vink o Cornell, sería próxima a 1:10.000.
+
+```{r}
+rm(del, del_trim, static, pic)
+```
+
+
+## Adscripción 
+
+La disolución de aquellas delineaciones inferiores a la MLA deben ejecutarse bajo algún criterio, de forma que su espacio quede asociado a un nuevo grupo o SMU potencial.
+Una aproximación para este proceso sería la adscripción a una delineación adyacente por criterios espaciales atendiendo: 
+
+1. La superficie (S)
+
+1. El perímetro compartido (P)
+
+1. El ratio (P/S)
+
+Desde un punto de vista ambiental, la asimilación por la delineación adyacente de mayor superficie favorece la acumulación en delineaciones que no tienen porqué responder a factores físicos detallados en el ámbito de la unión. 
+La de menor superficie, pero superior a la delineación considerada, favorecería mantener las conexiones de grupos de delineaciones a través pocos píxeles y una mayor aglomeración, que redundaría además en una disminución de la desviación típica respecto al ASA.
+Por su parte, el efecto considerando el mayor perímetro compartido guardaría semejanza con el de la asimilación por la delineación adyacente de mayor superficie.
+Finalmente, el ratio entre ambos tendería a favorecer bien a delineaciones concentradas si fuese alto, bien a delineaciones elongadas si fuese bajo, aunque no ha sido definido un límite nítido entre ambas.
+
+Otra aproximación alternativa sería atender a criterios de semejanza entre las categorías de los grupos limítrofes. 
+Una medida definida en este sentido es la distancia taxonómica entre clases de suelos. 
+La dificultad de este sistema radica en establecer un sistema de cuantificación de proximidad entre clases e implica conocer la asignación taxonómica previamente.
+Por ejemplo, en qué medida existe coincidencia entre los diferentes niveles taxonómicos.
+
+
+
+
+## Propuesta
+
+Atendiendo a los diferentes apartados analizados, una propuesta completa de actuación contemplaría:
+
+1. Buscar el nivel de refinamiento que más se aproxime a obtener un mapa de disgregación de escala 1:10.000, valor de referencia para el tamaño de malla y las áreas misceláneas añadidas, y también que cuente con un IMR lo más próximo posible a 2, como valor establecido por convención.
+
+1. La asociación de los píxeles tendrá en cuenta los píxeles adyacentes incluyendo las diagonales. 
+Esto busca que dos delineaciones del mismo tipo, separadas, pero que visualmente y en superficie tienen entidad suficiente para permanecer juntas, lo hagan.
+
+1. La adscripción de las superficies filtradas a las delineaciones adyacentes de menor superficie, pero superior a la considerada, y en caso de empate, a aquella con la que exista un límite compartido de mayor longitud.
+
+
+
+
+
+# Aplicación del refinamiento 
+
+## Algortimos
+
+En mapas de información categórica, el filtrado de píxeles o delineaciones de pequeño tamaño y su asimilación a grupos adyacentes es denominado **sieve**. 
+Para completar este geoprocesamiento han sido localizados varios algoritmos:
+
+1. **gdal_sieve**[^gdalsieve]
+
+  Se trata de un algoritmo en Python disponible GDAL que se aplica sobre un raster. 
+  En el que se detectan asociaciones de píxeles próximos de una mísma categoría (polígonos del raster) cuya superficie (en píxeles) es inferior a un valor mínimo (*threshold*), de las que se sustituye el valor de la categoría por el del conjunto de píxeles adyacente de mayor tamaño. 
+
+  El algortimo permite establecer el sistema de relación entre píxeles, bien por Neumann (4 píxeles en cruz desde el central), Moore (los 8 píxeles adyacentes en rectángulo) o uno diseñado específico. 
+
+[^gdalsieve]: GDAL Sieve 
+<https://gdal.org/programs/gdal_sieve.html>
+
+1. **SAGA sieve tool**[^sagasieve]
+
+  A diferencia de GDAL, SAGA asigna un valor *NODATA* a las asociaciones de píxeles eliminadas en los rasters.
+
+[^sagasieve]: SAGA Sieve tool 
+<http://www.saga-gis.org/saga_tool_doc/7.6.3/grid_filter_15.html>
+
+1. **Mapbox PostGIS sieve**[^mapboxsieve]
+
+Esta función parte de un mapa vectorial en donde se eliminan todos aquellos polígonos pequeños integrados dentro de otro polígono, a través de eliminar los anillos internos de los polígonos. 
+
+[^mapboxsieve]: Mapbox PostGIS Sieve function 
+<https://github.com/mapbox/postgis-vt-util/blob/master/src/Sieve.sql>
+
+
+## Selección del algoritmo
+
+Ninguno de los algoritmos encontrados son capaces de ejecutar la propuesta para la eliminación. 
+Con la implementación de GDAL no es posible controlar el sistema de asignación de forma que no sea para el conjunto de píxeles de mayor tamaño; mientras en SAGA se esquiva este apartado.
+Por último, la versión implementada sobre mapas vectoriales no considera aquellos polígonos aislados, pero rodeados por más de un polígono adyacente.
+
+Por este motivo, se decide implementar un nuevo algoritmo de filtrado que permita ajustar tanto el sistema de asociación como el de asignación. 
+
+
+## Implementación propia
+
+Con las consideraciones establecidas en la propuesta, se desarrolla un algoritmo propio de refinamiento. 
+
+Todo el proceso será alojado en un esquema independiente y se utilizará un sistema de herencia para asegurar la uniformidad entre los resultados de los refinamientos y para relacionarlos entre sí.
+ 
+```{r}
+# Specific schema for the refinement process
+sch <- paste("disagg", "ref", sep = "_")
+
+# Create the new schema
+glue_sql("
+CREATE SCHEMA IF NOT EXISTS {`sch`} ;", .con = con) %>% dbExecute(conn = con)
+
+# Comment on new schema
+glue_sql("
+COMMENT ON SCHEMA {`sch`} IS {txt} ;",
+txt = glue("Refinement of disaggregated map delineations from ", 
+      "CLARA with Mahalanobis distance on covariates collection 2"), .con = con) %>% dbExecute(conn = con)
+
+
+# Pattern for refinement tables
+ref_pat <-  "_div_ref"
+pat_crs <- glue_sql("
+SELECT DISTINCT ST_SRID(geom)
+FROM disagg.dsoil_raw ;", .con = con) %>% dbGetQuery(conn = con) %>% flatten_dbl()
+
+local({
+  if (dbExistsTable(con, Id(schema = sch, table = ref_pat)) == FALSE) {
+    glue_sql("
+    CREATE TABLE {`sch`}.{`ref_pat`} (
+    LIKE disagg.dsoil_raw INCLUDING ALL EXCLUDING IDENTITY) ;", .con = con) %>% dbExecute(conn = con)
+    glue_sql("
+    ALTER TABLE {`sch`}.{`ref_pat`}
+    ADD PRIMARY KEY (sid) ;", .con = con) %>% dbExecute(conn = con)
+    glue_sql("
+    ALTER TABLE {`sch`}.{`ref_pat`}
+    ALTER COLUMN sid ADD GENERATED BY DEFAULT AS IDENTITY ;", .con = con) %>% dbExecute(conn = con)
+    
+    glue_sql("
+    ALTER TABLE {`sch`}.{`ref_pat`}
+    ALTER COLUMN geom TYPE geometry(MULTIPOLYGON, {pat_crs}) ;", .con = con) %>% dbExecute(conn = con)
+    glue_sql("
+    ALTER TABLE {`sch`}.{`ref_pat`}
+    ALTER COLUMN geom SET STORAGE EXTERNAL ;", .con = con) %>% dbExecute(conn = con)
+    glue_sql("
+    ALTER TABLE {`sch`}.{`ref_pat`}
+    ALTER COLUMN geom SET NOT NULL ;", .con = con) %>% dbExecute(conn = con)
+    
+    glue_sql("
+    ALTER TABLE {`sch`}.{`ref_pat`}
+    ALTER COLUMN dsmu_id SET NOT NULL ;", .con = con) %>% dbExecute(conn = con)
+    
+    glue_sql("
+    CREATE INDEX ON {`sch`}.{`ref_pat`} (dsmu_id) ;", .con = con) %>% dbExecute(conn = con)
+    glue_sql("
+    CREATE INDEX ON {`sch`}.{`ref_pat`} USING gist (geom) ;", .con = con) %>% dbExecute(conn = con)
+  }
+})
+```
+
+Se opta por una aplicación secuencial, de forma que se repite el proceso secuencialmente con un incremento en el tamaño de MLA de un píxel.  
+Esto es así, para evitar definir asignaciones en las que unidades adyacentes superiores en tamaño, pero inferior a un MLA marcado sean descartadas.
+De esta forma, también se pueden analizar (*debug*) los pasos intermedios para localizar posibles artefactos no considerados.
+
+```{r, eval=FALSE}
+# For the first iteration, a multi version should be created for CLARA outcome
+# in order to work with the pipeline.
+#' Just once.
+
+# A new table is created 
+dbWithTransaction(con, {
+  glue_sql("
+  -- Copy with <like> to drag serial identifier and indexes.
+  -- Then, inheritance is apply to allow scan from parent.
+  CREATE TABLE {`sch`}.ref_0 (
+    LIKE {`sch`}.{`ref_pat`} INCLUDING ALL
+  ) ;", .con = con) %>% dbExecute(conn = con)
+  glue_sql("
+  ALTER TABLE {`sch`}.ref_0 INHERIT {`sch`}.{`ref_pat`} ;", .con = con) %>% dbExecute(conn = con)
+  glue_sql("
+  ALTER TABLE {`sch`}.ref_0
+  ADD FOREIGN KEY (dsmu_id) REFERENCES disagg.dsmu(dsmu_id) ON UPDATE CASCADE, ;", .con = con) %>% dbExecute(conn = con)
+})
+
+# A multi geometry version of the CLARA outcome is created
+glue_sql("
+INSERT INTO {`sch`}.ref_0 (geom, dsmu_id)
+-- From previous refinement iteration
+-- get all combinations of SMU 1 and groups
+WITH one AS (
+  SELECT dsmu_id, ST_UnaryUnion(clt) AS geom
+  -- Cluster distance =: 1 for connected, px +1 for one px gap and so on
+  FROM (  SELECT dsmu_id, unnest(ST_ClusterWithin(geom, 1)) AS clt
+          FROM disagg.dsoil_raw
+          GROUP BY dsmu_id ) AS unite
+)
+-- Calculate area for new geometries
+SELECT ST_Multi(geom), dsmu_id
+FROM one", .con = con) %>% dbExecute(conn = con)
+```
+
+
+```{r, eval=FALSE}
+debug <- vector("list")
+# We want to calculate related areas for every delineation and filter those less or equal to MLA.
+# They will be individually assigned to a side delineation sharing a max lenght boundary.
+# Related delineations are merged and put together with the rest of delineations
+
+#' Run-time: ~30 min each on average
+for (i in seq(from = pix^2, to = 2000, by = pix^2)) {
+  
+  # INITAL DEBUG ----
+  debug[[as.character(i)]][1] <- lubridate::now()
+  
+  
+  # REFERENCE DATA ----
+  # New connection, reassure all previous temporary tables are dropped.
+  #dbDisconnect(con)
+  #con <- dbcon_postgis("dicsm")
+
+  # Reference of table to hold refined delineations at corresponding MLA size 
+  ref_tb <- paste("ref", as.character(i), sep = "_") 
+  #' If it exists, the level should be skipped
+  if (dbExistsTable(con, Id(schema = sch, table = ref_tb)) == TRUE) {
+    next
+  }
+  
+  # Reference for refinement is the the previous iteration (or genuine disaggregation)
+  ref_pre <- paste("ref", as.character(i - (pix^2)), sep = "_")
+  
+  
+  
+  # FIND SMALL DELINEATIONS ----
+  # Find multi-delineations less or equal to the filter size (i)
+  glue_sql("
+  CREATE TABLE {`sch`}.del_fil AS
+  WITH area AS (
+    SELECT sid, dsmu_id, geom, st_area(geom) AS area
+    FROM {`sch`}.{`ref_pre`}
+  )
+  SELECT sid
+  FROM area
+  WHERE area <= {i} ;", .con = con) %>% dbExecute(conn = con)
+
+  
+  #' If no delineations are filtered
+  #' the corresponding level refinement should be a view instead.
+  del_fil <- glue_sql("
+  SELECT count(*)
+  FROM {`sch`}.del_fil ;", .con = con) %>% dbGetQuery(conn = con) %>% flatten_dbl()
+  
+  if (del_fil == 0) {
+    glue_sql("
+    CREATE OR REPLACE VIEW {`sch`}.{`ref_tb`} as
+    SELECT *
+    FROM {`sch`}.{`ref_pre`} ;", .con = con) %>% dbExecute(conn = con)
+    
+    next
+  } 
+  
+  
+  
+  # BLEND SMALL DELINEATIONS IN A BIGGER ADYACENT DELINEATION ----
+  # Find adyacents big delineations to assign small delineations to be filtered. 
+  #' Big delineations shall be the smallest area that is not considered for filtering 
+  #' When ties, biggest shared boundary is preferred.
+  #' This query could be speed up by skipping lenght criterion.
+  #' Run-time: ~10 min.
+  glue_sql("
+  CREATE TABLE {`sch`}.del_asg AS 
+  -- Select delineations to be filtered
+  WITH fil AS (
+    SELECT *
+    FROM {`sch`}.{`ref_pre`} INNER JOIN {`sch`}.del_fil USING (sid)
+  )
+  SELECT fil.sid AS sid, big.sid AS big_sid, lenght
+  FROM fil, 
+    LATERAL ( SELECT div.sid, st_length(st_intersection(fil.geom, div.geom)) AS lenght, st_area(div.geom) AS area
+              FROM {`sch`}.{`ref_pre`} AS div
+              WHERE st_touches(fil.geom, div.geom) AND div.sid != fil.sid AND div.sid NOT IN (SELECT sid FROM {`sch`}.del_fil)
+              ORDER BY area ASC, lenght DESC -- ties issue
+              LIMIT 1 
+              ) AS big ;", .con = con) %>% dbExecute(conn = con)
+  
+  dbWithTransaction(con, {
+    glue_sql("
+    CREATE INDEX ON {`sch`}.del_asg (sid) ;", .con = con) %>% dbExecute(conn = con)
+    glue_sql("
+    CREATE INDEX ON {`sch`}.del_asg (big_sid) ;", .con = con) %>% dbExecute(conn = con)
+  })
+
+  # Create table for temporal refined delineations
+  glue_sql("
+  -- Copy with <like> to drag serial identifier and indexes.
+  CREATE TABLE {`sch`}.del_tmp (
+    LIKE {`sch`}.{`ref_pat`} INCLUDING ALL
+  ) ;", .con = con) %>% dbExecute(conn = con)
+
+  # Create new shapes and insert into refinement table
+  #' For every big delineation with assignments reshape it 
+  #' by collecting related small delineations and union all of them together.
+  #' Run-time: ~5 min.
+  glue_sql("
+  INSERT INTO {`sch`}.del_tmp (sid, geom, dsmu_id)
+  WITH main AS (
+    SELECT *
+    FROM {`sch`}.{`ref_pre`} 
+    WHERE sid IN (SELECT DISTINCT big_sid FROM {`sch`}.del_asg)
+  ), asg AS (
+    SELECT *
+    FROM {`sch`}.{`ref_pre`} INNER JOIN {`sch`}.del_asg USING (sid)
+  )
+  SELECT main.sid AS sid, ST_Multi(one.geom), dsmu_id
+  FROM main, 
+    LATERAL ( SELECT st_union(geom) AS geom
+              FROM (  SELECT ST_Multi(main.geom) AS geom
+                      UNION ALL 
+                      SELECT ST_Multi(asg.geom) AS geom
+                      FROM asg
+                      WHERE asg.big_sid = main.sid
+                      ) AS unite 
+              ) AS one ;", .con = con) %>% dbExecute(conn = con)
+
+  # Add unmodified delineations to temporal
+  glue_sql("
+  INSERT INTO {`sch`}.del_tmp (sid, geom, dsmu_id)
+  SELECT sid, ST_Multi(geom), dsmu_id
+  FROM {`sch`}.{`ref_pre`}
+  -- if lenght = 0, they will get erased at this point, instead of selecting from <del_asg>
+    -- not those filtered
+  WHERE sid NOT IN (SELECT sid FROM {`sch`}.del_fil)  
+    -- and not those already present
+    AND sid NOT IN (SELECT sid FROM {`sch`}.del_tmp) ;", .con = con) %>% dbExecute(conn = con)
+
+  
+  
+  
+  # POPULATE FINAL TABLE ----
+  # Create table to hold definitive refined delineations at corresponding filter size (i)
+  glue_sql("
+  -- Copy with <like> to drag serial identifier and indexes.
+  -- Then, inheritance is apply to allow scan from parent.
+  CREATE TABLE {`sch`}.{`ref_tb`} (
+    LIKE {`sch`}.{`ref_pat`} INCLUDING ALL
+  ) ;", .con = con) %>% dbExecute(conn = con)
+  glue_sql("
+  ALTER TABLE {`sch`}.{`ref_tb`} INHERIT {`sch`}.{`ref_pat`} ;", .con = con) %>% dbExecute(conn = con)
+  glue_sql("
+  ALTER TABLE {`sch`}.{`ref_tb`}
+  ADD FOREIGN KEY (dsmu_id) REFERENCES disagg.dsmu(dsmu_id) ON UPDATE CASCADE, ;", .con = con) %>% dbExecute(conn = con)
+
+
+  # Adyacent polygons with the same SMU 1~group are unioned.
+  #' Run-time: ~4 min.
+  glue_sql("
+  INSERT INTO {`sch`}.{`ref_tb`} (geom, dsmu_id)
+  -- From previous refinement iteration
+  -- get all combinations of SMU 1 and groups
+  WITH one AS (
+    SELECT dsmu_id, ST_UnaryUnion(clt) AS geom
+    -- Cluster distance =: 1 for connected, px +1 for one px gap and so on
+    FROM (  SELECT dsmu_id, unnest(ST_ClusterWithin(geom, 1)) AS clt
+            FROM {`sch`}.del_tmp div
+            GROUP BY dsmu_id ) AS unite
+  )
+  SELECT ST_Multi(geom), dsmu_id
+  FROM one", .con = con) %>% dbExecute(conn = con)
+
+  # Close DB connection, temporary tables are dropped.
+  glue_sql("
+  DROP TABLE IF EXISTS {`sch`}.del_fil, {`sch`}.del_asg, {`sch`}.del_tmp ;", .con = con) %>% dbExecute(conn = con)
+  dbDisconnect(con)
+  con <- pg_con("dicsm")
+  
+  # FINAL DEBUG ----
+  debug[[as.character(i)]][2] <- lubridate::now()
+}
+```
+
+```{r}
+loop_pth <- path(proj$res, "ref_loop", ext = "rds")
+```
+
+```{r, eval=FALSE}
+# Processing of debug time data
+debug <- debug %>% 
+  map(matrix, nrow = 1) %>% 
+  map(as_tibble, .name_repair) %>% 
+  bind_rows(.id = "ng") %>% 
+  mutate(ng = as.integer(ng), 
+         loop = round((V1-V2)/60, 2)) %>% 
+  filter(!is.na(V2))
+
+if (file_exists(loop_pth) == TRUE) {
+  loop <- readRDS(loop_pth)
+  loop <- loop %>% 
+    bind_rows(debug)
+  saveRDS(loop, loop_pth) 
+} else {
+  saveRDS(debug, loop_pth)
+}
+```
+
+
+
+# Análisis de resultados parciales
+
+## Tiempo de ejecución
+
+En primer lugar, es posible analizar los tiempos de ejecución del refinamiento.
+
+```{r}
+( loop <- readRDS(loop_pth) )
+```
+
+```{r}
+loop %>% 
+  mutate(loop = abs(loop)) %>% 
+  ggplot(data = ., mapping = aes(x = ng, y = loop) ) +
+  geom_point() +
+  geom_smooth(se = FALSE)
+```
+
+Se observa que existe una reducción notable del tiempo de ejecución con el aumento del MLA, que se aproxima a una asíntota en el entorno de 2,5 min. por iteración durante una la primera ejecución.
+
+
+
+## Delineaciones
+
+Las condiciones de agregación en los diferentes niveles son uniformes, de manera que es posible un análisis comparativo entre los niveles de refinamiento.
+Dado que su aplicación ha sido secuencial, se consideran en conjunto los resultados por cada nivel.
+
+El estudio se centra en:
+  * IMR y escala
+  * Número de delineaciones
+  * Distribución de la superficie de las delineaciones
+
+```{r, eval=FALSE}
+glue_sql("
+CREATE OR REPLACE VIEW {`sch`}.ref_level AS
+SELECT (regexp_match(tableoid::regclass::character varying, '[0-9]{{1,}}$'))[1]::integer AS level, *
+FROM {`sch`}._div_ref ;", .con = con)  %>% dbExecute(conn = con)
+
+glue_sql("
+CREATE MATERIALIZED VIEW IF NOT EXISTS {`sch`}.level AS
+SELECT DISTINCT level
+FROM {`sch`}.ref_level 
+ORDER BY level ASC ;", .con = con)  %>% dbExecute(conn = con)
+
+glue_sql("
+REFRESH MATERIALIZED VIEW {`sch`}.level ;", .con = con)  %>% dbExecute(conn = con)
+```
+
+
+```{r}
+ref_level <- glue_sql("
+SELECT *
+FROM {`sch`}.level ;", .con = con)  %>% dbGetQuery(conn = con) %>% 
+  arrange(level) %>% 
+  flatten_int()
+
+# db connections to allow parallelisation
+dbconX <- foreach(id = ref_level, 
+                  .final = function(l) setNames(l, as.character(ref_level)) ) %do% {
+  RPostgres::dbConnect(odbc::odbc(), driver = "PostgreSQL Driver", 
+                      database = "dicsm", UID = keyring::key_list("psql-su")[1,2], PWD = keyring::key_get("psql-su"), host = "localhost", 
+                      port = 5432, bigint = "numeric")
+}
+
+del_ref <- foreach( i = ref_level, dbcon = dbconX, 
+                    .final = function(l) setNames(l, as.character(ref_level)) ) %dopar% {
+  glue_sql("
+  SELECT {i} as level, dsmu_id, (ST_Area(geom)) as area
+  FROM {`sch`}.{`tb`}",
+  tb = paste("ref", i, sep = "_"), .con = dbcon)  %>% RPostgres::dbGetQuery(conn = dbcon)
+}
+
+# Release db connections
+db <- foreach(dbcon = dbconX, 
+              .final = function(l) setNames(l, as.character(ref_level)) ) %do% {
+  RPostgres::dbDisconnect(dbcon)
+}
+rm(dbconX, dbcon)
+
+del_ref <- del_ref %>% 
+  bind_rows() %>% 
+  mutate(area = units::set_units(area, "m^2"))
+```
+
+
+```{r}
+( del_level <- del_ref %>% 
+    group_by(level) %>% 
+    summarise(n = n(),
+              mla = min(area),
+              asa = ss_asa(area),
+              imr = ss_imr(mla, asa),
+              sn_cornell = ss_sn_cornell(units::set_units(asa/4, "m^2")),
+              sn_vink = ss_sn_vink(units::set_units(asa/4, "m^2"))) %>% 
+    mutate(across(! matches("imr") & where(is.double), round), 
+           imr = round(imr, 2)))
+```
+
+```{r}
+del_level %>% 
+  mutate(sn_cornell_diff = abs(10^4 - sn_cornell)) %>% 
+  arrange(sn_cornell_diff)
+```
+
+
+```{r}
+del_level %>%  
+  ggplot(aes(x = as.integer(mla), y = n)) +
+  geom_point() +
+  geom_smooth(se = FALSE)
+```
+
+```{r}
+colBlue <- RColorBrewer::brewer.pal(9, "Blues")[8]
+
+(plot <- del_level %>%  
+  filter(level > 0) %>% 
+  ggplot(aes(x = as.integer(mla), y = n)) +
+  geom_point() +
+  geom_smooth(se = FALSE, colour = colBlue) +
+  xlab(bquote('Área Mínima Legible (MLA, '*m^2* ')')) +
+  ylab("Delineaciones (nº)") +
+  # xlab(bquote('Assimilation ('*mu~ 'mol' ~CO[2]~ m^-2~s^-1*')')) +
+  # labs(x = "Área Mínima de Delineación (MLA)", y = "Delineaciones (nº)") +
+  theme_light(base_size = 13)
+)
+```
+
+```{r}
+img <- fs::path(proj$img, "n_mla", ext = "pdf")
+ggsave(filename = img[1], plot, 
+       width = 7, height = 5, dpi = "retina")
+rm(plot)
+```
+
+
+```{r}
+(plot <- del_level %>%  
+  ggplot(aes(x = as.integer(mla), y = imr)) +
+  geom_point() +
+  # geom_line(colour = "blue")
+  geom_smooth(se = FALSE, colour = colBlue) + 
+  scale_y_continuous(limits = c(2.5, 9.5), breaks = seq(1, 9, 2)) + # , breaks = seq(1, 9, 2)
+  xlab(bquote('Área Mínima Legible (MLA, '*m^2* ')')) +
+  ylab("Índice de Máxima Reducción (IMR)") +
+  # labs(x = "Área Mínima de Delineación (m^{2} MLA)", y = "Índice de Máxima Reducción (IMR)") +
+  theme_light(base_size = 13)
+)
+```
+
+```{r}
+img <- fs::path(proj$img, "imr_mla", ext = "pdf")
+ggsave(filename = img[1], plot, 
+       width = 7, height = 5, dpi = "retina")
+rm(plot)
+```
+
+
+
+```{r}
+del_level %>%  
+  ggplot(aes(x = as.integer(level), y = sn_cornell)) +
+  geom_point() +
+  geom_smooth(se = FALSE)
+```
+
+```{r}
+del_level %>%  
+  ggplot(aes(x = as.integer(level), y = as.integer(mla))) +
+  geom_point() +
+  geom_smooth(se = FALSE)
+```
+
+Los resultados muestran diferentes tendencias conjuntas. 
+Así, se consigue una disminución constante tanto del número de delineaciones como del IMR al aumentar el tamaño del área mínima de filtrado. 
+Ambos son efectos buscados con el proceso de refinamiento.
+Al mismo tiempo, la escala aumenta progresivamente en relación con el nivel y el MLA, que coincide en todos los niveles con la suma del área de filtrado más la superficie de un píxel.
+
+La elección del nivel de refinado óptimo está condicionado a dos criterios complementarios.
+Por un lado, la elección del tamaño de malla y de las áreas misceláneas añadidas se enfocaron inicialmente a obtener un mapa de disgregación de escala 1:10.000, y por ello, se considera el nivel de refinado que más se aproximase a este. 
+En este supuesto, bajo las consideraciones de Cornell sería el nivel de refinado **1800** con un MLA de **1825 m^{2}**, mientras que por Vink sería el nivel **725** con un MLA de **750 m^{2}**.
+Por otro lado, el criterio de un IMR lo más próximo posible a 2, como valor establecido por convención.
+En los resultados, ninguno de los niveles llega a alcanzarlo. 
+Aunque este parámetro tiende a disminuir al aumentar el nivel de refinado, dicha reducción es limitada en los niveles superiores.
+Así, el nivel de refinado **725** contaría con un IMR relativamente bajo (**3,65**) que se reduciría sensiblemente hasta **2,96** en el nivel de refinado **1800**.
+Entre ambos, se selecciona **1800** como el nivel de refinado más óptimo y se utilizará en adelante para generar el mapa definitivo disgregado. 
+
+
+
+# Conclusión
+
+Los resultados de un análisis específico para las delineaciones de grupos obtenidos por el método CLARA y la colección de covariables 1 sustentan la necesidad de realizar un refinado sobre las delineaciones en base a la presencia de muchas delineaciones de muy poco tamaño y un IMR excesivamente alto.
+
+En el mismo análisis se fijó un horizonte de refinamiento orientativo de un MLA entre 900 y 2500.
+
+El método de refinamiento establecido toma en consideración múltiples aspectos: 
+
+1. Busca el nivel de refinamiento que más se aproxime a obtener un mapa de disgregación de escala 1:10.000, valor de referencia para el tamaño de malla y las áreas misceláneas añadidas, y también que cuente con un IMR lo más próximo posible a 2, como valor establecido por convención.
+
+1. La asociación entre las delineaciones tiene en cuenta los píxeles adyacentes incluyendo las diagonales. 
+Esto busca que dos delineaciones del mismo tipo, separadas, pero que visualmente y en superficie tienen entidad suficiente para permanecer juntas, lo hagan.
+
+1. La adscripción de las superficies filtradas a las delineaciones adyacentes de menor superficie, pero superior a la considerada.
+Favorece mantener las conexiones de grupos de delineaciones a través de pocos píxeles y una mayor aglomeración, que redundaría además en una disminución de la desviación típica de la distribución del tamaño de las delineaciones.
+
+
+La implementación de dicho método es recursiva y permite ser escalada a mapas de tamaños variables sin afectar a su rendimiento.
+
+La ejecución del refinamiento a dado lugar a nuevos conjuntos de delineaciones diferenciados por niveles de MLA en los que se consigue una disminución constante tanto del número de delineaciones como del IMR al aumentar el tamaño del área mínima de filtrado. 
+Al mismo tiempo, la escala aumenta progresivamente en relación con el nivel y el MLA, que coincide en todos los niveles con la suma del área de filtrado más la superficie de un píxel.
+Atendiendo a las consideraciones establecidas, el nivel de refinado óptimo para el mapa sería aquel con una MLA de **1825** m^{2} alcanzado en el nivel **1800** de filtrado. 
+
+
+```{r}
+glue_sql("
+CREATE OR REPLACE VIEW disagg.dsoil_base AS
+SELECT *
+FROM {`sch`}.{`tb`}",
+  tb = paste("ref", 0, sep = "_"), .con = con)  %>% dbExecute(conn = con)
+
+glue_sql("
+COMMENT ON VIEW disagg.dsoil_base IS {comment}",
+  comment = "Disaggregated soil map without refinement at level 0 (multigeometries).", .con = con)  %>% dbExecute(conn = con)
+
+
+glue_sql("
+CREATE OR REPLACE VIEW disagg.dsoil_refv AS
+SELECT *
+FROM {`sch`}.{`tb`}",
+  tb = paste("ref", 725, sep = "_"), .con = con)  %>% dbExecute(conn = con)
+
+glue_sql("
+COMMENT ON VIEW disagg.dsoil_refv IS {comment}",
+  comment = "Disaggregated soil map refined to level 725 according to Vink.", .con = con)  %>% dbExecute(conn = con)
+
+
+glue_sql("
+CREATE OR REPLACE VIEW disagg.dsoil_refc AS
+SELECT *
+FROM {`sch`}.{`tb`}",
+  tb = paste("ref", 1800, sep = "_"), .con = con)  %>% dbExecute(conn = con)
+
+glue_sql("
+COMMENT ON VIEW disagg.dsoil_refc IS {comment}",
+  comment = "Disaggregated soil map refined to level 1800 according to Cornell.", .con = con)  %>% dbExecute(conn = con)
+```
+
+
+
+# Exportación para entrega
+
+Dado que la aplicación ha sido secuencial, se entregarán los resultados a diferentes niveles de forma que exista la posibilidad de contraste entre ellos y facilitar el análisis de la evolución del proceso.
+El formato de entrega es un GeoPackage, que permite en un único archivo incluir diferentes capas. 
+La denominación de estas capas responde al patrón *ref* (de refinamiento) y un valor que señala el tamaño de filtrado a dicho nivel. 
+Por ejemplo, en *ref_100* todas las superficies desligadas iguales o inferiores a 100 m^{2} son filtradas.
+
+```{r, eval=FALSE}
+local({
+  ref_sel <- c(0, 100, 325, 725, 1200, 1800)
+  ref_lvl = paste("ref", ref_sel, "v", sep = "_")
+  
+  for (i in ref_lvl) {
+    glue_sql("
+    CREATE OR REPLACE VIEW {`sch`}.{`i`} AS
+    SELECT sid, geom, dsmu_id, array_to_string(stu, ', ') AS stu, smu1_id, grp, concat(smu1_id, grp) as smugrp
+    FROM {`sch`}.{`ref_tb`} 
+      JOIN disagg.grp_dsmu USING (dsmu_id) 
+      JOIN disagg.stu_dsmu USING (dsmu_id) ;", ref_tb = str_remove(i, "_v"), .con = con)  %>% dbExecute(conn = con)
+  }
+  
+  pgcon <- glue(pg_str("dicsm"), "schemas={sch}", "tables={tb}", 
+                tb = paste(ref_lvl, collapse = ","), 
+                .sep = " ")
+
+  out <- path("tmp", paste0("disagg_ref-", "1p_a"), ext = "gpkg")
+  
+  glue("ogr2ogr -f GPKG {out} PG:{pg}", 
+       pg = double_quote(pgcon)) %>% 
+    system()
+  
+  zip::zipr(path(path_ext_remove(out), ext = "zip"), out)
+  file_delete(out)
+  
+  for (i in ref_lvl) {
+    glue_sql("
+    DROP VIEW {`sch`}.{`i`}", .con = con)  %>% dbExecute(conn = con)
+  }
+})
+```
+
+
+```{r}
+del_ref <- foreach( i = ref_level, .final = function(l) setNames(l, as.character(ref_level)) ) %do% {
+  glue_sql("
+  ALTER TABLE disagg_ref.{`tb`}
+  ADD FOREIGN KEY (dsmu_id) REFERENCES disagg.dsmu(dsmu_id) ON UPDATE CASCADE ;", 
+    tb = paste("ref", i, sep = "_"), .con = con)  %>% RPostgres::dbExecute(conn = con)
+}
+```
+
+
+
+# Bibliografía
+
+::: {#refs}
+:::
+
+

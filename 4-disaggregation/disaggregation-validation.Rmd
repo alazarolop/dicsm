@@ -1,0 +1,664 @@
+---
+title: 'Validating the disaggregated soil map: evaluation of division and soil~landscape correlation'
+author: "Alberto Lázaro-López"
+date: "10th November 2020"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_depth: 3
+    number_sections: true
+bibliography: ../ref/dicsm.bib
+abstract: Validating the disaggregated soil map by the evaluation of the division and the soil~landscape 
+  correlation steps. It carries out 3 partial analysis i) by SMU and registered STU; ii) by delineations, 
+  and iii) by accuracy metrics for categories.
+---
+
+```{r core, include=FALSE }
+for (.i in paste0("src/", c("dbms", "core", "mapping"), ".R")) source(.i)
+
+knitr::opts_chunk$set(eval = TRUE)
+
+proj <- dir_ls(regexp = "disagg") %>% 
+  .proj_subdir()
+
+art <- path_home("Documents", "Research", "articles", "2020-disagg")
+```
+
+
+# Introduction
+
+La correlación entre los grupos de la división y las STU que componían las SMU originales ha dado lugar a un mapa disgregado con nuevas SMU. 
+Dicho mapa ha sido refinado posteriormente hasta un IMR mínimo y un MLA de 1825 m^{2}, preparándolo para su publicación.
+
+La fase final de la disgregación supone la validación del proceso y, en última estancia, del mapa disgregado y refinado. 
+Esta evaluación considera el mapa último, disgregado y refinado (**refX**), junto con el mapa disgregado aunque no refinado (**base**), de forma que se analice también el efecto de dicha acción, y el mapa original, considerando así el proceso completo (**orig**). 
+Del mapa refinado se incluyen dos versiones: la del refinado seleccionado, bajo las consideraciones de Cornell, (**refc**) y el sugerido bajo Vink (**refv**) con fines de contraste del proceso de refinado.
+
+La evaluación engloba tres análisis parciales:
+  
+  * El contraste entre los resultados parciales de las etapas de división, correlación y refinamiento durante la disgregación frente a las características del mapa original.
+
+  * La cuantificación de la precisión a través de métricas específicas de categorías. 
+  Estas métricas se derivan desde una matriz de confusión en la que se contrastan las delineaciones frente a observaciones puntuales del suelo.
+  Específicamente, se aprovechan las observaciones realizadas durante el proceso de cartografía y que se encuentran distribuidos por todo la región del proyecto.
+  
+El resultado de estas evaluaciones sería la validación definitiva del mapa disgregado final.
+
+
+# Análisis parciales
+
+## SMU y su contenido en STU
+
+Para la comparativa del mapa disgregado final frente al mapa original en términos de las categorías se dispone de la información del primero, pero es necesario recopilar las características del segundo.
+
+Además, de los **207** grupos, la mayor parte (63%) están asociados a una SMU monotáxicas.
+Así, en el mapa refinado se han descrito un total de **143** nuevas SMUs.
+De ellas, el **52%** se trata de SMUs monotáxicas y el **36%** politáxicas con 2 STUs, e.g. una STU principal con una inclusión.
+El resto son SMUs politáxicas con 3 o más componentes.
+ 
+```{r}
+nstu <- glue_sql("
+SELECT dsmu_id, count(*) AS n
+FROM disagg.dsmu_stu
+GROUP BY dsmu_id
+ORDER BY n ;",.con = con) %>% dbGetQuery(conn = con)
+
+nstu  %>% 
+  mutate(rk = percent_rank(n)) %>% 
+  distinct(n, rk) %>% 
+  mutate(rkl = lead(rk, 1, default = 1), 
+         diff = rkl-rk, 
+         rk = rkl, 
+         rkl = NULL) %>% 
+  mutate(across(where(is.numeric), round, 3))
+
+nstu$n %>%
+  mean()
+```
+ 
+ 
+
+
+Por su parte, el mapa original está formado por **46** SMUs.
+
+```{sql connection=con_odbc, eval=FALSE}
+SELECT DISTINCT smu1_id
+FROM csm.smu1
+WHERE smu1_id !~* '^jm'
+```
+
+En las SMUs del mapa convencional se recogen de media **5.6** STUs, reuniendo la mayor parte de ellas entre **4** y **6** STU.
+
+```{r}
+nstu <- glue_sql("
+SELECT smu1_id, count(*) AS n
+FROM csm.smu1_stu
+WHERE smu1_id !~* '^jm' 
+GROUP BY smu1_id
+ORDER BY n ;",.con = con) %>% dbGetQuery(conn = con)
+
+nstu  %>% 
+  mutate(rk = percent_rank(n)) %>% 
+  distinct(n, rk) %>% 
+  mutate(rkl = lead(rk, 1, default = 1), 
+         diff = rkl-rk, 
+         rk = rkl, 
+         rkl = NULL) %>% 
+  mutate(across(where(is.numeric), round, 3))
+```
+
+```{r}
+nstu$n %>%
+  mean()
+```
+
+
+En la leyenda de ambos mapas, el convencional y, a su vez, el disgregado, se recogen un total de **142** STU definidas al nivel de series, esto es, familias más litologías, con observaciones de suelos asociadas.
+
+```{r}
+stulvl <- glue_sql("
+SELECT DISTINCT stu_id
+FROM disagg.dsmu_stu ;",.con = con) %>% dbGetQuery(conn = con) %>% 
+  flatten_chr()
+```
+
+
+
+
+
+## Delineaciones
+
+También se caracterizan los cuatro mapas según las propiedades relacionadas con las delineaciones de cada uno.
+
+```{r}
+map_proc <- c("refc", "refv", "base")
+```
+
+```{r}
+del <- foreach( i = map_proc, .final = function(l) setNames(l, as.character(map_proc)) ) %do% {
+  glue_sql("
+  SELECT dsmu_id, (ST_Area(geom)) as area
+  FROM disagg.{`tb`}",
+  tb = paste("dsoil", i, sep = "_"), .con = con)  %>% dbGetQuery(conn = con)
+}
+
+del <- del %>% 
+  bind_rows(.id = "proc") %>% 
+  mutate(area = units::set_units(area, "m^2"))
+```
+
+```{r}
+(del <- del %>% 
+    group_by(proc) %>% 
+    summarise(n = n(),
+              mla = min(area),
+              asa = ss_asa(area),
+              imr = ss_imr(mla, asa),
+              sn_cornell = ss_sn_cornell(units::set_units(asa/4, "m^2")),
+              sn_vink = ss_sn_vink(units::set_units(asa/4, "m^2"))) %>% 
+    mutate(across(! matches("imr") & where(is.double), round), 
+           imr = round(imr, 2)) )
+```
+
+```{r}
+# The original map delineations are tweat to workaround issues with small elements
+local({
+  del_orig <- glue_sql("
+  SELECT smu_id, (ST_Area(geom)) as area
+  FROM csm.soil_base ;", .con = con)  %>% dbGetQuery(conn = con)
+  
+  del_orig <- del_orig %>% 
+    mutate(area = units::set_units(area, "m^2"))
+
+  # trim <- 0.025
+  del_orig_trim <- del_orig %>%
+    filter(area > units::set_units(2000, "m^2"))
+
+  del_orig_trim <- del_orig_trim %>% 
+    summarise(n = n(),
+              mla = min(area),
+              asa = ss_asa(area),
+              imr = ss_imr(mla, asa),
+              sn_cornell = ss_sn_cornell(units::set_units(asa/4, "m^2")),
+              sn_vink = ss_sn_vink(units::set_units(asa/4, "m^2"))) %>% 
+    mutate(across(! matches("imr") & where(is.double), round), 
+            imr = round(imr, 2)) %>% 
+    mutate(proc = "orig") %>% 
+    select(proc, everything())
+  
+  del <<- del_orig_trim %>% 
+    bind_rows(del) %>% 
+    mutate(ord = row_number()) %>% 
+    select(ord, everything())
+})
+```
+
+```{r}
+del
+```
+
+> El mapa disgregado y refinado hasta el nivel marcado bajo las consideraciones de Cornell tiene mejor IMR y deja en mejor posición a la escala del mapa original.
+
+```{r, eval=FALSE}
+del %>% 
+  mutate(across(c(mla, asa), units::set_units, "ha")) %>% 
+  write_csv(file = path(proj$res, "maps_delineations", ext = "csv"), 
+            na = "")
+```
+
+
+# Precisión categórica 
+
+La evaluación de la precisión se lleva a cabo mediante métricas específicas para categorías.
+Estas se derivan desde una matriz de confusión de las observaciones, esto es, una tabla donde se comparan por categorías las categorías predichas frente a las referencias.
+
+## Matrices de confusión
+
+Por cada mapa, disgregado y refinado y únicamente disgregado, se genera una relación con la predicción que establecen para cada observación asociadas a las STU recogidas en la leyenda del mapa y su valor de STU asignado.
+La relación se consigue mediante la intersección de las observaciones con las delineaciones de los mapas.
+Para el contraste, se considera que hay correspondencia cuando la STU de la observación coincide con alguna de las STU recogidas en la SMU.
+
+En concreto, son **459** observaciones provenientes del proceso de cartografía original y que son los que se utilizan para llevar a cabo el contraste.
+
+```{sql connection=con_odbc}
+BEGIN ; 
+CREATE OR REPLACE VIEW disagg.pfdsmu AS
+WITH s AS (
+	SELECT DISTINCT stu_id
+	FROM disagg.dsmu_stu
+)
+SELECT *
+FROM csm.pf
+WHERE stu_id IN (SELECT stu_id FROM s) ;
+
+COMMENT ON VIEW disagg.pfdsmu IS 'Profiles linked to STU registered in the map legend.' ;
+COMMIT ;
+```
+
+```{r}
+pfdsmu <- glue_sql("
+SELECT pf_id, stu_id
+FROM disagg.pfdsmu ;", .con = con) %>% dbGetQuery(conn = con)
+```
+
+```{r}
+pfdsmu %>% 
+  count()
+```
+
+
+```{r}
+(stupf <- pfdsmu %>% 
+  mutate(stu = str_sub(stu_id, 1, 4)) %>% 
+  count(stu) %>%
+  arrange(desc(n)) %>% 
+  mutate(p = round(n/sum(n)*100, 1)) )
+```
+
+```{r}
+stusmu <- glue_sql("
+WITH stupc AS (
+	SELECT smu1_id, stu_id, stupc
+	FROM smu1_stu 
+	WHERE stupc IS NOT NULL
+	UNION ALL
+	SELECT smu1_id, unnest(stuinc) as stu_id, (coalesce(stuincpc, 5) / array_length(stuinc, 1)) as stupc
+	FROM smu1_ct
+	WHERE stuinc IS NOT NULL
+
+)
+SELECT smu1_id, stu_id, (ST_Area(geom) * stupc / 100) AS area
+FROM soil 
+	JOIN smu USING (smu_id)
+	JOIN stupc USING (smu1_id)", .con = con) %>% dbGetQuery(conn = con)
+```
+
+```{r}
+stusmu <- stusmu %>% 
+  mutate(stu = str_sub(stu_id, 1, 4),
+         area = units::set_units(area, "m^2"), 
+         area = units::set_units(area, "ha"),
+         area = round(area, 2)) %>% 
+  group_by(stu) %>%
+  summarise(area = sum(area)) %>% 
+  arrange(desc(area)) %>% 
+  mutate(p = round(area/sum(area)*100, 1),
+         p = units::drop_units(p)) 
+
+stusmu
+```
+
+
+```{r}
+stu_csm <- inner_join(stupf, stusmu, by = "stu", suffix = c("pf", "smu")) %>% 
+  mutate(diff = ppf-psmu)
+
+stu_csm
+```
+
+```{r}
+mean(stu_csm$diff)
+
+sum(stu_csm$psmu)
+```
+
+
+```{r}
+write_csv(stu_csm, path = path(proj$res, "data", "stu_csm", ext = "csv") )
+```
+
+
+
+
+```{sql connection=con_odbc}
+with x as (
+	select substr(stu_id, 1, 4) as stu
+	from dsmu_stu
+	order by stu_id
+)
+
+select stu, count(*)
+from x
+group by stu
+order by count DESC
+
+```
+
+```{sql connection=con_odbc}
+BEGIN ; 
+DROP MATERIALIZED VIEW disagg.stu_dsmu ;
+--
+CREATE OR REPLACE VIEW disagg.stu_dsmu AS
+SELECT dsmu_id, array_agg(stu_id) as stu_agg
+FROM dsmu_stu
+GROUP BY dsmu_id
+ORDER BY dsmu_id ;
+--
+COMMENT ON VIEW disagg.stu_dsmu IS 'Aggregation of STU by new DSMU' ;
+COMMIT ; 
+```
+
+
+
+Hay ciertos perfiles que no interceptan ninguna delineación de los mapas disgregados.
+Un análisis visual permite comprobar que dichas observaciones se incluyen en áreas definidas como misceláneas y, por lo tanto, quedan excluidos.
+En última instancia, se utilizan un mínimo **450** observaciones durante la validación.
+
+```{r}
+inter <- foreach( i = map_proc, .final = function(l) setNames(l, as.character(map_proc)) ) %do% {
+  glue_sql("
+  SELECT pf.pf_id, pf.stu_id AS pfstu,
+    CASE 
+      -- If STU from the profile is registered within the SMU, then it's a match
+      WHEN ARRAY[pf.stu_id] <@ u.stu_agg THEN pf.stu_id
+      -- Else, the predominant STU is considered for the evaluation
+      ELSE u.stu_agg[1]
+    END AS smustu
+  FROM disagg.{`tb`} as s 
+    JOIN disagg.stu_dsmu as u USING (dsmu_id), 
+    disagg.pfdsmu AS pf
+  WHERE st_intersects(s.geom, pf.geom) ;", 
+    tb = paste("dsoil", i, sep = "_"), .con = con) %>% dbGetQuery(conn = con)
+}
+
+inter[["orig"]] <- glue_sql("
+WITH stu_smu1 AS (
+	SELECT smu1_id, array_agg(stu_id) AS stu
+	FROM smu1_stu
+	WHERE smu1_id !~* 'jm'
+	GROUP BY smu1_id
+)
+SELECT pf.pf_id, pf.stu_id AS pfstu,
+      CASE 
+        -- If STU from the profile is registered within the SMU, then it's a match
+        WHEN ARRAY[pf.stu_id] <@ u.stu THEN pf.stu_id
+        -- Else, the predominant STU is considered for the evaluation
+        ELSE u.stu[1]
+      END AS smustu
+FROM csm.soil_base as s 
+	JOIN csm.smu USING (smu_id)
+	JOIN stu_smu1 as u USING (smu1_id), 
+  disagg.pfdsmu AS pf
+WHERE st_intersects(s.geom, pf.geom) ;", .con = con) %>% dbGetQuery(conn = con)
+
+names(inter) <- paste("pt", names(inter), sep = "_")
+```
+
+```{r}
+nrow(inter[["pt_refv"]])
+```
+
+Por otro lado, existe un error implícito en las intersecciones asociado a la precisión de la localización de los perfiles.
+Por ese motivo, también se considera la intersección en un vecindario próximo (*nearest neighborhood*) para el contraste.
+En estos casos, el número de observaciones utilizadas aumenta hasta las **455**.
+
+```{r}
+buff <- foreach( i = map_proc, .final = function(l) setNames(l, as.character(map_proc)) ) %do% {
+  glue_sql("
+  WITH buff AS (
+    SELECT pf.pf_id, pf.stu_id AS pfstu, u.stu_id AS smustu
+    FROM disagg.{`tb`} AS s 
+      JOIN disagg.dsmu_stu AS u USING (dsmu_id), 
+      disagg.pfdsmu AS pf
+    WHERE st_intersects(s.geom, ST_Buffer(pf.geom, 7.5))
+    ORDER BY pf_id, stupc DESC
+  ), buff_agg AS (
+    SELECT pf_id, max(pfstu) AS pfstu, array_agg(smustu) AS smustu
+    FROM buff
+    GROUP BY pf_id
+  )
+  SELECT pf_id, pfstu, 
+    CASE 
+        -- If STU from the profile is registered within the SMU, then it's a match
+        WHEN ARRAY[pfstu]::varchar[] <@ smustu THEN pfstu
+        -- Else, the predominant STU is considered for the evaluation
+        ELSE smustu[1]
+      END AS smustu
+  FROM buff_agg ;", 
+    tb = paste("dsoil", i, sep = "_"), .con = con) %>% dbGetQuery(conn = con)
+}
+
+buff[["orig"]] <- glue_sql("
+WITH buff AS (
+-- Collect all predicted STU for every profile
+  SELECT pf.pf_id, pf.stu_id AS pfstu, u.stu_id AS smustu
+  FROM csm.soil_base as s 
+  JOIN csm.smu USING (smu_id)
+  JOIN smu1_stu as u USING (smu1_id), 
+    disagg.pfdsmu AS pf
+  WHERE st_intersects(s.geom, ST_Buffer(pf.geom, 7.5))
+  ORDER BY pf_id, stupc DESC
+-- Aggregate them
+), buff_agg AS (
+  SELECT pf_id, max(pfstu) AS pfstu, array_agg(smustu) AS smustu
+  FROM buff
+  GROUP BY pf_id
+)
+SELECT pf_id, pfstu, 
+  CASE 
+      -- If STU from the profile is registered within the SMU, then it's a match
+      WHEN ARRAY[pfstu]::varchar[] <@ smustu THEN pfstu
+      -- Else, the predominant STU is considered for the evaluation
+      ELSE smustu[1]
+    END AS smustu
+FROM buff_agg ;", .con = con) %>% dbGetQuery(conn = con)
+
+names(buff) <- paste("bf", names(buff), sep = "_")
+```
+
+La comparación entre las STU predichas y las asignadas a las observaciones es estricta, es decir, deben ser idénticas entre sí.
+Sin embargo, se ha observado que en ciertos casos existen variaciones relaciones con la identificación de las clases de familias o de litologías similares, y que suponen diferencias en los niveles de mayor detalle en la definición de las categorías.
+Se quiere evaluar estas variaciones, en la medida de que las predicciones fueran aproximadas categóricamente a las asignaciones. 
+Para ello, se calcula la distancia entre ambas definiciones y se permite que exista una única variación en alguno de los niveles de estas.
+
+```{r}
+ex <- strict <- append(inter, buff)
+for (i in names(ex)) {
+  p <- ex[[i]]
+  d <- vector("integer")
+  for (j in 1:nrow(p)) {
+    d[j] <- adist(p$pfstu[j], p$smustu[j])
+  }
+  ex[[i]] <- p %>% 
+    add_column(d) %>% 
+    mutate(smustu = ifelse(d <= 1, pfstu, smustu)) %>% 
+    select(-d)
+}
+```
+
+Desde estas relaciones se derivan las matrices de confusión desde las que calcular las métricas correspondientes.
+
+```{r}
+cm <- append(strict, ex)
+names(cm) <- paste(rep(c("s", "x"), each = length(cm)/2), names(cm), sep = "_")
+
+cm  <- cm %>% 
+  map(select, -pf_id) %>% 
+  # Set factor levels to get a square table
+  map(mutate, across(everything(), factor, levels = stulvl, ordered = FALSE)) %>% 
+  map(table) 
+```
+
+
+## Métricas de precisión categórica
+
+Específicamente, se calculan las métricas de Precisión global (*Overall Accuracy*, OA) y el Índice de Kappa.
+La implementación de las métricas es tomado de Rossiter [-@Rossiter2004StatisticalMethodsAccuracy] (y el código fuente se recoge en el anexo *Mapping*.
+
+Se calculan las métricas para todos los supuestos, a saber, i) con las versiones del mapa disgregado y refinado y sólo refinado; ii) la intersección de la observación puntual o de un buffer alrededor; y iii) estricta o permitiendo una variación menor en la definición de la STU. 
+
+```{r}
+accu <- vector("list")
+for (i in names(cm)) {
+  accu[[i]] <- accucat(cm[[i]])
+}
+```
+
+Se extraen las dos métricas señaladas y se disponen en matrices para su evaluación
+
+```{r}
+accu_metrics <- vector("list")
+
+accu_metrics[["naive"]] <- accu %>%
+  map(`[[`, "sum.naive")
+#gap
+accu_metrics[["kappa"]] <- accu %>%
+  map(`[[`, "sum.kappa")
+
+accu_metrics <- accu_metrics %>% 
+  map(unlist) %>% 
+  map(matrix, nrow = (length(map_proc)+1), 
+              dimnames = list(c(map_proc, "orig"), unique(str_sub(names(accu), 1, 4))) ) %>% 
+  map(round, 3)
+```
+
+Se han generado 8 combinaciones diferentes desde los supuestos planteados y para todos ellas se han calculado dos métricas diferentes, *Overall Accuracy* y *Kappa's Index*. 
+
+```{r}
+accu_metrics
+```
+
+```{r}
+saveRDS(accu_metrics, file = path(proj$res, "accu_metrics", ext = "rds"))
+```
+
+```{r}
+for (i in seq_along(accu_metrics)) {
+  accu_metrics[[i]] %>%
+    as_tibble() %>% 
+    write_csv(file = path(proj$res, glue("accu_metrics-", names(accu_metrics)[[i]]), ext = "csv"), 
+              na = "")
+}
+```
+
+
+Los valores principales, respecto al mapa disgregado refinado (recogidos en la tabla anterior), señalan un resultado favorable con limitaciones.
+El Kappa's Index de **0.22** se encuentra en el rango superior a 0 indicaría un *slighly fair agreement*.
+Por su parte, el valor de OA es del **24%** y queda en el entorno de los obtenidos en metodologías comparables en condiciones de partida semejantes en términos de escala y detalle categórico sobre una clasificación taxonómica (soil series) (de la review), aunque es sensiblemente inferior a los mejores resultados señalados.
+A diferencia de la metodología propuesta, estas se basaron en un sistema de clasificación supervisados, específicamente en DT, y en aportes de información adicionales. 
+
+```{r}
+(disagg_review <- readRDS("../../articles/2020-disaggregation_review/data/ref_full.rds"))
+
+disagg_review %>% 
+  filter(SN_SRI < 50) %>% 
+  select(author1, location, stages, training_sets, SRI_SN, SRI_soil_class, SRI_soil_taxa, OA, OA_nN, class_method) %>% 
+  arrange(stages, OA)
+```
+
+Cuando se tomar en consideración el vecindario próximo de las observaciones en un marco equivalente a 3x3 píxeles (7.5 metros de radio), la OA aumenta hasta el **33%**.
+Este efecto cabría asociarlo a la incorporación de los errores asociados a la precisión de la localización de las observaciones.
+
+>Este incremento señalaría errores de imprecisión, absorbidos por el buffer.
+
+Además, durante la validación se ha observado que en ciertos casos entre la clase predicha frente a la observada existen variaciones mínimas en los niveles de mayor detalle de definición de la serie, esto es, relacionadas con la identificación de las clases de familias o de litologías similares.
+Cuando se toman en consideración de forma que se permita una única variación de distancia mínima en alguno de estos aspectos, la OA aumenta significativamente hasta el **48%**.
+
+
+En comparación con el mapa original...
+
+Estos mismos parámetros respecto al mapa disgregado pero no refinado muestran un ligero aumento, posiblemente relacionado con la integración de áreas de pequeño tamaño pero que contaban con sentido edafológico.
+Sería indicativo que el proceso de refinamiento tiene un coste en términos de precisión, pero no significativo, y compensado por el beneficio en la visualización de la cartografía.
+
+
+
+# Evaluación final
+
+> Texto en el artículo.
+
+
+
+# Exportación para entrega
+
+De forma complementaria al análisis cuantitativo, se distribuye los mapas para su visualización de forma que exista la posibilidad de contrastar entre ellos y se facilite el examen de la evolución del proceso.
+El formato de entrega es un GeoPackage, que permite en un único archivo incluir diferentes capas. 
+La denominación de estas capas responde a las referencias utilizadas durante la evaluación. 
+
+
+```{r, eval=FALSE}
+pgsel <- paste(rep("dsoil", length(map_proc)), map_proc, sep = "_")
+
+local({
+  out <- path("tmp", "disagg_val", ext = "gpkg")
+  
+  # Disagg ####
+  #' Schemas must be query separately
+
+  # Temporal views
+  for (i in map_proc) {
+    glue_sql("
+    CREATE OR REPLACE VIEW disagg.{`i`} AS
+    SELECT sid, geom, dsmu_id, array_to_string(stu, ', ') AS stu, smu1_id, grp, concat(smu1_id, grp) as smugrp
+    FROM disagg.{`ref_tb`} 
+      JOIN disagg.grp_dsmu USING (dsmu_id) 
+      JOIN disagg.stu_dsmu USING (dsmu_id) ;", 
+      ref_tb = paste("dsoil", i, sep = "_"), .con = con)  %>% dbExecute(conn = con)
+  }
+  
+  pgcon <- glue(pg_str("dicsm"), "schemas={sch}", "tables={tb}", 
+                tb = paste(map_proc, collapse = ","), 
+                sch = "disagg",
+                .sep = " ")
+
+  # Export
+  glue("ogr2ogr -f GPKG {out} PG:{pg}", 
+       pg = double_quote(pgcon)) %>% 
+    system()
+
+  # Drop temporal views
+  for (i in map_proc) {
+    glue_sql("
+    DROP VIEW disagg.{`i`}", .con = con)  %>% dbExecute(conn = con)
+  }
+
+  # CSM ####
+  pgcon <- glue(pg_str("dicsm"), "schemas={sch}", "tables={tb}", 
+                tb = "soil", 
+                sch = "csm",
+                .sep = " ")
+  
+  glue("ogr2ogr -append -f GPKG {out} PG:{pg}", 
+       pg = double_quote(pgcon)) %>% 
+    system()
+  
+  zip::zipr(path(path_ext_remove(out), ext = "zip"), out)
+  file_delete(out)
+})
+```
+
+
+
+# Cartografía para publicación
+
+```{sql connection=con_odbc}
+BEGIN ; 
+CREATE MATERIALIZED VIEW csm.soil_smu1 AS 
+SELECT  row_number() OVER () AS sid,
+        smu1_id,
+        st_buffer(
+          st_union(
+            st_buffer(
+              geom, 1::double precision, 'join=mitre mitre_limit=1.0'::text
+            )
+          ), 
+        '-1'::integer::double precision, 'join=mitre mitre_limit=1.0'::text) AS geom
+FROM soil_base
+  JOIN smu USING (smu_id)
+GROUP BY smu1_id ;
+--
+CREATE INDEX ON csm.soil_smu1 (smu1_id) ;
+CREATE INDEX ON csm.soil_smu1 USING gist (geom) ;
+COMMIT ;
+```
+
+```{r}
+glue_sql("
+CREATE OR REPLACE VIEW disagg.dsoil_final AS
+SELECT *
+FROM {`sch`}.{`tb`}",
+  sch = "disagg_ref",
+  tb = paste("ref", 1800, sep = "_"), .con = con)  %>% dbExecute(conn = con)
+```
+
+

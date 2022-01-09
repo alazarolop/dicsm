@@ -1,0 +1,811 @@
+---
+title: "Refinement of miscellaneous areas for a disaggregated map"
+author: "Alberto Lázaro-López"
+date: "10/17/2020"
+output:
+  html_document:
+    toc: yes
+    toc_depth: '3'
+    df_print: paged
+    number_sections: yes
+abstract: 
+bibliography: ../ref/dicsm.bib
+---
+
+```{r core, include=FALSE }
+for (.i in paste0("src/", c("spatial", "dbms", "core", "raster"), ".R")) {
+  source(.i)
+}
+
+proj <- dir_ls(regexp = "disagg") %>% 
+  .proj_subdir()
+```
+
+
+# Introducción
+
+Posteriormente al refinado de las SMU, se acomete el mismo proceso sobre las áreas misceláneas de forma que todas las delineaciones recogidas en el mapa respeten el mismo **MLA**.
+
+Específicamente se abordan los siguientes objetivos parciales:
+
+  1. Ajuste de las áreas misceláneas a la estructura de malla.
+  
+  1. Detección espacios no cubiertos en la región de trabajo.
+  
+  1. Refinado de las áreas misceláneas a la MLA fijada.
+  
+  1. Ajuste del mapa completo a la MLA fijada.
+
+
+
+
+# Datos
+
+Se continúa trabajando sobre el conjunto de delineaciones derivadas de la colección 1 con CLARA en base al nivel de refinado 800 (MLA de 825 m ^{2}).
+
+```{r}
+div <- list("met" = "clara",
+            "sel" = 1
+            )
+```
+
+
+
+# Ajuste de las áreas misceláneas a una retícula
+
+## Conversión
+
+El proceso se basa en la conversión de las geometrías a raster y su reconversión de nuevo a polígonos, de forma que estas se adapten automáticamente a la retícula utilizada durante toda la metodología.
+Para conservar las categorías asociadas a las áreas misceláneas durante la fase de raster se emplean valores numéricos fijadas en un tabla.
+
+```{sql connection=con_odbc}
+BEGIN ; 
+
+CREATE TABLE misc._misc_code (
+  smu_id varchar(10) PRIMARY KEY,
+  code integer UNIQUE NOT NULL
+) ;
+
+INSERT INTO disagg._misc_code (smu_id, code)
+VALUES  ('JMa', 91),
+        ('JMb', 92),
+        ('JMi', 93),
+        ('JMk', 94),
+        ('JMu', 95),
+        ('JMv', 96) ;
+
+COMMIT ; 
+```
+
+
+```{r}
+pat_tb <- paste(div$met, div$sel, "div", sep = "_")
+sch_rast <-  paste("division", div$met, div$sel, sep = "_")
+
+dbWithTransaction(con, {
+  glue_sql("
+  -- Copy with <like> to drag serial identifier and indexes.
+  -- Single geometries as the raw division, compared to multi in Refinement
+  CREATE TABLE disagg.misc_pix (
+    LIKE division.{`pat_tb`} INCLUDING ALL
+  ) ;",  .con = con) %>% dbExecute(conn = con)
+  glue_sql("
+  ALTER TABLE disagg.misc_pix ALTER COLUMN geom SET STORAGE EXTERNAL ;", .con = con) %>% dbExecute(conn = con)
+
+  glue_sql("
+  INSERT INTO disagg.misc_pix (geom, smu1_id, grp)
+  -- Raster pattern
+  WITH pix AS (
+  	SELECT rast
+  	FROM {`sch_rast`}._div_grp
+  	LIMIT 1
+  -- All miscellaneous areas from refined version of the original soil map
+  ), misc as (
+  	SELECT *
+  	FROM csm.soilref JOIN disagg._misc_code USING (smu_id)
+  	WHERE smu_id ~* '^jm'
+  -- Convertion to Raster and back to Polygons
+  ), div AS (
+    SELECT (ST_DumpAsPolygons(ST_AsRaster(m.geom, r.rast, 
+  										'8BUI', 
+  										code, 
+  										ST_BandNoDataValue(r.rast)))
+  		 ).* AS div
+    FROM misc AS m, pix AS r 
+  )
+  SELECT geom, misc.smu_id AS smu1_id, 0 as grp
+  FROM div JOIN disagg._misc_code AS misc ON val=code ;", .con = con) %>% dbExecute(conn = con)
+})
+```
+
+
+
+### Covered by
+
+El ajuste de las geometrías a la estructura de malla depende del criterio interno del programa y que por ese motivo se produzcan solapes con las SMU para ciertos píxeles o que queden cubiertas por estas. 
+En primer lugar, se convierte el nivel de refinado al mismo sistema de geometrías que las áreas misceláneas, geometrías simples.
+
+```{r}
+dbWithTransaction(con, {
+  glue_sql("
+  -- Copy with <like> to drag serial identifier and indexes.
+  -- Single geometries as the raw division, compared to multi in Refinement
+  CREATE TABLE disagg.grp_ref (
+    LIKE division.{`pat_tb`} INCLUDING ALL
+  ) ;",  .con = con) %>% dbExecute(conn = con)
+  glue_sql("
+  ALTER TABLE disagg.grp_ref ALTER COLUMN geom SET STORAGE EXTERNAL ;", .con = con) %>% dbExecute(conn = con)
+
+  glue_sql("
+  INSERT INTO disagg.grp_ref (geom, smu1_id, grp)
+  SELECT (ST_Dump(geom)).geom as geom , smu1_id, grp
+  FROM disagg.ref_mla ;", .con = con) %>% dbExecute(conn = con)
+})
+```
+
+
+
+
+Existen 739 geometrías completamente cubiertas por alguna geometría de los grupos.
+
+```{sql connection=con_odbc}
+CREATE MATERIALIZED VIEW disagg.pix_covered
+SELECT m.sid
+FROM disagg.grp_ref AS s, disagg.misc_pix AS m
+WHERE ST_Covers(s.geom, m.geom) ;
+```
+
+```{sql connection=con_odbc}
+SELECT * 
+FROM disagg.pix_covered ;
+```
+
+Estas son eliminadas directamente.
+
+```{sql connection=con_odbc}
+DELETE FROM disagg.misc_pix WHERE sid IN (SELECT sid FROM disagg.pix_covered) ;
+```
+ 
+ 
+ 
+### Overlaps
+
+Existen 739 geometrías con algún grado de cobertura por alguna geometría de los grupos.
+ 
+```{sql connection=con_odbc}
+CREATE MATERIALIZED VIEW disagg.pix_over AS
+SELECT DISTINCT m.sid
+FROM disagg.grp_ref AS s, disagg.misc_pix AS m
+WHERE ST_Overlaps(m.geom, s.geom) ;
+```
+
+```{sql connection=con_odbc}
+SELECT * 
+FROM disagg.pix_over ;
+```
+
+Se generan geometrías por diferencia con los grupos y se guardan independientemente.
+
+```{sql connection=con_odbc}
+CREATE TABLE disagg.misc_mod AS
+SELECT sid, (ST_Dump(ST_Difference(misc.geom, one.geom))).geom, smu1_id, grp
+FROM  disagg.pix_over JOIN misc_grid as misc USING (sid), 
+      LATERAL ( SELECT st_union(geom) AS geom
+                FROM disagg.ref AS s
+              	WHERE st_intersects(misc.geom, s.geom) ) one ;
+```
+
+Al mismo tiempo, se eliminan las geometrías de las áreas misceláneas que han sido modificadas y se incorporan sus reemplazos resultado de la modificación.
+
+```{sql connection=con_odbc}
+BEGIN ;
+
+DELETE FROM disagg.misc_pix WHERE sid IN (SELECT sid FROM disagg.pix_over) ;
+
+INSERT INTO misc_pix (geom, smu1_id, grp)
+SELECT geom, smu1_id, grp
+FROM disagg.misc_mod ;
+
+DROP TABLE disagg.misc_mod ;
+
+COMMIT ; 
+```
+
+```{sql connection=con_odbc}
+DROP MATERIALIZED VIEW disagg.pix_covered, disagg.pix_over ;
+```
+
+
+
+### Unificación de semejantes
+
+El proceso de incorporación de áreas misceláneas ha podido dar lugar a geometrías de la categoría de movilidad que se solapan entre sí.
+Este hecho no había sido corregido al no imponer ninguna limitación durante el proceso de disgregación y, por el contrario, permitir mejores rendimientos.
+Con el fin de presentar un mapa donde sólo exista información por cada localización equivalente a un píxel, se corrige esta situación mediante la disolución de estas áreas.
+
+Para evitar generar grandes geometrías, son subdividas en polígonos más pequeños, pero superiores al MLA impuesto.
+El criterio de subdivisión se basa en el número de vértices de cada geometría. 
+Como mínimo deberían darse lugar a polígonos del MLA. 
+
+```{r}
+minpix <- 825/25
+```
+
+Esto es polígonos equivalentes a 33 píxeles (825 m^{2} de MLA / 25 m^{2} por píxel ).
+En el contexto más desfavorable, se deberían mantener 3 vértices por píxel.
+
+```{r}
+minpix * 3
+```
+
+Esto equivale a 99 vértices. 
+Se redondea en última instancia al doble de vértices máximos, 200.
+
+```{sql connection=con_odbc}
+CREATE TABLE disagg.misc_mv AS
+WITH clust as (
+  -- Clustered to 7.5 so diagonal geometries are kept.
+	SELECT unnest(ST_ClusterWithin(geom, 7.5)) AS grp
+	FROM disagg.misc_pix
+	WHERE smu1_id ~* 'jmv'
+), big AS (
+  SELECT (ST_Dump(ST_UnaryUnion(grp))).geom as geom
+  FROM clust
+)
+SELECT ST_Subdivide(geom, 200) as geom
+FROM big ;
+```
+
+Se comprueba que el área de las nuevas áreas es el adecuado.
+
+```{sql connection=con_odbc}
+SELECT DISTINCT ST_Area(geom) AS area
+FROM disagg.misc_mv
+ORDER BY area DESC ; 
+```
+
+
+Se crea una nueva tabla con las áreas nuevas creadas.
+
+```{sql connection=con_odbc}
+BEGIN ; 
+
+CREATE TABLE disagg.misc_grid (
+  LIKE disagg.misc_pix INCLUDING ALL
+);
+
+INSERT INTO disagg.misc_grid (geom, smu1_id, grp)
+SELECT geom, smu1_id, grp
+-- NOT JMv
+FROM disagg.misc_pix WHERE smu1_id !~* 'jmv' ;
+
+INSERT INTO disagg.misc_grid (geom, smu1_id, grp)
+SELECT geom, smu1_id, grp
+FROM disagg.misc_mv ;
+
+COMMIT ; 
+```
+
+```{sql connection=con_odbc}
+DROP TABLE disagg.misc_pix, disagg.misc_mv ; 
+```
+
+
+
+## Huecos
+
+De igual forma que sucedía con el solape para ciertos píxeles, el proceso de reticulación individual de las SMU y de las áreas misceláneas puede ocasionar que ciertos píxeles aislados no sean adjudicados a ninguna categoría.
+Para detectarlos y circunscribirlos, se opta por cruzar la geometría de la región de trabajo reticulada con una unión de todas las SMU y áreas misceláneas.
+
+### Detección
+
+Primero, se genera la versión reticulada de la región de trabajo.
+
+```{r}
+dbWithTransaction(con, {
+  glue_sql("
+  -- Copy with <like> to drag serial identifier and indexes.
+  -- Single geometries as the raw division, compared to multi in Refinement
+  CREATE TABLE disagg.region_pix (
+    LIKE disagg.misc_grid INCLUDING ALL
+  ) ;",  .con = con) %>% dbExecute(conn = con)
+  glue_sql("
+  ALTER TABLE disagg.region_pix ALTER COLUMN geom SET STORAGE EXTERNAL ;", .con = con) %>% dbExecute(conn = con)
+  glue_sql("
+  ALTER TABLE disagg.region_pix DROP COLUMN smu1_id ;", .con = con) %>% dbExecute(conn = con)
+  glue_sql("
+  ALTER TABLE disagg.region_pix RENAME COLUMN grp TO cid ;", .con = con) %>% dbExecute(conn = con)
+
+
+  glue_sql("
+  INSERT INTO disagg.region_pix (geom)
+  -- Raster pattern
+  WITH pix AS (
+  	SELECT rast
+  	FROM {`sch_rast`}._div_grp
+  	LIMIT 1
+  -- Convertion to Raster and back to Polygons
+  ), div AS (
+    SELECT (ST_DumpAsPolygons(ST_AsRaster(r.geom, pix.rast, 
+  										'8BUI', 
+  										1, 
+  										ST_BandNoDataValue(pix.rast)))
+  		 ).* AS div
+    FROM csm.region AS r, pix AS pix
+  )
+  SELECT val AS sid, geom
+  FROM div ;", .con = con) %>% dbExecute(conn = con)
+})
+```
+
+Después la unión de todas las delineaciones generadas entre SMU y áreas misceláneas.
+
+```{r}
+del_tbs <- c("del_km", "del_one", "unasg_pix")
+
+for (i in del_tbs) {
+  dbWithTransaction(con, {
+    glue_sql("
+    -- Copy with <like> to drag serial identifier and indexes.
+    -- Single geometries as the raw division, compared to multi in Refinement
+    CREATE TABLE disagg.{`i`} (
+      LIKE disagg.region_pix INCLUDING ALL
+    ) ;",  .con = con) %>% dbExecute(conn = con)
+    glue_sql("
+    ALTER TABLE disagg.{`i`} ALTER COLUMN geom SET STORAGE EXTERNAL ;", .con = con) %>% dbExecute(conn = con)
+  })
+}
+```
+
+```{sql connection=con_odbc}
+INSERT INTO disagg.del_km (geom)
+WITH one AS (
+  SELECT geom
+  FROM disagg.grp_ref
+  UNION ALL
+  SELECT geom
+  FROM disagg.misc_grid
+)
+SELECT ST_ClusterKMeans(geom, 1000) over() as cid, geom
+FROM one ;
+```
+
+```{sql connection=con_odbc}
+INSERT INTO disagg.del_one (geom)
+WITH km AS (
+  SELECT ST_Union(geom) as geom
+  FROM disagg.del_km
+  GROUP BY cid
+)
+SELECT ST_Union(geom) as geom
+FROM km ;
+```
+
+Por diferencia, se obtienen los píxeles aislados no asignados.
+
+```{sql connection=con_odbc}
+INSERT INTO disagg.unasg_pix (geom)
+SELECT (ST_Dump(ST_Difference(pix.geom, d.geom))).geom as geom
+FROM disagg.region_pix as pix, disagg.del_one as d ;
+```
+
+
+### Asignación a áreas misceláneas
+
+Si alguno de estos píxeles es adyacente a una o varias área misceláneas, será adjudicado a aquella de menor tamaño.
+
+```{sql connection=con_odbc}
+CREATE TABLE disagg.unasg_misc AS
+SELECT p.sid AS pix_sid, big.smu1_id, big.grp, big.sid
+FROM disagg.unasg_pix AS p, 
+  LATERAL ( SELECT m.sid, smu1_id, grp st_area(m.geom) AS area
+            FROM disagg.misc_grid AS m
+            WHERE ST_Intersects(p.geom, m.geom)
+            ORDER BY area ASC 
+            LIMIT 1 
+            ) AS big ;
+```
+
+
+Se generan geometrías por diferencia con los grupos y se guardan independientemente.
+Así, sólo se modifican aquellas que son afectadas.
+
+```{sql connection=con_odbc}
+CREATE TABLE misc_grid_mod AS
+WITH misc AS MATERIALIZED (
+  SELECT *
+  FROM disagg.misc_grid
+  WHERE sid IN (SELECT sid FROM disagg.unasg_misc)
+)
+CREATE TABLE disagg.misc_mod AS
+SELECT sid, (ST_Dump(one.geom)).geom, misc.smu1_id, misc.grp
+FROM  misc, 
+  LATERAL ( SELECT ST_Union(geom) AS geom
+            FROM (  SELECT ST_Multi(misc.geom) AS geom
+                    UNION ALL 
+                    SELECT ST_Multi(asg.geom) AS geom
+                    FROM disagg.unasg_misc AS asg
+                    WHERE asg.sid = misc.sid
+                    ) AS unite 
+            ) AS one ;
+```
+
+```{sql connection=con_odbc}
+BEGIN ; 
+
+ALTER TABLE disagg.misc_grid RENAME TO disagg._misc_grid ;
+
+CREATE TABLE disagg.misc_grid (
+  LIKE disagg._misc_grid INCLUDING ALL
+) ;
+
+INSERT INTO disagg.misc_grid (geom, smu1_id, grp)
+SELECT geom, smu1_id, grp
+FROM disagg._misc_grid
+WHERE sid NOT IN (SELECT sid FROM disagg.unasg_misc) ;
+
+INSERT INTO disagg.misc_grid (geom, smu1_id, grp)
+SELECT geom, smu1_id, grp
+FROM disagg.misc_grid_mod ;
+
+COMMIT ;
+```
+
+```{sql connection=con_odbc}
+DROP TABLE disagg._misc_grid ;
+```
+
+
+
+### Asignación a SMU
+
+Por último, las no asignadas a ningún área miscelánea.
+
+```{sql connection=con_odbc}
+CREATE VIEW disagg.unasg_smu AS
+SELECT sid, geom
+FROM disagg.unasg_pix
+WHERE sid NOT IN (SELECT pix_sid FROM disagg.unasg_misc)
+```
+
+```{sql connection=con_odbc}
+SELECT asg.sid
+FROM disagg.unasg_smu AS asg, pf
+WHERE ST_Intersecs(asg.geom, pf.geom)
+```
+
+```{sql connection=con_odbc}
+SELECT DISTINCT ST_Area(geom) AS area
+FROM disagg.unasg_smu 
+ORDER BY area ;
+```
+
+Ninguna de las áreas no asignadas es intersecada por algún perfil, por lo que su disolución no es necesaria para los análisis y puede ser pospuesta.
+Además, como todas las áreas no asignadas son menores de 800 m^{2} y van a ser disueltas, podrán ser incluidas como áreas misceláneas *X* y grupo *0* que en última instancia serán eliminadas durante el proceso de refinamiento final.
+
+```{sql connection=con_odbc}
+INSERT INTO disagg.misc_grid (geom, smu1_id, grp)
+SELECT geom, "X" as smu1_id, 0 as grp
+FROM disagg.unasg_smu ;
+```
+
+```{sql connection=con_odbc}
+DROP TABLE disagg.unasgn_smu /*CASCADE*/ ;
+```
+
+
+
+
+
+
+# Refinamiento de las áreas misceláneas **PENDIENTE**
+
+Una vez se dispone de todas las localizaciones asignada a áreas misceláneas, se lleva a cabo su refinado considerando el MLA fijado de geometrías menores o iguales a 800 m^{2}.
+Este refinamiento se lleva a cabo internamente, de modo que las asignaciones sólo pueden ser entre áreas misceláneas.
+
+```{sql connection=con_odbc}
+-- A independet schema is used
+BEGIN ; 
+
+CREATE SCHEMA misc_ref ;
+COMMENT ON SCHEMA disagg IS 'Refinement of miscellaneous areas' ;
+
+COMMIT ;
+```
+
+Proceso:
+
+1. A todas las delineaciones menores del nivel de refinado se les asigna otra mayor que ellas adyacente (si tienen).
+
+2. Aquellas delineaciones que sí tengan y hayan sido asignadas a alguna otra se eliminan y se sustituyen por las otras.
+Esto quiere decir que siempre se quedaran aquellas delineaciones aisladas que no puedan ser absorbidas por ninguna delineación de área miscelánea y que serán disueltas en el refinado global del final.
+
+
+
+
+
+Todo el proceso será alojado en un esquema independiente y se utilizará un sistema de herencia para asegurar la uniformidad entre los resultados de los refinamientos y para relacionarlos entre sí.
+ 
+```{r}
+# Specific schema for the refinement process
+sch <- paste("division", div$met, div$sel, "ref", sep = "_")
+
+# Create the new schema
+glue_sql("
+CREATE SCHEMA IF NOT EXISTS {`sch`} ;", .con = con) %>% dbExecute(conn = con)
+
+# Comment on new schema
+glue_sql("
+COMMENT ON SCHEMA {`sch`} IS {txt} ;",
+txt = paste("Refinement of divisions by CLARA with Mahalanobis distance",
+            "on covariates collection", div$sel), .con = con) %>% dbExecute(conn = con)
+
+
+# Pattern for refinement tables
+ref_pat <-  "_div_ref"
+pat <-  paste(div$met, div$sel, "div", sep = "_")
+pat_crs <- glue_sql("
+SELECT DISTINCT ST_SRID(geom)
+FROM {`pat`}", .con = con) %>% dbGetQuery(conn = con) %>% flatten_dbl()
+
+local({
+  
+  if (dbExistsTable(con, Id(schema = sch, table = ref_pat)) == FALSE) {
+    glue_sql("
+    CREATE TABLE {`sch`}.{`ref_pat`} (
+    LIKE division.{`pat`} INCLUDING ALL EXCLUDING IDENTITY) ;", .con = con) %>% dbExecute(conn = con)
+    glue_sql("
+    ALTER TABLE {`sch`}.{`ref_pat`}
+    ALTER COLUMN sid ADD GENERATED BY DEFAULT AS IDENTITY ;", .con = con) %>% dbExecute(conn = con)
+    glue_sql("
+    ALTER TABLE {`sch`}.{`ref_pat`}
+    ALTER COLUMN geom TYPE geometry(MULTIPOLYGON, {pat_crs}) ;", .con = con) %>% dbExecute(conn = con)
+  }
+})
+```
+
+Se opta por una aplicación secuencial, de forma que se repite el proceso secuencialmente con un incremento en el tamaño de MLA de un píxel.  
+Esto es así, para evitar definir asignaciones en las que unidades adyacentes superiores en tamaño, pero inferior a un MLA marcado sean descartadas.
+De esta forma, también se pueden analizar (*debug*) los pasos intermedios para localizar posibles artefactos no considerados.
+
+```{r, eval=FALSE}
+# For the first iteration, a multi version should be created for CLARA outcome
+# in order to work with the pipeline.
+#' Just once.
+
+# A new table is created 
+dbWithTransaction(con, {
+  glue_sql("
+  -- Copy with <like> to drag serial identifier and indexes.
+  -- Then, inheritance is apply to allow scan from parent.
+  CREATE TABLE {`sch`}.ref_0 (
+    LIKE {`sch`}.{`ref_pat`} INCLUDING ALL
+  ) ;", .con = con) %>% dbExecute(conn = con)
+  glue_sql("
+  ALTER TABLE {`sch`}.ref_0 INHERIT {`sch`}.{`ref_pat`} ;", .con = con) %>% dbExecute(conn = con)
+  glue_sql("
+  ALTER TABLE {`sch`}.ref_0 ALTER COLUMN geom SET STORAGE EXTERNAL ;", .con = con) %>% dbExecute(conn = con)
+})
+
+# A multi geometry version of the CLARA outcome is created
+dbWithTransaction(con, {
+  glue_sql("
+  INSERT INTO {`sch`}.ref_0 (geom, smu1_id, grp)
+  -- From previous refinement iteration
+  -- get all combinations of SMU 1 and groups
+  WITH one AS (
+    SELECT smu1_id, grp, ST_UnaryUnion(clt) AS geom
+    -- Cluster distance =: 1 for connected, px +1 for one px gap and so on
+    FROM (  SELECT smu1_id, grp, unnest(ST_ClusterWithin(geom, 1)) AS clt
+            FROM division.{`tb`} div
+            GROUP BY smu1_id, grp ) AS unite
+  )
+  -- Calculate area for new geometries
+  SELECT ST_Multi(geom), smu1_id, grp
+  FROM one", tb = paste(div$met, div$sel, "div", sep = "_"),
+             .con = con) %>% dbExecute(conn = con)
+  
+  glue_sql("
+  CREATE INDEX ON {`sch`}.ref_0 (smu1_id) ;", .con = con) %>% dbExecute(conn = con)
+  glue_sql("
+  CREATE INDEX ON {`sch`}.ref_0 (grp) ;", .con = con) %>% dbExecute(conn = con)
+  glue_sql("
+  CREATE INDEX ON {`sch`}.ref_0 (smu1_id, grp) ;", .con = con) %>% dbExecute(conn = con)
+  glue_sql("
+  CREATE INDEX ON {`sch`}.ref_0 USING gist (geom) ;", .con = con) %>% dbExecute(conn = con)
+})
+```
+
+
+```{r, eval=FALSE}
+debug <- vector("list")
+# We want to calculate related areas for every delineation and filter those less or equal to MLA.
+# They will be individually assigned to a side delineation sharing a max lenght boundary.
+# Related delineations are merged and put together with the rest of delineations
+
+#' Run-time: ~30 min each on average
+for (i in seq(from = div$pix^2, to = 900, by = div$pix^2)) {
+  
+  # INITAL DEBUG ----
+  debug[[as.character(i)]][1] <- lubridate::now()
+  
+  
+  # REFERENCE DATA ----
+  # New connection, reassure all previous temporary tables are dropped.
+  #dbDisconnect(con)
+  #con <- dbcon_postgis("dicsm")
+
+  # Reference of table to hold refined delineations at corresponding MLA size 
+  ref_tb <- paste("ref", as.character(i), sep = "_") 
+  #' If it exists, the level should be skipped
+  if (dbExistsTable(con, Id(schema = sch, table = ref_tb)) == TRUE) {
+    next
+  }
+  
+  # Reference for refinement is the the previous iteration (or genuine disaggregation)
+  ref_pre <- paste("ref", as.character(i - (div$pix^2)), sep = "_")
+  
+  
+  
+  # FIND SMALL DELINEATIONS ----
+  # Find multi-delineations less or equal to the filter size (i)
+  dbWithTransaction(con, {
+    glue_sql("
+    CREATE TABLE {`sch`}.del_fil AS
+    WITH area AS (
+      SELECT sid, smu1_id, grp, geom, st_area(geom) AS area
+      FROM {`sch`}.{`ref_pre`}
+    )
+    SELECT sid
+    FROM area
+    WHERE area <= {i} ;", .con = con) %>% dbExecute(conn = con)
+    glue_sql("
+    CREATE INDEX ON {`sch`}.del_fil (sid) ;", .con = con) %>% dbExecute(conn = con)
+  })
+  
+  #' If no delineations are filtered
+  #' the corresponding level refinement should be a view instead.
+  del_fil <- glue_sql("
+  SELECT count(*)
+  FROM {`sch`}.del_fil ;", .con = con) %>% dbGetQuery(conn = con) %>% flatten_dbl()
+  
+  if (del_fil == 0) {
+    glue_sql("
+    CREATE OR REPLACE VIEW {`sch`}.{`ref_tb`} as
+    SELECT *
+    FROM {`sch`}.{`ref_pre`} ;", .con = con) %>% dbExecute(conn = con)
+    
+    next
+  } 
+  
+  
+  
+  # BLEND SMALL DELINEATIONS IN A BIGGER ADYACENT DELINEATION ----
+  # Find adyacents big delineations to assign small delineations to be filtered. 
+  #' Big delineations shall be the smallest area that is not considered for filtering 
+  #' When ties, biggest shared boundary is preferred.
+  #' This query could be speed up by skipping lenght criterion.
+  #' Run-time: ~10 min.
+  glue_sql("
+  CREATE TABLE {`sch`}.del_asg AS 
+  WITH fil AS (
+    SELECT *
+    FROM {`sch`}.{`ref_pre`} INNER JOIN {`sch`}.del_fil USING (sid)
+  )
+  SELECT fil.sid AS sid, big.sid AS big_sid, lenght
+  FROM fil, 
+    LATERAL ( SELECT div.sid, st_length(st_intersection(fil.geom, div.geom)) AS lenght, st_area(div.geom) AS area
+              FROM {`sch`}.{`ref_pre`} AS div
+              WHERE st_touches(fil.geom, div.geom) AND div.sid != fil.sid AND div.sid NOT IN (SELECT sid FROM {`sch`}.del_fil)
+              ORDER BY area ASC, lenght DESC -- ties issue
+              LIMIT 1 
+              ) AS big ;", .con = con) %>% dbExecute(conn = con)
+  
+  dbWithTransaction(con, {
+    glue_sql("
+    CREATE INDEX ON {`sch`}.del_asg (sid) ;", .con = con) %>% dbExecute(conn = con)
+    glue_sql("
+    CREATE INDEX ON {`sch`}.del_asg (big_sid) ;", .con = con) %>% dbExecute(conn = con)
+  })
+
+  # Create table for temporal refined delineations
+  glue_sql("
+  -- Copy with <like> to drag serial identifier and indexes.
+  CREATE TABLE {`sch`}.del_tmp (
+    LIKE {`sch`}.{`ref_pat`} INCLUDING ALL
+  ) ;", .con = con) %>% dbExecute(conn = con)
+
+  # Create new shapes and insert into refinement table
+  #' For every big delineation with assignments reshape it 
+  #' by collecting related small delineations and union all of them together.
+  #' Run-time: ~5 min.
+  glue_sql("
+  INSERT INTO {`sch`}.del_tmp (sid, geom, smu1_id, grp)
+  WITH main AS (
+    SELECT *
+    FROM {`sch`}.{`ref_pre`} 
+    WHERE sid IN (SELECT DISTINCT big_sid FROM {`sch`}.del_asg)
+  ), asg AS (
+    SELECT *
+    FROM {`sch`}.{`ref_pre`} INNER JOIN {`sch`}.del_asg USING (sid)
+  )
+  SELECT main.sid AS sid, ST_Multi(one.geom), smu1_id, grp
+  FROM main, 
+    LATERAL ( SELECT st_union(geom) AS geom
+              FROM (  SELECT ST_Multi(main.geom) AS geom
+                      UNION ALL 
+                      SELECT ST_Multi(asg.geom) AS geom
+                      FROM asg
+                      WHERE asg.big_sid = main.sid
+                      ) AS unite 
+              ) AS one ;", .con = con) %>% dbExecute(conn = con)
+
+  # Add unmodified delineations to temporal
+  glue_sql("
+  INSERT INTO {`sch`}.del_tmp (sid, geom, smu1_id, grp)
+  SELECT sid, ST_Multi(geom), smu1_id, grp
+  FROM {`sch`}.{`ref_pre`}
+  -- if lenght = 0, they will get erased at this point, instead of selecting from <del_asg>
+    -- not those filtered
+  WHERE sid NOT IN (SELECT sid FROM {`sch`}.del_fil)  
+    -- and not those already present
+    AND sid NOT IN (SELECT sid FROM {`sch`}.del_tmp) ;", .con = con) %>% dbExecute(conn = con)
+
+  
+  
+  
+  # POPULATE FINAL TABLE ----
+  # Create table to hold definitive refined delineations at corresponding filter size (i)
+  dbWithTransaction(con, {
+    glue_sql("
+    -- Copy with <like> to drag serial identifier and indexes.
+    -- Then, inheritance is apply to allow scan from parent.
+    CREATE TABLE {`sch`}.{`ref_tb`} (
+      LIKE {`sch`}.{`ref_pat`} INCLUDING ALL
+    ) ;", .con = con) %>% dbExecute(conn = con)
+    glue_sql("
+    ALTER TABLE {`sch`}.{`ref_tb`} INHERIT {`sch`}.{`ref_pat`} ;", .con = con) %>% dbExecute(conn = con)
+    glue_sql("
+    ALTER TABLE {`sch`}.{`ref_tb`} ALTER COLUMN geom SET STORAGE EXTERNAL ;", .con = con) %>% dbExecute(conn = con)
+    # #' Indexes. Theorically they are created with INCLUDING ALL option. Check in a next run.
+    # glue_sql("
+    # CREATE INDEX ON {`sch`}.{`ref_tb`} (smu1_id) ;", .con = con) %>% dbExecute(conn = con)
+    # glue_sql("
+    # CREATE INDEX ON {`sch`}.{`ref_tb`} (grp) ;", .con = con) %>% dbExecute(conn = con)
+    # glue_sql("
+    # CREATE INDEX ON {`sch`}.{`ref_tb`} (smu1_id, grp) ;", .con = con) %>% dbExecute(conn = con)
+    # glue_sql("
+    # CREATE INDEX ON {`sch`}.{`ref_tb`} USING gist (geom) ;", .con = con) %>% dbExecute(conn = con)
+  })
+
+  # Adyacent polygons with the same SMU 1~group are unioned.
+  #' Run-time: ~4 min.
+  glue_sql("
+  INSERT INTO {`sch`}.{`ref_tb`} (geom, smu1_id, grp)
+  -- From previous refinement iteration
+  -- get all combinations of SMU 1 and groups
+  WITH one AS (
+    SELECT smu1_id, grp, ST_UnaryUnion(clt) AS geom
+    -- Cluster distance =: 1 for connected, px +1 for one px gap and so on
+    FROM (  SELECT smu1_id, grp, unnest(ST_ClusterWithin(geom, 1)) AS clt
+            FROM {`sch`}.del_tmp div
+            GROUP BY smu1_id, grp ) AS unite
+  )
+  -- Calculate area for new geometries
+  SELECT ST_Multi(geom), smu1_id, grp
+  FROM one", .con = con) %>% dbExecute(conn = con)
+
+  # Close DB connection, temporary tables are dropped.
+  glue_sql("
+  DROP TABLE IF EXISTS {`sch`}.del_fil, {`sch`}.del_asg, {`sch`}.del_tmp ;", .con = con) %>% dbExecute(conn = con)
+  #dbDisconnect(con)
+  #con <- dbcon_postgis("dicsm")
+  
+  # FINAL DEBUG ----
+  debug[[as.character(i)]][2] <- lubridate::now()
+}
+```
+
+
+
+
