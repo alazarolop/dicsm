@@ -1,0 +1,129 @@
+---
+title: "DiCSM project set-up"
+author: "Alberto Lázaro-López"
+date: "5th December 2019"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+abstract: Disaggregation of Conventional Soil Maps, from now on DiCSM, is a project aiming to develop highly detailed soil maps based on semi-detailed conventional soil map through out the transformation of its compound map units into homogenous ones. 
+bibliography: ref/dicsm.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+knitr::opts_chunk$set(connection = "con")
+
+library(tidyverse)
+```
+
+Disaggregation of Conventional Soil Maps, en adelante **DiCSM**, tiene como objetivo último desarrollar una cartografía de suelos de alta resolución que aproveche un mapa de suelos convencional semi-detallado ya elaborado, desagregando sus SMU politáxicas en monotáxicas. Se persigue conseguirlo a través de la integración del mapa convencional de suelos con información generada a partir de imágenes de teledetección y el modelo digital del terreno (MDT, en inglés *DEM*) en análisis geoestadísticos. 
+
+# Objetivos 
+
+Este objetivo general será la consecución de diversos objetivos parciales:
+
+1. Fuentes de datos (*sources*)  
+  Incluye la selección de las fuentes de datos para los conjuntos de imágenes de teledetección y MDT, su obtención y su procesamiento para ser empleados en los cálculos de variables ambientales o covariables.
+  
+1. Covariables (*covariates*)  
+  Las covariables son variables ambientales ligadas a los factores de desarrollo edáficos derivadas a partir de imágenes de teledetección o MDT. Se recoge la metodología de cálculo de múltiples covariables, su análisis y su selección para su posterior uso en los análisis geoestadísticos.
+  
+1. División (*division*)
+  Engloba los análisis geoestadísticos de enfocados a la *clasificación no supervisada por partición* sobre los datos recopilados, así como su análisis.
+
+1. Desagregación (*disaggregation*)
+  Se correlaciona los resultados de la división con perfiles de suelos descritos buscando establecer una relación suelo~paisaje cuyo resultado sería un nuevo mapa de suelos de unidades cartográficas homogéneas o monotáxicas.
+  
+
+# Materiales y métodos
+
+Todos estos objetivos se componen de acciones que combinan el uso de motores SIG, como el SGBBDD **PostgreSQL** y su extensión espacial **PostGIS**, los paquetes SIG **QGIS**, **SAGA** y **GRASS**; con el software estadístico **R**.
+
+Por un lado, se empleará una base de datos, *dicsm*, que aglutinará todos los datos de la investigación. 
+Su esquema lógico y físico será desarrollado durante la ejecución y quedará recogido en un directorio dedicado, `db`.
+
+> El proceso de creación de la base de datos queda recogida en el documento inicial, `dicsm.sql`, dentro del directorio `db`.
+
+```{r}
+# Directory holding files for db structure.
+fs::dir_create("db")
+```
+
+Los archivos de imágenes espaciales serán registrados en la base de datos, pero permanecerán disponible bajo la estructura de directorios de forma que puedan ser accedidos ágilmente y sin sobrecostes de procesamiento por los paquetes SIG más allá de PostGIS. 
+Estos quedarán recogidos en el directorio `data`. 
+Inicialmente serán recopilados en el directorio `raw` para su estudio y tratamiento. 
+Los pasos intermedios antes de su almacenamiento definitivo quedarán recogidos en el directorio `tmp`.
+
+```{r}
+c("raw", "tmp", "data") %>% 
+  fs::dir_create()
+```
+
+Se considera interesante un desarrollo unificado de los diferentes códigos de tratamiento y análisis con explicaciones y razonamientos, de forma que ambos queden recogidos en un único documento.
+Estos documentos deberán ser fácilmente accesibles desde diferentes plataformas así como incorporar y ejecutar códigos de los lenguajes en uso en el proyecto: *R*, *SQL* y *bash*.
+Con todo, se opta por el uso de ficheros **RMarkdown** que combinan *Markdown* con trozos de código de dichos lenguajes y que pueden ser ejecutados in situ.
+Excepcionalmente, el código de la base de datos será recogido en archivos de formato *SQL* cuando no sea necesaria su explicación y constituyan elementos básicos, ya que facilita su implementación. 
+
+También estará disponible la bibliografía gestionada en Zotero en el directorio `ref` en un archivo de formato BibTex.
+
+```{r}
+fs::dir_create("ref")
+```
+
+Por último, las funciones de R globales para todo el proyecto serán recopiladas en archivos de extensión **R** en el directorio `src`.
+
+```{r}
+fs::dir_create("src")
+```
+
+## Configuración del control de versiones
+
+Para finalizar, se configura el archivo de exclusiones del gestor de control de versiones, Git.
+
+```{r}
+httr::GET(url = "https://raw.githubusercontent.com/github/gitignore/master/R.gitignore", httr::write_disk(".gitignore", overwrite=TRUE))
+
+gittext <- "
+# macOS Finder files
+.DS_Store
+
+
+# DiCSM ####
+## Orignal files 
+raw/
+raw/*
+
+## Definitive fiels
+data/*
+
+## Files on processing
+tmp/*
+_tmp/
+gis/
+
+# VSCode #####
+.vscode/
+"
+write(gittext, file = ".gitignore", append = TRUE)
+rm(gittext)
+```
+
+Y los tipos de archivos bajo el sistema de GIT-LFS.
+
+```{r}
+gittext <- "# R data files
+*.rds filter=lfs diff=lfs merge=lfs -text
+
+# Large output images files
+*.png filter=lfs diff=lfs merge=lfs -text
+*.html filter=lfs diff=lfs merge=lfs -text
+*.svg filter=lfs diff=lfs merge=lfs -text
+*.pdf filter=lfs diff=lfs merge=lfs -text
+
+# QGIS project files
+*.qgz filter=lfs diff=lfs merge=lfs -text" 
+write(gittext, file = ".gitattributes")
+rm(gittext)
+```
