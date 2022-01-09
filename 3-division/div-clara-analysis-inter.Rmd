@@ -1,0 +1,308 @@
+---
+title: "CLARA divison analysis (II): inter SMU and profiles"
+author: "Alberto Lázaro-López"
+date: "3/03/2020"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+abstract: Just for covariates collection 2
+bibliography: ../ref/dicsm.bib
+---
+
+```{r core, include=FALSE }
+for (.i in paste0("src/", c("spatial", "dbms", "core", "raster", "nbclust_par"), ".R")) {
+  source(.i)
+}
+
+proj <- .proj_envi("division") %>% 
+  path_file() %>% 
+  .proj_subdir()
+```
+
+
+# Introducción
+
+Just for division from CLARA by covariates collection 2.
+
+```{r, eval=TRUE}
+div <- list("met" = "clara", 
+            "sel" = 2)
+
+proj[["data"]] <- path("data", paste0("division-", paste(div$met, div$sel, sep = "_")))
+``` 
+
+```{r}
+smu1_set <- RPostgres::dbGetQuery(conGIS, glue_sql("
+  SELECT DISTINCT smu1_id
+  FROM division.{`paste(div$met, div$sel, 'div', sep = '_')`}", 
+  .con = conGIS)
+  )
+
+smu1_set <- smu1_set %>% 
+  mutate(smu1_id = tolower(smu1_id),
+         class = path(proj$res, paste("clara", div$sel, sep = "_"), paste("clara", div$sel, smu1_id, sep = "-"), ext = "rds")) %>% 
+  arrange(smu1_id)
+```
+
+
+# Extracción de centroides
+
+Representación de los grupos a través de sus centroides.
+
+```{r}
+centroids <- foreach(
+  i = smu1_set$smu1_id, 
+  .final = function(l) setNames(l, smu1_set$smu1_id),
+  .errorhandling = "pass") %dopar% {
+    
+    smu1_set %>% 
+      filter(smu1_id == i) %>% 
+      select(class) %>% 
+      flatten_chr() %>% 
+      readRDS() %>%
+      .$medoids %>% 
+      as_tibble() %>%
+      mutate(grp = row_number()) %>% 
+      select(grp, everything())
+}
+
+centroids <- centroids %>% 
+  bind_rows(.id = "smu1_id") %>% 
+  mutate_if(is.numeric, round, digits = 3) %>% 
+  mutate(ctd_id = paste(smu1_id, grp, sep = "")) %>% 
+  select(ctd_id, everything())
+
+ctd_mat <- centroids %>% 
+  magrittr::set_rownames(.$ctd_id) %>% 
+  select(-smu1_id, -grp, -ctd_id) %>% 
+  as.matrix()
+```
+
+
+## Hierarchical clustering
+
+Diagrama - árbol bottom up
+
+* Distance: Euclidean, Mahalanobis, Correlation
+
+```{r}
+dist_set <- c("Euclidean", "Mahalanobis", "Correlation")
+
+ctd_dist <- foreach(i = dist_set, 
+                    .final = function(l) setNames(l, dist_set)) %do% {
+  proxy::dist(ctd_mat, method = i)
+}
+```
+
+* Linkage: ward.D2 ~ average ~ complete
+
+```{r}
+ctd_hclust <- foreach(i = dist_set, 
+                      .final = function(l) setNames(l, dist_set)) %do% {
+  hclust(ctd_dist[[i]], method = "ward.D2")  
+}
+```
+
+* Comparing dendogram
+
+```{r}
+ctd_dendro <- foreach(i = dist_set, 
+                      .final = function(l) setNames(l, dist_set)) %do% 
+{
+  ctd_hclust[[i]] %>%
+    as.dendrogram() 
+    #dendextend::as.ggdend(offset_labels = 2) %>% 
+    #ggplot()
+}
+
+#ggsave(path("gis", "test", ext = "pdf"), ctd_dendro$Euclidean, 
+#       width = 15)
+
+#' Run directly in the console
+for (i in names(ctd_dendro)) {
+  pdf(path(proj$img, paste("dendro", i, sep = "-"), ext = "pdf"), 
+      width = 12, 
+      height = 35)
+  plot(ctd_dendro[[i]], horiz = TRUE)
+  dev.off()
+}
+```
+
+
+```{r}
+dendro_comb <- arrangements::combinations(dist_set, k = 2, replace = FALSE)
+dendro_names <- apply(dendro_comb, 1, function(r) paste(r, collapse = "_"))
+ctd_tangle <- foreach(i = dendro_comb[, 1], 
+                      j = dendro_comb[, 2], 
+                      .final = function(l) setNames(l, dendro_names)) %do% {
+  
+  tangleidx <- round(dendextend::entanglement(ctd_dendro[[i]], ctd_dendro[[j]]), 3)
+  
+  dendextend::tanglegram(dend1 = ctd_dendro[[i]], 
+                         dend2 = ctd_dendro[[j]],
+                         main_left = i,
+                         main_right =  j,
+                         main = paste("Entanglement =", tangleidx ),
+                         sub = paste("Entanglement =", tangleidx ),
+                         #cex_main = 100,
+                         #cex_sub = 100,
+                         common_subtrees_color_branches = TRUE
+                         )
+  
+}
+
+tangleidx <- foreach(i = dendro_comb[, 1], 
+                      j = dendro_comb[, 2], 
+                      .final = function(l) setNames(l, dendro_names)) %do% {
+  
+  round(dendextend::entanglement(ctd_dendro[[i]], ctd_dendro[[j]]), 3)
+
+}
+
+#' Run directly in the console
+for (i in names(ctd_tangle)) {
+  pdf(path(proj$img, paste("tangle", i, sep = "-"), ext = "pdf"), 
+      width = 40, 
+      height = 20)
+  plot(ctd_tangle[[i]])
+  dev.off()
+}
+```
+
+
+
+
+
+* Correlation cophenetic ~ dist
+Compute some dendogram and compare them
+
+```{r}
+# Compute cophentic distance 
+ctd_coph <- vector(mode = "list")
+for (i in names(ctd_hclust)){
+  ctd_coph[[i]] <- cophenetic(ctd_hclust[[i]])   
+}
+
+ctd_coph_cor <- vector(mode = "list")
+for (i in names(ctd_hclust)){
+  ctd_coph_cor[[i]] <- cor(ctd_dist, ctd_coph[[i]])   
+}
+
+ctd_coph_cor
+```
+
+* Dendogram (horizontal) fviz_dend
+
+```{r}
+pic <- factoextra::fviz_dend(ctd_hclust$ward.D2, 
+                      horiz = TRUE, 
+                      cex = 0.75)
+
+ggsave(filename = path(proj$img, "clara_analyais_gap_statistic", ext = "pdf"), 
+       plot = pic, 
+       width=15, height=40)
+#' Run directly in the console
+# pdf("dendrogram.pdf", width=15, height=30) 
+# print(p) 
+# dev.off()
+
+```
+
+* Choosing among groups and algorithms
+
+```{r}
+smu1_stu <- vector(mode = "numeric")
+smu1_stu[["stu"]] <- RPostgres::dbGetQuery(conGIS, glue_sql(
+  "WITH smu1_stu AS (SELECT DISTINCT stu_id
+    FROM smu1_stu
+    WHERE stupc iS NOT NULL
+    ORDER BY stu_id
+    )
+  SELECT count(*)
+  FROM smu1_stu
+  ", 
+  .con = conGIS)
+  ) %>% 
+  flatten_dbl()
+```
+
+```{r}
+ctd_valid <- clValid::clValid(ctd_mat, 
+                 nClust = seq(from = 35, to = 155, by = 30), 
+                 clMethods = c("hierarchical", "agnes"),
+                 method = c("ward"),
+                 metric = "euclidean",
+                 validation = c("internal", "stability") 
+                 )
+
+summary(ctd_valid)
+```
+
+
+Validation:
+
+* pvclust
+
+```{r}
+#' Create FORK cluster limited to 6 cores
+registerDoSEQ()
+
+ctd_pv <- pvclust(parallel = cores, t(ctd_mat), method.hclust = "ward.D2",
+    method.dist = "correlation", nboot = 500, iseed = 5432)
+
+# Reset to standard cluster
+parallel::stopCluster(cores)
+registerDoParallel(cores = 6L)
+
+```
+
+
+
+
+```{r}
+pic <- factoextra::fviz_nbclust(smu$sub, cluster::clara, k.max = max(search_space), method = "gap_stat", nboot = 10) +
+  labs(subtitle = "Gap statistic method")
+ggsave(filename = path(proj$img, "gap_statistic", ext = "svg"), plot = pic)
+
+NbClustPar
+```
+
+
+```{r}
+grp <- cutree(res.hc, k = 4)
+fviz_dend(res.hc, k = 4, # Cut in four groups
+cex = 0.5, # label size 
+k_colors = c("#2E9FDF", "#00AFBB", "#E7B800", "#FC4E07"), 
+color_labels_by_k = TRUE, # color labels by groups 
+rect = TRUE # Add rectangle around groups 
+)
+
+fviz_cluster(list(data = df, cluster = grp),
+palette = c("#2E9FDF", "#00AFBB", "#E7B800", "#FC4E07"), 
+ellipse.type = "convex", # Concentration ellipse 
+repel = TRUE, # Avoid label overplotting (slow) 
+show.clust.cent = FALSE, 
+ggtheme = theme_minimal())
+```
+ 
+
+Validation:
+
+* pvclust
+```{r}
+# Utilizar fork
+parPvclust(cl=NULL, data, method.hclust = "average",
+
+method.dist = "correlation", nboot = 1000, iseed = NULL)
+```
+
+
+
+
+## Comparativa 
+
+## Clasificación definitiva
+
+

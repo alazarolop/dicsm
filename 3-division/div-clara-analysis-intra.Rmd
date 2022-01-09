@@ -1,0 +1,518 @@
+---
+title: "CLARA divison analysis (I): intra SMU and delineations"
+author: "Alberto Lázaro-López"
+date: "15/01/2020"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+abstract: 
+bibliography: ../ref/dicsm.bib
+---
+
+```{r core, include=FALSE }
+for (.i in paste0("src/", c("spatial", "dbms", "core", "raster"), ".R")) {
+  source(.i)
+}
+
+proj <- dir_ls(regexp = "division") %>% 
+  .proj_subdir()
+```
+
+
+# Introducción
+
+El objetivo último del proyecto es desarrollar una cartografía de suelos de alta resolución aprovechando un mapa de suelos convencional semi-detallado ya elaborado y mediante la desagregación de sus SMU politáxicas en monotáxicas.
+Utilizando el concepto del modelo suelo~paisaje, proponemos buscar áreas potencialmente homogéneas que se relacionen posteriormente con clases de suelos mediante métodos de clasificación no supervisados, partiendo de las SMU de un mapa de suelos convencional.
+
+La búsqueda de estás áreas potenciales se ajustaría a los límites de las SMU primarias, buscando el beneficio del trabajo de integración de variables realizado por el cartógrafo y para reducir la variabilidad a organizar. 
+Así, se aplicaría el método de clasificación no supervisado **Clara con distancia de Mahalanobis** por cada grupo de delineaciones pertenecientes a una SMU primaria del **mapa de suelos refinado** y sobre el conjunto de covariables que ha sido definido previamente para el proyecto.
+La elección de este método de clasificación específico está recogida en detalle en el anexos correspondiente, **clasificación no supervisada por partición**.
+
+El resultado serán polígonos vectoriales que delimitarán las nuevas áreas potencialmente homogéneas asociados a las SMU primarias, pero sin ser asociaciados con las STU. 
+
+En definitiva, se trata de una propuesta metodológica altamente adaptada a cada unidad cartográfica, que recoge los características concretas y busca explotarlas en la clasificación de la variabilidad intrínseca de las SMU.
+
+
+# Características de las SMU 
+
+```{sql, connection=con, output.var="smu1_set"}
+SELECT *
+FROM division.smu1_set
+LIMIT 10 ;
+```
+
+```{r}
+soil_smu1 <- st_read(conGIS, 
+                     query = "SELECT * FROM csm.soil_smu1")
+
+```
+
+
+
+
+
+
+# Número de grupos sugeridos
+
+Se empieza comparando el número creado por los diferentes conjuntos.
+
+```{sql, connection=con, output.var="smu1_nc"}
+SELECT subset, smu1_id, max(grp) AS grp
+FROM (
+  SELECT DISTINCT concat('c', (regexp_match(tableoid::regclass::character varying, '[1-9]'))[1]) AS subset, smu1_id, grp
+  FROM division._div_div ) AS res
+GROUP BY subset, smu1_id
+ORDER BY subset, smu1_id
+```
+
+```{r}
+smu1_nc <- smu1_nc %>% 
+  pivot_wider(names_from = subset, values_from = grp) 
+
+smu1_nc
+```
+
+```{r}
+smu1_nc %>% 
+  summarise(c1 = sum(c1),
+            c2 = sum(c2))
+```
+
+La principal diferencia de C1 sobre C2 se da en los grupos J09C y J10C, que son las SMU fluivales o de fondo de valle.
+
+
+# Áreas homogéneas
+
+## Análisis cuantitativo
+
+En primer lugar, se hace un estudio cuantitativo de las nuevas delineaciones:
+- ¿En qué número han aumentado las divisiones en cada uno? 
+- ¿En qué SMU han cambiado más? ¿Qué característica tienen esas SMU?
+Por delineaciones, observar cuáles han sido las que más han sido divididas. ¿Hay algún patrón espacial, por ejemplo, a mayor cota mejor o así, de forma que pueda justificarlo por la elección?
+
+### Divisiones
+
+Aquí se estudia qué ha pasado con el número de delineaciones por cada SMU primaria.
+
+```{sql, connection=con, output.var="smu1_del"}
+-- Used as an example of how to transpose a table in a query. R is a better and the standard approach.
+WITH div AS (
+	SELECT (regexp_match(tableoid::regclass::character varying, '[1-9]'))[1]::integer AS subset, 
+			smu1_id, grp, geom
+	FROM division._div_div 
+), div_sub AS  (
+	SELECT subset, smu1_id, count(*)
+	FROM div
+	GROUP BY subset, smu1_id
+	ORDER BY subset, smu1_id
+), c1 AS (
+	SELECT smu1_id, count AS c1 
+	FROM div_sub 
+	WHERE subset = 1
+), c2 AS (
+	SELECT smu1_id, count AS c2 
+	FROM div_sub 
+	WHERE subset = 2
+), csm AS (
+	SELECT smu1_id, count(*) AS csm
+	FROM soilref JOIN smu USING (smu_id)
+	WHERE smu1_id IN (SELECT smu1_id FROM div_sub)
+	GROUP BY smu1_id
+	ORDER BY smu1_id
+)
+
+SELECT *
+FROM csm 
+JOIN c1 USING (smu1_id)
+JOIN c2 USING (smu1_id)
+```
+
+El número de delineaciones inicial en las SMU primarias seleccionadas es de 7554 y tras la clasificación aumenta en más de un 3000% para ambos conjuntos de covariables, concretamente 244889 para el C1 y 220671 para el C2, es decir, que C1 tiene un 10% más de delineaciones que C2.
+
+> Sería recomendable realizar este ejercicio después de limpiar las divisiones más pequeñas que sólo se corresponden con uno o dos píxeles y pueden alterar el resultado.
+
+```{r}
+smu1_del %>% 
+  summarise(csm = sum(csm), 
+            c1 = sum(c1),
+            c2 = sum(c2)) %>% 
+  mutate(csm_c1 = ((c1 - csm) / csm * 100),
+         c2_c1 = ((c2 - c1) / c1 * 100)) %>% 
+  mutate_if(is.double, round, digits = 2)
+```
+
+
+### Delineaciones
+
+Se desea estudiar la distribución espacial de las nuevas delineaciones, se quiere observar en qué SMU se han generado más y el motivo. También en qué delineaciones se ha aumentado más. 
+La hipotésis es que SMU o delineaciones con ciertas características han sido explotadas de forma diferente por cada conjunto.
+
+```{r}
+pivot_longer( smu1_del, cols = c(c1, c2), 
+              names_to = "covars", 
+              values_to = "dels") %>% 
+  ggplot(data = .) +
+  geom_point(mapping = aes(x = csm, y = dels, shape = covars, colour = covars)) +
+  ggrepel::geom_text_repel(mapping = aes(x = csm, y = dels, label = smu1_id))
+  #geom_text(mapping = aes(x = csm, y = dels, label = smu1_id))
+```
+
+```{r}
+( smu1_map <- smu1_del %>% 
+  mutate(csm_c1 = ((c1-csm)/csm*100),
+         csm_c2 = ((c2-csm)/csm*100),
+         c2_c1 = ((c2-c1)/c1*100),
+         c1_c2 = ((c1-c2)/c1*100)    ) %>% 
+  mutate_if(is.double, round, digits=2 ) )
+```
+
+
+```{r}
+smu1_map <- inner_join(soil_smu1, smu1_map, by = "smu1_id")
+```
+
+```{r}
+tm_shape(smu1_map) +
+  tm_fill(col = "csm_c1")
+```
+
+```{r}
+tm_shape(smu1_map) +
+  tm_fill(col = "csm_c2", palette = "Blues") +
+  tm_text("smu1_id", size = 0.85, col = "black") 
+```
+
+
+```{r}
+tm_shape(smu1_map) +
+  tm_fill(col = "c1_c2", palette = RColorBrewer::brewer.pal(9, "Spectral")) +
+  tm_text("smu1_id", size = 0.85, col = "black") 
+```
+
+Era de esperar que J09C y J10C tuviesen más delineaciones porque se defínian más grupos.
+Sin embargo, en J43 y J16 la diferencia era mínima. 
+
+Si se desgrana más esta información y se analiza cómo ha sido la división por delineaciones. 
+
+```{sql connection=con}
+CREATE OR REPLACE VIEW division.clara_div AS
+SELECT row_number() over() AS sid, 
+    (regexp_match(tableoid::regclass::character varying, '[1-9]'))[1]::integer AS subset, 
+    smu1_id, grp, geom
+FROM division._div_div ;
+```
+
+
+```{sql, connection=con}
+BEGIN ;
+CREATE MATERIALIZED VIEW division.clara_pt AS
+SELECT subset, smu1_id, grp, st_pointonsurface(geom) as pt
+FROM division.clara_div ;
+--
+CREATE INDEX ON clara_pt USING gist (pt) ;
+CREATE INDEX ON clara_pt (smu1_id) ;
+COMMIT ;
+```
+
+```{sql, connection=con}
+-- Count of delineations from each collection within every original primary SMU delineation
+-- The aim is to check those SMU where more delineations are produced.
+CREATE OR REPLACE VIEW division.clara_del AS
+WITH del AS (
+	SELECT sid, subset, pt.smu1_id, grp, soil.geom AS geom
+	FROM soil, clara_pt as pt
+	WHERE st_intersects(soil.geom, pt.pt)
+)
+
+SELECT DISTINCT row_number() over() as id, sid, subset, smu1_id, geom, count(*) over (partition by sid, subset)
+FROM del
+ORDER BY sid, subset
+```
+
+Mediante la visualización en QGIS de las divisiones creadas por cada delineación, no se encuentra un factor espacial. 
+Pero las delineaciones de J16C y J43C que más divisiones tienen son las de fondo de valle. 
+Este factor es especialmente llamativo en J16C debido a su amplio rango de distribución altitudinal.
+
+```{sql connection=conGIS}
+DROP MATERIALIZED VIEW clara_pt CASCADE ;
+```
+
+
+En general, si es cierto que se percibe que C1 ha sido capaz de generar mayor número de delineaciones.
+
+> De cara a hacer un sieve, decidir el número de pixels mediante un histograma del area de todas las delineaciones y en las 4 donde hay mayor discrepancia, (9, 10, 16, 43).
+
+```{r}
+del <- foreach( i = c(1:2), .final = function(l) setNames(l, paste0("c", c(1:2)) ) ) %do% {
+  query <- glue_sql("
+    SELECT {i} as subset, smu1_id, grp, (ST_Area(geom)) as area
+    FROM {`tb`}
+    WHERE smu1_id IN (SELECT smu1_id FROM smu1_set)",
+    tb = paste("clara", i, "div", sep = "_"), .con = conGIS)
+  
+  RPostgres::dbGetQuery(conn = conGIS, 
+                        statement = query)
+}
+```
+
+En ambos ocurre, pero es más intenso en C1.
+Sin embargo, en un análisis pormenorizado de las delineaciones encontramos que en C1 el peso lo llevan delineaciones de poca superficie. 
+Es decir, delineaciones pequeñas aisladas que podríamos asemejar al ruido de las covariables.
+
+```{r}
+pic <- del %>%
+  map(arrange, area) %>% 
+  #map(slice, 1:round(nrow(del$c2)*0.70)) %>% 
+  bind_rows(.id = "covars") %>% 
+  mutate(covars = toupper(covars)) %>% 
+  ggplot() +
+  geom_freqpoly(aes(area, stat(count), linetype = covars), binwidth = 25 ) +
+  labs(linetype = "Collection", x = "Area", y = "Number of delineations") +
+  theme(legend.position = c(0.9, 0.85), 
+        plot.margin = margin(t = 5, r = 15, b = 5, l = 10, unit = "pt") ) +
+  coord_cartesian(xlim = c(0, 150))
+
+pic
+```
+
+```{r}
+ggsave(path(proj$img, "del_count", ext = "tiff"), pic )
+```
+
+
+Se encuentra que hay un punto de inflexión (*knee* o *elbow*) entre 75 y 100. 
+Considerando que las delineaciones tienen una superficie relacionada con el tamaño de malla, 5 m, ese rango se corresponde con un tamaño de delineación entre 3 y 4. 
+
+Se quiere focalizar sobre las SMU donde C1 supera a C2, con la teoría de observar el mismo patrón.
+Ello podría expresar que la superioridad de C1 se debe a delineaciones pequeñas, de poco sentido material y poca utilidad.
+
+```{r}
+del %>%
+  map(arrange, area) %>% 
+  map(filter, smu1_id %in% paste0("J", c(9, 10, 16, 43), "C") ) %>% 
+  map(slice, 1:round(nrow(del$c2)*0.10)) %>% 
+  bind_rows(.id = "covars") %>% 
+  ggplot() +
+  geom_freqpoly(aes(area, colour = covars), binwidth = 25 )
+```
+
+Efectivamente, C1 tiene una línea de frequencia / histograma mucho más sesgado hacia tamaños pequeños. En este caso el punto de inflexión es entre 50 y 75. 
+
+
+```{r}
+# Standard summary for delineations
+#my_quantile <- function(x, probs) {
+#  tibble(x = quantile(x, probs), probs = probs)
+#}
+```
+
+```{r}
+( del_map <- del %>% 
+  map(summarise, m = mean(area), sd = sd(area), n = n()) %>% 
+  map(as_tibble) %>% 
+  bind_rows(.id = "cc") )
+```
+
+```{r}
+del %>% 
+  map(filter, area <=75) %>% 
+  map(summarise, n = n()) %>% 
+  map(as_tibble) %>% 
+  bind_rows(.id = "cc") %>% 
+  rename(n100 = n) %>% 
+  join(del_map, ., by = "cc") %>% 
+  mutate(ratio100 = n100/n)
+```
+
+
+
+
+
+## Análisis cualitativo
+
+Y un análisis cualitativo / cuantitativo de los grupos divididos en SMU.
+Se analiza la visualización, corroborando lo que se ha observado en el análisis cuantitativo y extendiéndolo.
+
+> Comentar las imágenes. ¿qué es lo que marcan mejor, en qué se diferencian?
+
+- Límites generales
+- Zonas claras = Carbonatos
+- Arcillas
+
+
+
+
+
+
+# Análisis de centroides de divisiones
+
+1. Calcular las áreas de las divisiones con sumatarios mediante la db
+
+```{sql, connection=con, output.var="class_div"}
+SELECT subset, smu1_id, grp, sum(st_area(geom)/10^4)::numeric(9,2) as area
+FROM clara_div
+GROUP BY subset, smu1_id, grp
+```
+
+```{r}
+# Setting up classification details
+
+div <- list("met" = "clara")
+
+div[["set"]] <- unique(class_div$subset) 
+
+div[["smu1"]] <- unique(class_div$smu1_id)
+
+# Set of stacked covariates 
+covars <- DBI::dbGetQuery(con, glue_sql(
+  "SELECT select_id, covar_id
+  FROM covar_select
+  WHERE select_id IN ({div$set*})
+  ORDER BY select_id, covar_id ASC", .con = con) )
+
+covars <- split(covars, covars$select_id) %>% 
+  map(select, -select_id) %>% 
+  map(flatten_chr)
+
+
+```
+
+```{r}
+del_area <- foreach(i = unique(class_div$subset), .final = function(l) setNames(l, as.character(div$set)) ) %do% {
+  class_div %>% 
+    filter(subset == i) %>% 
+    select(-subset)
+}
+```
+
+
+2. Explotar los resultados en centroides. 
+
+```{r}
+del_div <- foreach(i = div$set, .final = function(l) setNames(l, as.character(div$set))) %do% {
+  class <- dir_ls( path(proj$res, paste(div$met, i, sep = "_")) )
+  
+  res <- foreach(j = class, .final = function(l) setNames(l, div$smu1) ) %do% {
+    readRDS(j)$medoids %>%
+      as_tibble() %>%
+      mutate(grp = row_number()) %>% 
+      select(grp, everything())
+  }
+  
+  #res %>% 
+  #  bind_rows(.id = "smu1_id")
+}
+rm(res)
+
+del_div <- del_div %>% 
+  map( map, mutate_if, is.numeric, round, digits = 3)
+```
+
+
+5. Devolver valores originales
+
+```{r}
+# Get all rasters
+rastlist <- foreach(i = div$set, 
+                    .final = function(l) setNames(l, as.character(div$set))) %:%
+  foreach(j = div$smu1, .final = function(l) setNames(l, div$smu1) ) %do% {
+    path("gis", paste("smu1", i, sep = "_"), tolower(j), ext = "tiff") %>% 
+      brick()
+}
+
+# Get their values and compute mean and sd for every SMU
+del_unscale <- foreach(i = names(rastlist), 
+                        .final = function(l) setNames(l, names(rastlist))) %:%
+  foreach(j = div$smu1, .final = function(l) setNames(l, div$smu1) ) %do% {
+    pix <- raster::getValues( rastlist[[i]][[j]] )
+    colnames(pix) <- covars[[as.character(i)]]
+    pix <- pix[complete.cases(pix), ]
+
+    res <- vector(mode = "list")
+    res[["mean"]] <- colMeans(pix) %>% enframe() 
+    res[["sd"]] <-  apply(pix, 2, sd)  %>% enframe()
+
+    res <- map(res, pivot_wider, names_from = "name", values_from = "value" ) 
+    res
+  }
+rm(pix, res)
+```
+
+
+```{r}
+del_div_unscale <- foreach(i = names(del_unscale), .final = function(l) setNames(l, names(del_unscale) ) ) %:%
+  foreach(j = div$smu1, .final = function(l) setNames(l, div$smu1) ) %do% {
+    
+   mapply(magrittr::multiply_by, del_div[[i]][[j]][, -1], del_unscale[[i]][[j]]$sd) %>% 
+      as_tibble() %>% 
+      mapply(magrittr::add, ., del_unscale[[i]][[j]]$mean) %>% 
+      as_tibble() %>% 
+      mutate(grp = row_number() ) %>% 
+      select(grp, everything())
+}
+
+del_div_unscale <- del_div_unscale %>% 
+  map( map, mutate_if, is.numeric, round, digits = 5)
+```
+
+
+3. JOIN 
+
+```{r}
+del <- vector(mode = "list")
+del[["med"]] <- del_div %>% 
+  map(bind_rows, .id = "smu1_id") %>% 
+  map2(del_area, ., inner_join, by = c("smu1_id", "grp"))
+
+del[["unscale"]] <- del_div_unscale %>% 
+  map(bind_rows, .id = "smu1_id") %>% 
+  map2(del_area, ., inner_join, by = c("smu1_id", "grp"))
+```
+
+
+4. Pack table
+
+> Vicente (31/01/2020): En concreto ¿una tabla? (o lo que sea) con las unidades disgregadas de cada SMU, su superficie y su descripción en términos de la covariables y su significado físico-ambiental, y si puedes, con “ligeras” alusiones a las STU.
+
+```{r}
+tp <- names(del)
+del <- flatten(del)
+names(del) <- paste(rep(tp, each = 2), names(del), sep = "_")
+rm(tp)
+
+openxlsx::write.xlsx(del, 
+                     file = path("tmp", paste(div$met, "del", sep = "_"), ext = "xlsx") )
+```
+
+
+
+# Consideraciones previas
+
+Detección de zonas carbonatadas (C1 Blue over red c2 )
+-1.51409,41.77012,623503.387,4625320.596
+
+-1.49618,41.75170,625027.751,4623301.571
+
+
+Detección de variaciones en llanura de inundación (C2 over C1)
+-1.46206,41.85042,627668.285,4634311.725
+
+
+Grupos de C2 se integran en C1
+-1.45400,41.76758,628502.675,4625126.569
+
+
+
+```{r}
+# Region generation
+for (i in c(1:2)) {
+  glue('pgsql2shp -f {file} {pgsql} {query} ',
+     file = path_wd("gis", paste("clara", i, sep = "_"), ext = "shp"),
+     pgsql = glue("-h localhost -u {keyring::key_list(\"psql-su\")[1,2]} -P {keyring::key_get(\"psql-su\")} dicsm"),
+     query = double_quote(paste("SELECT *, concat_ws('_', smu1_id, grp) as id FROM division.clara", i, sep = "_")),
+     ) %>% system()
+}
+
+```

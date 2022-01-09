@@ -1,0 +1,293 @@
+---
+title: "Covariates isolation"
+author: "Alberto Lázaro-López"
+date: "19th July 2019"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+abstract: Classification stage of the disaggregation is sought to be applied independently on every primary SMU (SMU1), and so the raster stack of selected covariates should be dividedq in isolated tiles for every primary SMU. This documents develop an efficient methodology to achieve this goal.
+bibliography: ../ref/dicsm.bib
+---
+
+```{r core, include=FALSE }
+for (.i in paste0("src/", c("spatial", "dbms", "core", "raster"), ".R" ) ) source(.i)
+
+proj <- .proj_envi("division") %>% 
+  path_file() %>% 
+  .proj_subdir()
+```
+
+# Introducción
+
+La etapa de división de la desagregación de mapas considera el análisis de cada SMU primaria (SMU 1) de forma individualizada, y para esto es necesario disponer del grupo de covariables selecciondas aisladas por cada SMU 1.
+Se pretende desarrollar una metodología[^1] que consiga realizar este proceso lo más eficientemente posible dentro de la base de datos.
+
+[^1]: Aclaración: Este documento transcribe el estudio realizado originalmente el 2018/09/10 y lo extiende con las consideraciones actuales.
+
+
+
+# Análisis del aislamiento
+
+Se utilizan el agrupamiento de covariables _Selección 1_, construido previamente, y las SMU 1 del mapa original sin áreas misceláneas extras, buscando facilitar el procesamiento.
+Así, se prueba a aislar una única SMU 1, considerando todas sus delineaciones.
+Todas las acciones de estudio serán realizadas en un _schema_ independiente que pueda ser descartado fácilmente al final.
+
+```{sql, connection=con}
+CREATE SCHEMA _dev ;
+```
+
+```{sql, connection=con}
+EXPLAIN ANALYZE VERBOSE 
+WITH solo AS (
+  SELECT geom
+	  FROM soil JOIN smu USING (smu_id)
+	  WHERE smu1_id ~ '^J04C'
+  )
+SELECT ST_Clip(rast, geom) AS rast
+FROM (SELECT ST_Union(rast) AS rast 
+	  FROM covar_1, solo
+	  WHERE ST_Intersects(rast, 1, geom) ) AS zona, solo 
+```
+
+## Problemas
+
+Al correr el análisis anterior se observa que el consumo total de tiempo se reparte:
+
+
+| Tiempo (%) | Objeto |
+|:----------:|:-------|
+| **70** | ST_Intersects: Index scan _st_convexhull x nº de geom~loops |
+| 2 | seq scan soil (smu_id) <br> seq scan smu (smu1_id) |
+  : La mayor parte del consumo de tiempo lo acapara la intersección de cada delineación (geometría simple) con los tiles.
+
+
+## Alternativas
+
+1. **Reducir el número de loops to scan**.  
+  Agrupar las geometrías en MULTI: ST_Collect() y ST_Union().
+  Cada loop sería más caro, pero se reduciría el número considerablemente.
+
+1. Test diferentes versiones of ST_Intersects.
+
+1. Seq -> indexes: ¿MATERIALIZED VIEW?.
+
+
+### Opción 1
+
+* Agregación de las geometrías en multi geometrías por SMU 1. (1)
+* Versión de ST_Intersects sin banda. (2)
+
+```{sql, connection=con}
+EXPLAIN ANALYZE VERBOSE 
+WITH solo AS (
+  SELECT ST_Union(geom) as geom
+	  FROM soil JOIN smu USING (smu_id)
+	  WHERE smu1_id ~ '^J04C'
+  )
+SELECT ST_Clip(rast, geom) AS rast
+FROM (SELECT ST_Union(rast) AS rast 
+	  FROM covar_1, solo
+	  WHERE ST_Intersects(rast, geom) ) AS zona, solo ;
+```
+
+
+### Opción 2
+
+* Se fuerza a que todas las SMU agrupadas sean MULTI (en caso de que algunas sólo acapararan una única delineación). (1)
+* Se materializan las geometrías y se preparan índices sobre los atributos consultados. (3)
+
+```{sql, connection=con}
+BEGIN ;
+CREATE MATERIALIZED VIEW IF NOT EXISTS _dev.suelo_smu1_multi AS
+SELECT row_number() over() AS sid, ST_Multi(ST_Union(geom)) as geom, smu1_id
+	FROM soil JOIN smu USING (smu_id)
+	GROUP BY smu1_id ;
+--
+CREATE INDEX ON _dev.suelo_smu1_multi USING gist (geom) ;
+CREATE INDEX ON _dev.suelo_smu1_multi (smu1_id) ;
+COMMIT ;
+```
+
+```{sql, connection=con}
+EXPLAIN ANALYZE VERBOSE 
+WITH solo AS (
+  SELECT geom
+	  FROM _dev.suelo_smu1_multi
+	  WHERE smu1_id ~ '^J04C'
+  )
+SELECT ST_Clip(rast, geom) AS rast
+FROM (SELECT rast AS rast 
+	  FROM covar_1, solo
+	  WHERE ST_Intersects(rast, geom) ) AS zona, solo ;
+```
+
+```{sql, connection=con}
+CREATE TABLE _dev.t_covar AS
+WITH solo AS (
+  SELECT geom
+	  FROM _dev.suelo_smu1_multi
+	  WHERE smu1_id = 'J04C'
+  )
+SELECT row_number() over() as rid, ST_Clip(rast, geom) as rast
+FROM (SELECT rast AS rast 
+	  FROM covar_1, solo
+	  WHERE ST_Intersects(rast, geom) ) AS zona, solo ;
+```
+
+```{sql, connection=con}
+BEGIN ;
+SELECT AddRasterConstraints('dsm'::name, 't_covar'::name, 'rast'::name) ;
+SELECT VACUUM FULL dsm.t_covar ;
+COMMIT ;
+```
+
+
+## Solución
+
+| Corrección | Objeto | Reducción de tiempo (%) | Observaciones |
+|:----------:|:-------|:---:|:-------|
+| 1 | Multi | 50 | ST_Collect puede dar fallos de topología (e.g. J08C). ST_Union no los da al disolver los bordes. |
+| 2 | Versión de ST_Intersects | 50 | ST_Intersects rast~geom, geom~raster son iguales desde PostGIS 2.1.0. <br> ¿Por qué usaba la opción con banda si es mucho más lenta?! |
+| 3 | Índices | ~ | No hay una mejora sustancial. Puede estar relacionado con el tamaño de la tabla. 
+| 4 | Raster union | 60 | Los raster tiles sólo se intersectan con una geometría (multiple) y no hace falta unirlos.
+  : Resumen de resultados para la optimización del aislamiento de covariables por SMU.
+  
+Se decide aplicar **todas** las correcciones señaladas.
+
+
+
+
+# Análisis de agrupamiento de delineaciones
+
+Durante la fase de aislamiento se creó la versión unificada multigeometría de las SMU 1, de forma que la intersección con los tiles de los rasters fuera más eficiente.
+
+```{sql, connection=con}
+CREATE MATERIALIZED VIEW IF NOT EXISTS _dev.suelo_smu1_multi AS
+SELECT row_number() over() AS sid, ST_Multi(ST_Union(geom)) as geom, smu1_id
+	FROM soil JOIN smu USING (smu_id)
+	GROUP BY smu1_id ;
+```
+
+
+## Problemas
+
+Al analizar dichas geometrías se observa la existencia de múltiples esquirlas o astillas dentro de ellas y en los bordes como resultado de la fusión de los bordes y, seguramente, motivada por pequeños errores durante la digitalización de las SMU.
+
+Se quiere mejorar el método de cálculo de forma que sean eliminadas y sólo retener las líneas principales de las geometrías.
+
+## Alternativas
+
+A través de consultas en Stack, encuentro un indicio de solución aplicando dos _buffers_, uno positivo y otro negativo. 
+Sin embargo, la propia solución aporta un nuevo problema, ya que deforma las figuras con puntas.
+Dicha problemática puede ser solventada al analizar la documentación de la función _ST_Buffer_, que explica la forma de evitarlo.
+
+Además, para el desarrollo se añade un paso extra de forma que la solución se aplique en grupo sobre aquellas delineaciones contiguas pertenecientes al mismo grupo, de forma que si se solapan en la base de _buffer_ positivo, se disuelvan entre sí.
+Así, los pasos serían:
+
+* Por cada clase de SMU 1 (_GROUP BY_)
+* Se agrupan aquellas delineaciones a menos de 1 metro, contiguas (ST_ClusterWithin)
+* Se crean los _buffers_ sobre estos grupos
+* Se disuelven las geometrías dentro de cada grupo
+* Se crean los _buffers_ negativos dentro de cada grupo
+* Finalmente, se crean MULTI geometrías por cada SMU.
+
+```{sql, connection=con}
+CREATE TABLE _dev.soil_unary AS 
+WITH x AS (
+  SELECT  smu1_id,
+          ST_Buffer(
+          	ST_UnaryUnion(
+          		ST_Buffer(
+          			unnest(ST_ClusterWithin(geom, 1)
+          				  ), 1, 'join=mitre mitre_limit=1.0')
+          	), -1, 'join=mitre mitre_limit=1.0') AS grp
+  FROM soil join smu using (smu_id)
+  GROUP BY smu1_id
+)
+
+select row_number() over() as sid, smu1_id, ST_Union(grp) as geom
+from x
+GROUP BY smu1_id
+```
+
+## Solución
+
+Se emplea la nueva metodología desarrollada en lugar de la versión simple que creaba problemas de astillas.
+
+
+
+
+# Análisis de aplicación global
+
+Hasta ahora el análisis se ha centrado en el proceso de aislamiento. 
+Una vez lograda la optimización de la consulta individual, es necesario optimizar su aplicación conjunta en todas las SMU 1.
+
+```{sql, connection=con}
+EXPLAIN ANALYZE VERBOSE
+CREATE TABLE _dev.multi_lat AS
+SELECT row_number() over() as rid, rast, smu1_id
+FROM _dev.soil_unary, 
+	LATERAL (SELECT ST_Clip(rast, geom) as rast
+				FROM covar_1
+				WHERE ST_Intersects(rast, geom)) AS zona
+WHERE smu1_id ~ '^J04|J02' 
+```
+
+## Problemas
+
+Sorprende lo rápido que funciona.
+Aún así, ¿sería posible mejorar el funcionamiento de la consulta si se simplificara?
+
+## Alternativas
+
+```{sql, connection=con}
+EXPLAIN ANALYZE VERBOSE
+CREATE TABLE _dev.multi_one AS
+SELECT row_number() over() as rid, ST_Clip(rast, geom) as rast , smu1_id
+FROM _dev.soil_unary, covar_1
+WHERE ST_Intersects(geom, rast) AND smu1_id ~ '^J04|J02'
+```
+
+## Solución
+
+La eliminación de _LATERAL_ disminuye débilmente el tiempo de consulta, en escasos milisegundos.
+Se entiende que la versión simplificada es preferible.
+
+
+
+#Análisis de aplicación individual sistemática
+
+Otra alternativa es la creación al vuelo del aislamiento de las covariables para cada consulta.
+Esto podría hacerse aprovechando el método de apilamiento de covariables, donde se intersectarían los _tiles_ con la geometría.
+
+```{sql, connection=con}
+-- E.g. SMU1 _J25C_
+CREATE OR REPLACE TEMPORARY VIEW covar.j25c AS
+
+SELECT row_number() over() as rid, st_addband(NULL, array_agg(rast)) AS rast
+FROM (SELECT cvb.tableoid::regclass::character varying::text AS covar_id, ST_UpperLeftX(rast) AS upx,
+              ST_UpperLeftY(rast) AS upy, st_clip(rast, geom) AS rast
+      FROM  _covar_band AS cvb, soil_smu1
+      WHERE smu1_id ~* 'J25C' AND st_intersects(rast, geom)
+      ORDER BY upx, upy, covar_id ASC ) AS cv -- ORDER BY to make sure alphabetically bands order
+GROUP BY upx, upy
+```
+
+
+
+
+# Conclusión
+
+A través de diferentes ensayos, se ha llegado a la conclusión de que la forma más eficiente de aislar las covariables por geometrías de las SMU 1 se consigue mediante el empleo:
+
+* Geometrías _MULTI_ por SMU 1 a través de la metodología desarrollada para evitar astillas e imperfecciones.
+* Dichas geometrías se alojan en una _vista materializada_ sobre la que se construyen índices de los atributos _geom_ y _smu1_id_.
+* Versión de ST_Intersects sin selección de bandas.
+* Se retiran funciones no necesarias como la _ST_Union_ y _ST_Tile_ del procesamiento de los rasters.
+
+
+```{sql, connection=con}
+DROP SCHEMA _dev ; 
+```

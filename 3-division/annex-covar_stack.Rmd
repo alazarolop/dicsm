@@ -1,0 +1,102 @@
+---
+title: "Covariates stacked: a multi-band raster"
+author: "Alberto Lázaro-López"
+date: "19th July 2019"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+abstract: The classification stage of disaggregation is sought to be applied independently on every primary SMU using a set of covariates. Hence, a process to stack them and create a specific multi-band raster for every primary SMU ought to be available. This documents develop an efficient methodology to achieve this goal.
+bibliography: ../ref/dicsm.bib
+---
+
+```{r core, include=FALSE }
+for (.i in paste0("src/", c("spatial", "dbms", "core", "raster"), ".R" ) ) source(.i)
+
+proj <- .proj_envi("division") %>% 
+  path_file() %>% 
+  .proj_subdir()
+```
+
+# Introducción
+
+La etapa de división (clasificación de grupos) de la desagregación de mapas considera el análisis de cada SMU primaria de forma individualizada mediante un conjunto de variables. 
+Para ello, es necesario disponer de las covariables apiladas formando un único raster multibanda, de tal manera que cada pixel reuna toda la información requerida
+Se pretende desarrollar una metodología que consiga realizar este proceso de apilamiento lo más eficientemente posible dentro de la base de datos.
+
+
+# Requisitos
+
+Durante la fase de cálculo de covariables se genera un número indeterminado, de forma que los rasters de apilamiento contarán con un número diferente de bandas para cada proyecto. 
+A su vez el conjunto reducido de covariables tendrá también una composición variable. 
+Por lo tanto, será necesario implementar un **método capaz de generar un raster cuya designación y número de bandas sea variable**.
+Además, **el orden de las bandas deberá ser fijo y previsible**. 
+
+
+# Alternativas
+
+Una forma de seleccionar un conjunto no determinado de tablas que comparten características es mediante un sistema de herencia. 
+Así para crear el raster se generar una organización de las tablas de las covariables, que heredan sus atributos de una tabla patrón y que permite consultar todas las tablas herederas hijas a partir de la parental. 
+
+Se agrupan las tiles de diferentes covariables según sus coordenadas de rerencia en un array, que será empleado para crear un nuevo raster. 
+En caso de querer añadir algún filtro, esa misma consulta lo permitiría.
+
+
+## Opción completa
+
+```{sql, connection=con}
+-- E.g. SMU1 _J25C_
+CREATE OR REPLACE TEMPORARY VIEW covar.j25c AS
+
+SELECT row_number() over() as rid, st_addband(NULL, array_agg(rast)) AS rast
+FROM (SELECT cvb.tableoid::regclass::character varying::text AS covar_id, ST_UpperLeftX(rast) AS upx,
+              ST_UpperLeftY(rast) AS upy, rast
+      FROM  _covar_band AS cvb, soil_smu1
+      WHERE smu1_id ILIKE 'J25C' AND st_intersects(rast, geom)
+      ORDER BY upx, upy, covar_id ASC ) AS cv -- ORDER BY to make sure alphabetically bands order
+GROUP BY upx, upy
+```
+
+
+
+## Opción por selección
+
+```{sql, connection=con}
+-- Creating a raster with all selected covariates as bands
+CREATE OR REPLACE TEMPORARY VIEW covar.covar_1 AS
+
+WITH selection AS (
+	SELECT covar_id
+	FROM covar_select
+	WHERE smu1_id ILIKE 'J25C'
+)
+
+SELECT row_number() over() as rid, st_addband(NULL, array_agg(rast)) AS rast
+FROM (SELECT cvb.tableoid::regclass::character varying::text AS covar_id, ST_UpperLeftX(rast) AS upx,
+              ST_UpperLeftY(rast) AS upy, rast
+      FROM  _covar_band AS cvb, soil_smu1
+      WHERE smu1_id ILIKE 'J25C' AND st_intersects(rast, geom) 
+      ORDER BY upx, upy, covar_id ASC ) AS cv -- ORDER BY to make sure alphabetically bands order
+WHERE covar_id IN (SELECT * FROM selection)
+GROUP BY upx, upy
+```
+
+
+# Funciones
+
+> La función diseñada está alojada directamente en la base de datos y recopilada en las funciones PL/pgsql del schema "covariates".
+
+
+# Solución
+
+La solución adoptada no es sólo eficaz, sino increíblemente eficiente; logrando unificar un número $n$ no determinado de antemano de bandas a partir de una única consulta.
+
+Lo ideal para una aplicación recurrente por cada SMU sería utilizar las estructuras propuestas como base de una función.
+Esta futura función debería ser creada bajo el lenguaje `SQL` y que devolviera una tabla completa de raster en base a _covar_band_.
+
+Cabe destaar que sólo podría ser creada poco antes de que su aplicación ya que está basada en una tabla creada durante el proceso, _soilref_smu1_.
+
+
+
+

@@ -1,0 +1,524 @@
+---
+title: 'Principal Components Analysis (PCA) on covariates: a wat to select among them.'
+author: "Alberto Lázaro-López"
+date: "28/10/2019"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+abstract: A wide range of covariates were calculated and then analysed in order to filter the most valuable set at the project scale. Nevertheless, the classification will be applied individually within every primary SMU, so actual explained variability by covariates is presumed to change. Principal Compounents Analysis is choosen as a technique to discover what are the most valuable covariates. In this document, several methods for PCA application are tested so one is selected to be applied.
+---
+
+```{r core, eval=TRUE, include=FALSE }
+for (.i in paste0("src/", c("spatial", "dbms", "core", "raster"), ".R" ) ) source(.i)
+
+proj <- .proj_envi("covar") %>% 
+  path_file() %>% 
+  .proj_subdir()
+```
+
+
+# Introducción
+
+Durante la fase de análisis de las covariables que previamente habían sido calculadas, se estudió las correlaciones existentes así como su relación material potencial, con lo que se determinó cuáles eran de mayor interés para el conjunto del proyecto. 
+Estas covariables son la base para la futura clasificación, que se aplicará individualmente en cada SMU con el fin de mejorar la detección de las características particulares de cada una en el estudio.
+Por ese motivo, también cabría esperar que las covariables que mejor expliquen la variabilidad en cada caso sean diferentes, es decir, que un subgrupo reducido de covariables sean capaces de explicar la mayor parte de la variabilidad.
+
+Esta reducción del número de covariables será realizada mediante un Análisis de Componentes Principales (PCA).
+La aplicación de este debe considerar además la [preparación de los datos][basic1] y las diferentes [variantes posibles][pcacor]. 
+
+[basic1]: <https://www.r-bloggers.com/principal-component-analysis-in-r/>
+ 
+[pcacor]: <https://stats.stackexchange.com/questions/53/pca-on-correlation-or-covariance>
+
+Así, el objetivo último de este documento es encontrar los paquetes y las funciones para el cálculo del PCA más adaptados a las necesidades del proyecto.
+
+
+## Requisitos
+
+* **Indispensables**
+  * Cálculo de _PCA_.
+  
+* **Favorables**
+  * Visualización gráfica de los resultados numéricos obtenidos en los cálculos.
+  * Paralelización de los cálculos.
+  
+
+
+# Pre-selección
+
+## Revisión
+
+La revisión de antecedentes se ha basado en el estudio de la documentación de paquetes de R seleccionados a través de consultas del metabuscador [MetaCRAN][metacran] y de referencias en la bibliografía, que se resumen en la siguiente tabla.
+
+[metacran]: <https://www.r-pkg.org/>
+
+| Paquete | Función | Descripción |
+|:-------:|:-------:|:-----:|:------:|:---------------:|
+| stats | prcomp | Cálculo |
+| stats | princomp | Cálculo |
+| FactoMineR | PCA | Cálculo |
+| ade4 | dudi.pca | Cálculo |
+| bigpca | big.pca | Cálculo para *big.matrix* |  
+| FactoExtra | Varias | Visualización y optimización |
+| nFactor | Varias | Índices de optimización |
+| caret | preProcess | Preprocesamiento de los datos | 
+| missMDA | | Handle datasets with missing values |
+ : Funciones encontradas para el cálculo y la visualización de PCA.
+  
+  
+(@) **stats**  
+
+  Forma parte del núcleo de R, e incluye dos funciones semejantes: [**princomp**][princomp] y [**prcomp**][prcomp]. 
+  La primera usa el método de _spectral decomposition_, que examina la covarianza y la correlación entre variables; mientras la segunda _singular value decomposition_ (SVD), que examina dichos parámetros entre individuos.
+  Según la documentación de R, ese último cuenta con mayor precisión.
+  Ambos paquetes cuentan con [ejemplos][tuto] minuciosos de aplicación.
+  
+[princomp]: <https://www.rdocumentation.org/packages/stats/versions/3.6.1/topics/princomp>
+
+[prcomp]: <https://www.rdocumentation.org/packages/stats/versions/3.6.1/topics/prcomp>
+
+[tuto]: <http://www.sthda.com/english/articles/31-principal-component-methods-in-r-practical-guide/118-principal-component-analysis-in-r-prcomp-vs-princomp/#prcomp-and-princomp-functions>
+
+
+(@) [**FactoMineR**][factominer]  ]
+
+  Devuelve un resultado detallado y cuenta con múltiple opciones de visualización.
+  Aparece [recomendado][pcacompa] en diferente bibliografía y cuenta también con [tutoriales][factotuto] de aplicación.
+
+[factominer]: <http://factominer.free.fr/>
+
+[pcacompa]: <https://www.gastonsanchez.com/visually-enforced/how-to/2012/06/17/PCA-in-R/>
+
+[factotuto]: <http://www.sthda.com/english/articles/31-principal-component-methods-in-r-practical-guide/112-pca-principal-component-analysis-essentials/>
+
+(@) [**ade4**][ade4]
+
+  Aparece reflejado en cierta documentación, aunque sin recomendaciones.
+
+[ade4]: <https://www.rdocumentation.org/packages/ade4/versions/1.7-13>
+   
+
+(@) [**bigpca**][bigpca]
+
+  Paquete especial para aplicar PCA en matrices de gran tamaño de forma más eficiente.
+
+[bigpca]: <https://www.rdocumentation.org/packages/bigpca/versions/1.1>
+
+
+(@) [**factoExtra**][factoExtra]
+  
+  Paquete específico de visualización de los diferentes resultados del PCA.
+  Cuenta con [documentación][fEtuto] para su aplicación. 
+  
+[factoExtra]: <https://rpkgs.datanovia.com/factoextra/index.html>
+
+[fEtuto]: <http://www.sthda.com/english/wiki/factoextra-r-package-easy-multivariate-data-analyses-and-elegant-visualization>
+
+
+(@) [**nFactors**][nfactors]
+
+  Recoge funciones de índices sobre la selección de componentes principales.
+
+[nfactors]: <https://cran.rstudio.com/web/packages/nFactors/index.html>
+
+
+(@) [**caret**][caret]
+
+  Paquete de modelización, pero que también cuenta con funciones para preprocesamiento de los datos.
+  Su uso es [recomendado][caretpca] y cuenta con [tutoriales][caretuto].
+
+[caret]: <https://www.rdocumentation.org/packages/caret/versions/6.0-84>
+
+[caretpca]: <https://tgmstat.wordpress.com/2013/11/28/computing-and-visualizing-pca-in-r/#ref2>
+
+[caretuto]: <https://tgmstat.wordpress.com/2013/11/07/unsupervised-data-pre-processing-for-predictive-modeling/>
+
+
+(@) [**missMDA**][missMDA]
+
+  Paquete del grupo de FactoMineR que permite realizar PCA con conjuntos de datos no completos. 
+
+[missMDA]: <http://factominer.free.fr/missMDA/index.html>
+
+
+## Análisis 
+
+La mayor parte de los paquetes pre-seleccionados recogen funciones para ejecutar PCA con ciertas variaciones en su implementación. 
+**stats::prcomp** y **FactoMineR::PCA** son las que cuentan con mayores referencias y mejor documentación.
+Además, no se considera que alguna de las SMU supere el límite de tamaño de matriz de R, aproximadamente 3GB, por lo que la versión para *big.matrix* se descartaría. 
+Por ello, se optaría inicialmente por el uso de **FactoMineR::PCA**.
+
+Los otros dos paquetes restantes, **factoExtra** y **caret**, son paquetes complementarios para visualización y realizar el preprocesado de forma sencilla.
+
+
+  
+  
+# Área modelo
+
+Se quiere llevar a cabo un estudio de las fórmulas seleccionados.
+Para ello, se sigue la misma metodología que para el análisis de PCA, tomando como base los datos pertenecientes a la SMU cuya ratio/perfiles esté entre los más pequeños y se escoge la SMU **J25C**.
+
+```{r}
+smu1_set <- tribble(
+  ~smu1_id, 
+  "J25C",
+) %>% 
+  mutate(smu1_id = tolower(smu1_id),
+         file = path("gis", "division_met", paste(smu1_id, covar_select, sep = "_"), ext = "tiff"))
+```
+
+
+
+## Preparación de los datos
+
+Se carga el raster correspondiente a la SMU que se quiere clasificar a modo de prueba.
+
+```{sql, connection=con}
+-- E.g. SMU1 _J25C_
+CREATE OR REPLACE VIEW covar.j25c AS
+
+SELECT row_number() over() as rid, st_addband(NULL, array_agg(rast)) AS rast
+FROM (SELECT cvb.tableoid::regclass::character varying::text AS covar_id, ST_UpperLeftX(rast) AS upx,
+              ST_UpperLeftY(rast) AS upy, st_clip(rast, geom) AS rast
+      FROM  _covar_band AS cvb, soil_smu1
+      WHERE smu1_id ~* 'J25C' AND st_intersects(rast, geom)
+      ORDER BY upx, upy, covar_id ASC ) AS cv -- ORDER BY to make sure alphabetically bands order
+GROUP BY upx, upy
+```
+
+```{r}
+# Get raster from database
+smu1 <- pgiscon("j25c", "covar") %>% 
+  pgisrast()
+```
+
+```{sql, connection=con, output.var="covar"}
+SELECT covar_id
+FROM covariates
+ORDER BY covar_id ASC
+```
+
+```{r}
+# Names of bands
+names(smu1) <- covar$covar_id
+```
+
+Y se crean los objetos intermediarios de la clasificación.
+
+```{r}
+# SMU1 data filtered and scaled
+smu1_proc <- smu1 %>% 
+  as.matrix() %>%
+  na.omit() %>% 
+  scale()
+
+# Vector holding positions of filled pixels
+vref <- raster(x = smu1, layer = 1)
+vref <- Which(!is.na(vref)) %>% 
+  as.vector()
+
+# New raster for groups
+clt <- raster(smu1) 
+
+# Cleaning
+rm(smu1)
+gc()
+```
+
+
+```{r}
+clastime <- vector(mode = "list")
+vrefb <- vref
+cltb <- clt
+```
+
+# Análisis de fórmulas
+
+A continuación, se estudia el comportamiento y resultado de las diferentes fórmulas pre-seleccionadas.
+
+
+## FactoMineR::PCA
+
+```{r}
+clastime[["factominer"]] <- system.time({
+  smu1_pca <- FactoMineR::PCA(smu1_proc, scale.unit = FALSE)
+})
+```
+
+Durante la ejecución, se produce un uso inapreciable de memoria RAM (~2GB) y de CPU reducido (~15%).
+El tiempo de ejecución también es reducido, de 88s.
+
+
+## stats::prcomp
+
+```{r}
+clastime[["stats"]] <- system.time({
+  smu1_pcas <- stats::prcomp(smu1_proc)
+})
+```
+
+Durante la ejecución, se produce un uso inapreciable de memoria RAM (~2GB) y de CPU reducido (~15%).
+La ejecución es casi instantánea.
+
+
+
+## Comparativa
+
+Los resultados de ambas funciones son prácticamente idénticos. 
+Los tiempos de ejecución son reducidos en ambas, si bien **stats::prcomp** lo realiza prácticamente al instante.
+
+```{r}
+clastime <- map(clastime, matrix, ncol = 5) %>% 
+  bind_rows() %>% 
+  t() %>% 
+  as_tibble(rownames = "clastp") %>% 
+  select(clastp, user = V1, sytem = V2, elapsed = V3)
+
+saveRDS(clastime, path(proj$res, "pca-clastime", ext = "rds"))
+
+#----
+
+ggplot(data = clastime) +
+  geom_bar(aes(clastp, elapsed), stat = "identity") +
+  labs(x = "Método de clasificación", y = "Tiempo (s)")
+
+ggsave(filename = path(proj$img, "pca-clastime", ext = "svg"))
+rm(smu1_pca, smu1_pcas)
+```
+
+
+```{r, eval=FALSE, echo=FALSE, fig.cap='C-Means es el método más rápido de clasificación no supervisado.'}
+knitr::include_graphics( path_wd(proj$img, "pca-clastime", ext = "svg") )
+```
+
+
+Con todo, se opta finalmente por **stats::prcomp** como la función más adecuada.
+
+
+# Análisis de implementación
+  
+El proceso de cálculo contempla:
+
+1. Pre-procesado
+  
+  * Visualización de la matriz original
+  * Centrado
+  * Escalado
+  * Simetría
+
+1. Computación
+
+1. Interpretación
+
+  * Interpretación
+  * Eigenvalues y varianza
+  * Correlación con las variables
+  * Contribución de las variables a los componentes principales (PC).
+
+
+## Pre-procesado
+
+En primer lugar, se genera una matrix de pares entre las covariables para observar su distribución y representación de las correlaciones.
+
+```{r}
+# It's save as an image in order to get a quicker visualization.
+fig <- smu1_proc[sample(x = 1:nrow(smu1_proc), size = (nrow(smu1_proc)*0.02), replace = FALSE ), ] %>% 
+  as.data.frame() %>% 
+  GGally::ggpairs(progress = TRUE)
+
+ggsave(path("gis", "test-pca", ext = "png"), fig, width = 14, height = 14)
+```
+
+
+El centrado y escalado se ha aplicado previamente, durante la preparación de los datos del área modelo.
+Aunque las variables no tienen una distribución normal y presentan asimetrías, no se considera necesaria su corrección.
+
+
+## Computación
+
+```{r}
+smu1_pca <- stats::prcomp(smu1_proc)
+```
+
+
+
+## Interpretación
+
+### Autovectores (*Eigenvalues*) y selección de PC
+
+Los autovectores miden la cantidad de varianza explicada por los PC, donde el primer PC corresponde cno la dirección de mayor varianza en el conjunto de datos y así sucesivamente.
+A través de su análisis es posible determinar el número de PC óptimos a retener.
+
+```{r}
+factoextra::fviz_screeplot(smu1_pca, addlabels = TRUE)
+```
+
+```{r}
+factoextra::get_eigenvalue(smu1_pca)
+```
+
+Un autovalor superior a 1 (>1) indica que el PC explica más variación que una de las variables originales. 
+Esto sólo es correcto cuando los datos han sido previamente estandarizados.
+
+
+### Correlación con las variables
+
+El grado de correlación de las variables con los componentes principales, donde el signo señala la dirección de esa correlación.
+
+```{r}
+smu1_pca.var <- factoextra::get_pca_var(smu1_pca)
+
+smu1_pca.var$coord[, 1:3]
+```
+
+Esto puede ser visualizdo a través del siguiente gráfico circular.
+
+```{r}
+factoextra::fviz_pca_var(smu1_pca, 
+                         col.var="contrib",
+                         gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+                         repel = TRUE 
+                         )# Avoid text overlapping 
+```
+
+
+### Contribución de las variables
+
+Por su parte el nivel de contribución de cada covariable para definir el PC.
+
+```{r}
+smu1_pca.var$contrib[, 1:3]
+```
+
+También puede ser visualizado por cada PC o dimensión.
+
+```{r}
+factoextra::fviz_contrib(smu1_pca, choice = "var", axes = 1, top = 10)
+```
+
+La línea a rayas roja en el gráfico superior indica la contribución media esperada. 
+Si la contribución de las variables fuese uniforme, el valor esperado sería $1/length(variables) = 1/19 = 5.2%$.
+Para el caso de un componente, una variable con una contribución superior a este valor podría considerarse que tiene una contribución importante. 
+
+Para el PC o dimensión 2 y 3.
+
+```{r}
+factoextra::fviz_contrib(smu1_pca, choice = "var", axes = 2, top = 10)
+```
+
+```{r}
+factoextra::fviz_contrib(smu1_pca, choice = "var", axes = 3, top = 10)
+```
+
+Para el cómputo de la contribución de una variable para varios componentes se obtiene mediante:
+
+$$contrib = [(C1 * Eig1) + (C2 * Eig2)]/(Eig1 + Eig2)$$
+
+donde, *C1* y *C2* son las contribuciones de las variables para los PC correspondientes, mientras *Eig1* e *Eig2* lo son para los autovalores. 
+
+```{r}
+factoextra::fviz_contrib(smu1_pca, choice = "var", axes = c(1, 2, 3), top = 13)
+```
+
+
+```{r}
+smu1_pca.var$contrib[19:1, 1:5] %>% 
+  as_tibble(rownames = "covar") %>% 
+  mutate_if(is.numeric, scales::rescale, to = c(-1, 1) ) %>% 
+  column_to_rownames(var = "covar") %>% 
+  t() %>% 
+  ggcorrplot::ggcorrplot(show.legend = FALSE, colors = RColorBrewer::brewer.pal(9, "Blues")[c(1, 5, 8)])
+```
+
+
+
+# Conclusion
+
+Se han probado diferentes métodos y funciones de PCA para aplicar sobre las covariables en cada SMU primaria.
+Como resultado, se ha determinado que **stats::prcomp** es el método más eficiente y óptimo.
+
+Además, se ha desarrollado un esquema de la secuencia de aplicación del análisis y de interpretación de los resultados.
+
+
+
+# Anexo de implementación
+
+## PCA
+
+¿Qué patrón dibujan los centroides considerando los 2 PC mayoritarios? Distribución
+
+```{r, warning=FALSE}
+ctd_pca <- ctd_mat <- centroids %>% 
+  magrittr::set_rownames(.$ctd_id) %>% 
+  select(-smu1_id, -grp, -ctd_id) %>% 
+  as.matrix()
+
+ctd_pca <- FactoMineR::PCA(ctd_pca, 
+                           scale.unit = FALSE, 
+                           graph = FALSE)
+```
+
+### Eigenvalues
+
+```{r}
+factoextra::get_eigenvalue(ctd_pca)
+```
+
+```{r}
+factoextra::fviz_eig(ctd_pca, addlabels = TRUE)
+```
+
+3 factores (Eig>1; 72%)
+
+### Variables
+
+Estudio del comportamiento, relaciones positivas o negativas.
+
+```{r}
+ctd_pca_var <- factoextra::get_pca_var(ctd_pca)
+
+ctd_pca_var$cor[, 1:5]
+```
+
+```{r}
+factoextra::fviz_pca_var(ctd_pca, 
+                         col.var="contrib",
+                         gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+                         repel = TRUE 
+                         )# Avoid text overlapping 
+```
+
+Análisis de las contribuciones.
+
+```{r}
+ctd_pca_var$contrib[8:1, 1:3] %>% 
+  as_tibble(rownames = "covar") %>% 
+  mutate_if(is.numeric, scales::rescale, to = c(-1, 1) ) %>% 
+  column_to_rownames(var = "covar") %>% 
+  t() %>% 
+  ggcorrplot::ggcorrplot(show.legend = FALSE, colors = RColorBrewer::brewer.pal(9, "Blues")[c(1, 5, 8)])
+```
+
+Se confirma con las contribuciones que las variables hasta 3 factores son las más relevantes.
+
+```{r}
+factoextra::fviz_contrib(ctd_pca, choice = "var", axes = c(1:5), top = 5)
+```
+
+
+### Individuos
+
+A través del estudio inicial del PCA se determina que los 2 PC mayoritarios dan explicación suficiente para una correcta representación de la distribución de los individuos.
+
+```{r}
+factoextra::fviz_pca_ind(ctd_pca,
+                         geom = c("point"),
+                         axes = c(1,2))
+```
+
+Se observa una masa central concentrada y a su vez individuos más o menos aislados alrededor.
+
+
+

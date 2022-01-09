@@ -1,0 +1,133 @@
+---
+title: "SMU unsupervised division: isolation by primary SMU"
+author: "Alberto Lázaro-López"
+date: "8/11/2019"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+abstract: The ultimate goal of the disaggregation project is to develop a high detailed soil mapping taking advantage of the current conventional soil map through the disaggregation of its SMU into homogenous ones. This document tackles the core part which covers the unsupervised classification.
+bibliography: ../ref/dicsm.bib
+---
+
+```{r core, include=FALSE }
+for (.i in paste0("src/", c("spatial", "dbms", "core", "raster"), ".R" ) ) source(.i)
+
+proj <- .proj_envi("covar") %>% 
+  path_file() %>% 
+  .proj_subdir()
+```
+
+
+# Introducción
+
+El objetivo último del proyecto es desarrollar una cartografía de suelos de alta resolución aprovechando un mapa de suelos convencional semi-detallado ya elaborado y mediante la desagregación de sus SMU politáxicas en monotáxicas.
+Utilizando el concepto del modelo suelo~paisaje, proponemos buscar áreas potencialmente homogéneas que se relacionen posteriormente con clases de suelos mediante métodos de clasificación no supervisados, partiendo de las SMU de un mapa de suelos convencional.
+
+La búsqueda de estás áreas potenciales se ajustaría a los límites de las SMU primarias, buscando el beneficio del trabajo de integración de variables realizado por el cartógrafo y para reducir la variabilidad a organizar. 
+Por lo tanto, el paso previo a la clasificación concierne al aislamiento de las covariables seleccionadas según las SMU primarias del mapa de suelos refinado. 
+Para ello, se aplican las consideraciones recogidas en el documento anexo de **aislamiento y apilamiento de covariables**.
+
+Este paso es común a cualquier variante de clasificación, por lo que el tratamiento individualizado del aislamiento y el apilamiento facilita la creación de futuras modificaciones.
+
+
+# Mapa de suelos por SMU primarias multigeometrías
+
+Según el anexo **aislamiento y apilamiento de covariables**, la forma más óptima de aislamiento se consigue a través del uso de multigeometrías por cada SMU. 
+Por lo tanto, se preparan los mapas de suelos base y refinado mediante vistas materializadas.
+Esto mantiene el vínculo con los datos originales a la vez que permite generar índices sobre las nuevas geometrías.
+
+
+### Mapa de suelos original
+
+```{sql, connection=con_odbc}
+BEGIN ; 
+-- Merging SMU by its SMU 1 symbol
+CREATE MATERIALIZED VIEW IF NOT EXISTS csm.soil_smu1 AS 
+SELECT row_number() over() as sid, smu1_id, 
+          ST_Buffer(
+          	ST_Union(
+          		ST_Buffer(
+          			geom
+          		, 1, 'join=mitre mitre_limit=1.0'
+			      )
+          ), -1, 'join=mitre mitre_limit=1.0') AS geom
+FROM csm.soil_base JOIN smu using (smu_id)
+GROUP BY smu1_id ;
+
+-- Indexes on new table
+CREATE INDEX ON soil_smu1 USING gist (geom) ;
+CREATE INDEX ON soil_smu1 (smu1_id) ;
+--
+COMMIT ;
+```
+
+### Mapa de suelos refinado
+
+```{sql, connection=con_odbc}
+BEGIN ; 
+CREATE VIEW csm.soilref_base AS
+SELECT *
+  FROM csm.soilref
+  WHERE smu_id !~ '^JM' ;
+--
+COMMENT ON VIEW csm.soilref_base IS 'Delineations of refined SMU excluding miscellaneous areas' ;
+COMMIT ; 
+```
+
+```{sql, connection=con_odbc}
+BEGIN; 
+-- Merging SMU by its SMU 1 symbol
+CREATE MATERIALIZED VIEW IF NOT EXISTS csm.soilref_smu1 AS 
+SELECT row_number() over() as sid, smu1_id, 
+          ST_Buffer(
+          	ST_Union(
+          		ST_Buffer(
+          			geom
+          		, 1, 'join=mitre mitre_limit=1.0'
+			      )
+          ), -1, 'join=mitre mitre_limit=1.0') AS geom
+FROM csm.soilref_base JOIN smu using (smu_id)
+GROUP BY smu1_id ;
+
+CREATE INDEX ON soilref_smu1 USING gist (geom) ;
+CREATE INDEX ON soilref_smu1 (smu1_id) ;
+--
+COMMIT ;
+```
+
+
+# Consolidación de referencias foráneas
+
+Las nuevas unidades cartográficas tienen referencias a las SMU primarias en lugar de a las SMU.
+Por eso, es necesario consolidar las tablas foráneas de SMU primarias en la base de datos de desagregación (DiCSM).
+
+```{sql, connection=con_odbc}
+-- Rename foreign table that is going to be sustituted. 
+ALTER FOREIGN TABLE csm.smu1 RENAME TO _smu1 ;
+```
+
+```{sql, connection=con_odbc}
+-- Copying the table, defining the PRIMARY KEY and creating the index of the new _SMU_ table.
+BEGIN ;
+--
+CREATE TABLE csm.smu1 AS
+SELECT *
+FROM csm._smu1 ;
+--
+ALTER TABLE csm.smu1 ADD PRIMARY KEY (smu1_id) ;
+CREATE INDEX ON csm.smu1 (smu1_id) ;
+--
+COMMENT ON TABLE csm.smu1 IS 'Primary Soil Map Units. No phases' ;
+
+COMMIT;
+```
+
+
+
+
+# Conclusión
+
+Se ha derivado del mapa convencional de suelos original un modelo de geometrías que optimiza el aislamiento de las covariables por las SMU primarias como paso previo de la clasificación. 
+Se trata de un paso común a cualquier modelo de clasificación y su tratamiento individualizado facilita la creación de nuevas variantes.

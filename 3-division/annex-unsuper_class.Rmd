@@ -1,0 +1,1165 @@
+---
+title: 'Unsupervised classification for SMU division: medoids and fuzzy c-means methods'
+author: "Alberto Lázaro-López"
+date: "20/07/2019"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+abstract: The disaggregation methodology relies on classification of stacked covariates in order to find groups within SMU. A classification approach is the unsupervised method group. Within this group, and based in the ability to communicate uncertainty, the family of centroids has been choosen. In this document, several methods for fuzzy and medoids unsupervised classification are tested so one is selected to be applied.
+bibliography: ../ref/dicsm.bib
+---
+
+```{r core, include=FALSE }
+for (.i in paste0("src/", c("spatial", "dbms", "core", "raster"), ".R" ) ) source(.i)
+
+proj <- .proj_envi("division") %>% 
+  path_file() %>% 
+  .proj_subdir()
+```
+
+# Introducción
+
+La metodología de desagregación se fundamenta en la búsqueda de subunidades dentro de las SMU a través de métodos de clasificación no supervisados sobre covariables apiladas, de forma que no estén predefinidas de antemano, para posteriormente correlacionarlas con STU.
+
+Las familias de algoritmos de agrupación no supervisada más destacadas son las basadas en la conectividad (*hierarchical clustering*), en centroides (*partitioning clustering*, e.g. k-means, k-medoids), en distribuciones (*Gaussian mixture models*) y en densidades (*Density-based clustering*, e.g. DBSCAN, OPTICS...) [@Mouselimis2019FunctionalityClusterRPackage]. 
+
+De estas, la familia de centroides permite crear grupos excluyentes entre sí y los métodos que engloba son los de interés para este estudio.
+Se distingue entre aquellos donde los centroides se correspoden con medias de los grupos, como _k-means_, frente a los que toman como centro a ejemplares de la muestra, denominados *medoids*. 
+Este último grupo de métodos se considera más robustos, ya que el uso de *medoids* reduce la influencia de *outliers* y del ruido.
+A su vez, la forma de cuantificar las distancias entre los individuos también modela el resultado.
+Así cuando la distancía *euclídea* define grupos circulares, frente a otras, como la distancia de *Mahalanobis*, que resulta invariante ante los cambios de escala y que considera también las correlaciones entre las variables, por lo que corrige el efecto de la redundancia. 
+Esta última ha sido señalada por su potencial uso sobre datos de suelo [@Odeh1992SoilPatternRecognition].
+Por último, las variantes [*fuzzy*][fuzzy] dan lugar a grados de pertenencia de los individuos a los grupos. 
+
+[fuzzy]: <http://home.deib.polimi.it/matteucc/Clustering/tutorial_html/cmeans.html>
+
+El objetivo último es encontrar los paquetes y las funciones para el cálculo de la clasificación más adaptados a las necesidades del proyecto.
+
+## Requisitos
+
+* **Indispensables**
+  * Familia de métodos de partición: ya sea *kmeans* o *medoids*.
+  
+* **Favorables**
+  * Métodos fuzzy.
+  * Empleo de la distancia de **Mahalanobis**.
+  * Disponer de métodos par la optimización del número de grupos.
+  * Disponer de métodos de validación internos y externos.
+
+
+
+# Pre-selección
+
+## Revisión
+
+La revisión de antecedentes se ha basado en el estudio de la documentación de paquetes de R seleccionados a través de consultas del metabuscador [MetaCRAN][metacran] y la *task view* [Multivariate][multi] de CRAN, que se resumen en la siguiente tabla.
+
+[metacran]: <https://www.r-pkg.org/>
+
+[multi]: <https://cran.rstudio.com/web/views/Multivariate.html>
+
+
+
+| Paquete | Tipos de clasificación fuzzy | Métodos de validación |
+|:-------:|:-----------------------------|:----------------------|
+| | **Paquetes relevantes** | |
+| cluster | c-means, Fuzzy Analysis Clustering (fanny), PAM, Clara (sin version fuzzy) | ... |
+| clusterR | Clara (fuzzy), K-means (fuzzy) | Varios | 
+| e1071 | Fuzzy c-means <br> Unsupervised Fuzzy Competitive Learning ~ UPFC (1996) | Varios <br> + permite usar objetos *fclust* |
+| | **Paquetes específicos fuzzy**| |
+| fclust | Gustafson, Kessel and Babuska (GKB) <br> GKB with entropy regularization <br> Fuzzy k-medoids | Modiﬁed Partition Coeﬃcient (MPC) <br> Partition Entropy (PE)<br> Varios |
+| ppclust | Possibilistic Fuzzy C-Means (PFCM) (2005) <br> Unsupervised Possibilistic Fuzzy Clustering (UPFC) (2010) | Extensión de *fclust* |
+| | **Paquetes específicos de variantes** | |
+| fpc | DBSCAN <br> Mahalanobis Fixed Point | Varios |
+| evclust | Evidential Clustering (sin version fuzzy) | ... |
+| wskm | Group Weighted k-means (fgkm) (sin version fuzzy) | ... |
+| clusterSim | Spectral clustering (sin version fuzzy) | Extensión de *e1071* |
+| clv | | Extensión de _cluster_ |
+| | **Visualización** | |
+| factoextra | | |
+| | **Optimización** | |
+| NbClust | | |
+  : Selección de paquetes de clasificaciones no supervisadas fuzzy. Los métodos reseñados son los de mayor interés para su aplicación.
+
+
+
+* [**cluster**][cluster]: Es un paquete del conjunto estandar de R (Paquete recomendado).
+  Dispone del método base de *fuzzy c-means*, así como una función más robusta (**fanny**). 
+  Incluye la clasificación basada en medoides junto con una variante para grandes datasets que podría resultar muy interesante (**clara**).
+
+[cluster]: <https://cran.rstudio.com/web/packages/cluster/index.html>
+
+
+
+* [**ClusterR**][ClusterR]: Paquete especializado en métodos de clasificación no supervisados y que cuenta con métodos basados en centroides y distribuciones, también con sus variantes fuzzy.
+Buena documentación complementada mediante [viñetas extras][ClusterR+].
+
+[ClusterR]: <https://cran.rstudio.com/web/packages/cluster/index.html>
+
+[ClusterR+]: <https://cran.r-project.org/web/packages/ClusterR/vignettes/the_clusterR_package.html> 
+
+
+
+* [**e1071**][e1071]: Uno de los paquetes más completos para cálculos de clasificación, que cuenta tanto con métodos no supervisados como supervisados.
+  Los métodos no supervisados fuzzy son más bien limitados en comparación con los otros paquetes específicos, si bien cuenta con una gran variedad de índices que, aparentemente, son compatibles con el paquete **fclust**.
+  Además, dispone de una amplia y buena [documentación][e1071+].
+
+[e1071]: <https://cran.r-project.org/web/packages/e1071/index.html>
+
+[e1071+]: <https://www.datanovia.com/en/lessons/fuzzy-clustering-essentials/cmeans-r-function-compute-fuzzy-clustering/>
+
+
+
+
+* [**fclust**][fclust]: Gran número de métodos y funciones y con buena documentación.
+  Han desarrollado un artículo con explicaciones minuciosas de la aplicación de las distintas variantes y los métodos de validación. 
+  Dichos métodos también están documentados y con enlaces a sus artículos de referencia.
+
+[fclust]: <https://cran.r-project.org/web/packages/fclust/index.html>
+
+
+
+
+* [**ppclust**][ppclust]: Familia de métodos fuzzy específicos. 
+  El paquete se basa y extiende a **fclust**, incluyendo nuevos métodos de validación.
+  Cuenta también con buen soporte a través de [documentación extra][ppclust+].
+
+[ppclust]: <https://cran.r-project.org/web/packages/ppclust/index.html>
+
+[ppclust+]: <http://rpubs.com/rahulSaha/Fuzzy-CMeansClustering>
+
+
+
+
+* [**fpc**][fpc]: Gran variedad de métodos que han sido diseñados por el desarrollador del paquete.
+  También gran variedad de métodos de validación e incluso de *benchmarking* que permiten mayores posibilidades de contraste.
+  La documentación encontrada disponible no es tan amplia y se limita al manual y alguna [documentación extra][fpc+].
+
+[fpc]: <https://cran.r-project.org/web/packages/fpc/index.html>
+
+[fpc+]: <http://www.sthda.com/english/wiki/wiki.php?id_contents=7940>
+
+
+
+
+* [**evclust**][evclust]: Familia muy concreta de clasificación no supervisada.
+  Sin embargo, no cuenta con versión fuzzy.
+
+[evclust]: <https://cran.r-project.org/web/packages/evclust/index.html>
+
+
+
+* [**wskm**][wskm]: De manera similar, presenta una familia muy concreta de clasificación no supervisada, que no cuenta con versión fuzzy por contra.
+
+[wskm]: <https://rdrr.io/cran/wskm/>
+
+
+* [**clusterSim**][clusterSim]: Función específica para un método de clasificación no supervisado, aunque no cuenta con versión fuzzy.
+  Los métodos de clasificación extienden a los de **e1071**.
+
+[clusterSim]: <https://cran.r-project.org/web/packages/clusterSim/index.html>
+
+
+
+* [**clv**][clv]: Paquete específico para métodos de validación como extensión de **cluster**.
+
+[clv]: <https://cran.rstudio.com/web/packages/clv/index.html>
+
+
+* [**factoextra**][factoextra]: Paquete específico para visualizaciones de análisis multivariable.
+
+[factoextra]: https://www.rdocumentation.org/packages/factoextra/versions/1.0.5
+
+
+* [**NbClust**][nbclust]: Paquete para optimización de número de grupos.
+
+[nbclust]: <https://sites.google.com/site/malikacharrad/research/nbclust-package>
+
+
+## Paquetes
+
+Todos los paquetes pre-seleccionados recogen funciones de métodos de partición, bien sean versiones con centroides de medias o medoids. 
+
+Los paquetes relevantes **cluster**, **ClusterR**, **e1071** resultan interesantes por la amplia variedad de opciones que brindan, ya que con una única inversión de tiempo para su implementación se accede a múltiples métodos relacionados. 
+En todos los casos, la documentación disponible en bastante amplia.
+
+Por otro lado, aquellos paquetes específicos para métodos fuzzy son atractivos por la sofisticación y novedad de las variantes que recogen sobre la base de un método más convencional.
+Además, cuentan con numerosos tipos de validaciones específicas para métodos *fuzzy*.
+
+En esta primera aproximación prevalecerá el uso de métodos convencionales cuyo funcionamiento general ya sea conocido, como k-means o medoids, preferentemente en sus variantes fuzzy, con el fin de acelerar su implantación. 
+Por este, los paquetes **cluster**, **e1071**, **ClusterR** y **fclust** son considerados inicialmente para su aplicación.
+
+
+## Variantes
+
+Atendiendo a lo descrito en la introducción, las variantes de métodos de clasificación disponibles en estos paquetes que presentan mayor potencial son: i) aquellos que se basan en los métodos convencionales de *k-means* o *medoids*, ii) los que permiten el uso de la distancia de Mahalanobis y iii) cuentan con variante fuzzy. 
+
+Estos se reseñan en la tabla resumen presentada, a saber, **Partitioning Around Medoids (PAM)** (`pam`), **Clustering Large Applications** (`clara`), **Clustering Large Applications with Mahalanobis distance** (`Clara_Medoids`), **Fuzzy Analysis Clustering with Mahalanobis distance** (`fanny`), **Fuzzy C-Means** (`cmeans`), **Gustafson, Kessel and Babuska (GKB) with entropy regularization** (`FKM.gkb.ent`) y **Fuzzy k-medoids** (`FKM.med`).
+
+
+
+# Área modelo
+
+Se quiere llevar a cabo un estudio de las fórmulas seleccionados.
+Para ello, se toma como modelo los datos pertenecientes a la SMU cuyo ratio superficie por perfiles sea lo más bajo posible, así como que el número de perfiles totales utilizados sea el máximo posible.
+
+```{sql, connection=con, eval=FALSE, output.var="smu1_set"}
+WITH smu1_pf AS (
+SELECT smu1_id, count(*) AS n
+FROM soil_smu1, pf
+WHERE ST_Covers(soil_smu1.geom, pf.geom)
+GROUP BY smu1_id
+ORDER BY n DESC 
+), smu1_ratio AS (
+	SELECT smu1_id, ((ST_Area(geom)/10^4)/n)::numeric(7,2) as ratio, n
+	FROM soil_smu1 JOIN smu1_pf USING (smu1_id)
+	ORDER BY ratio ASC
+	LIMIT 10
+)
+
+SELECT smu1_id, ((ST_Area(geom)/10^4))::numeric(7,2) as area, n, ratio
+FROM soil_smu1 JOIN smu1_ratio USING (smu1_id)
+ORDER BY n DESC
+```
+
+De entre las 10 primeras opciones, se opta por la SMU **J25C** como prueba inicial dado su reducido tamaño, el número de perfiles y su ratio bajo.
+
+```{r}
+smu1_set <- smu1_set %>% 
+  filter(smu1_id == 'J25C')
+```
+
+
+## Preparación de los datos
+
+Se utiliza la selección de covariables **1**.
+
+```{r}
+proj[["met"]] <- "gis/division_met"
+
+covar_select <- 1
+```
+
+
+```{r}
+smu1_set <- smu1_set %>% 
+  transmute(smu1_id = tolower(smu1_id),
+            file = path(proj$met, paste(smu1_id, covar_select, sep = "_"), ext = "tiff"))
+
+dir_create(path_dir(smu1_set$file[1]))
+```
+
+Se genera el apilamiento de las covariables para la SMU que se quiere clasificar a modo de prueba y se exporta a un archivo para facilitar su tratamiento.
+
+```{r}
+# Create the covariates stack
+DBI::dbExecute(con, glue_sql("SELECT cvstack({smu1_set$smu1_id}, {covar_select})", .con = con) )
+
+# Get raster from database
+if(file_exists(smu1_set$file) == FALSE) {
+  glue('gdal_translate -of GTiff -a_srs EPSG:25830 "{pgis}" {file}',
+       pgis = pgiscon(.tb = smu1_set$smu1_id, .sch = paste("covars", covar_select, sep = "_")),
+       file = path_wd(smu1_set$file) ) %>% 
+    system()
+}
+
+```
+
+```{sql, connection=con, output.var="covars"}
+SELECT covar_id
+FROM covars.covar_select
+WHERE select_id = ?covar_select
+ORDER BY covar_id ASC
+```
+
+```{r}
+# Get raster from database
+smu1 <- smu1_set$file %>% 
+  brick()
+
+# Names of bands ~ covariates
+names(smu1) <- covars$covar_id
+
+# Processing of SMU raster
+smu <- smuproc(smu1)
+rm(smu1)
+gc()
+```
+
+## Número de grupos
+
+Con el fin de optimizar y hacer más eficiente la búsqueda, se determinar el rango inicial en base al número y las proporciones de las STU descritas en cada SMU de la leyenda del mapa.
+
+```{r}
+smu1_tb <- smu1_set$smu1_id
+```
+
+
+```{sql, connection=con, output.var="range"}
+WITH inc AS (
+  SELECT smu1_id, count(*) as ninc
+  FROM smu1_stu
+  WHERE stupc IS NULL AND smu1_id ILIKE ?smu1_tb
+  GROUP BY smu1_id
+), j AS (
+  SELECT smu1_id, count(*) as nstu
+  FROM smu1_stu
+  WHERE stupc IS NOT NULL AND smu1_id ILIKE ?smu1_tb
+  GROUP BY smu1_id
+)
+SELECT smu1_id, COALESCE(ninc, 0) AS ninc, nstu
+FROM j LEFT JOIN inc USING (smu1_id)
+```
+
+Así, **el número mínimo de grupos a evaluar equivaldrá al número de STU y el máximo será la unión entre STU e inclusiones**.
+
+```{r}
+search_space = as.integer(seq(range$nstu, (range$nstu+range$ninc+1)))
+
+rm(range, smu1_tb)
+```
+
+```{r}
+# Samples size is given in percentage, so it should be calculated before hand to not to exceede maximum. 
+smp <- sampling(smu$smu1)
+```
+
+```{r}
+# Run-time: ~3 min
+set.seed(5432)
+smu[["sub"]] <- smu$smu1[sample(x = 1:nrow(smu$smu1), size = (nrow(smu$smu1)*smp$p/4), replace = FALSE ), ]
+
+# NbClust
+set.seed(5432)
+clt_num <- NbClust::NbClust(data = smu$sub, method = "kmeans", min.nc = min(search_space), max.nc = max(search_space))
+```
+
+```{r}
+search_space <- 4
+```
+
+# Ejecución de las fórmulas
+
+A continuación, se estudia el comportamiento y resultado de las diferentes fórmulas seleccionadas.
+
+```{r}
+classtime <- vector(mode = "list")
+```
+
+
+## PAM. Partitioning Around Medoids
+
+Partición Alrededor de Medoides (PAM, *Partitioning Around Medoids*).
+
+```{r}
+met <- "pam"
+
+classtime[["met"]] <- system.time({
+  classout <- cluster::pam(x = smu$smu1, k = search_space, diss = FALSE, metric = "euclidean",  
+                           stand = FALSE, do.swap = TRUE, keep.data = FALSE, keep.diss = FALSE, pamonce = 5 )
+})
+```
+
+> Error in cluster::pam(x = smu1_proc, k = search_space, diss = FALSE, metric = "euclidean", : have 1116929 observations, but not more than 65536 are allowed
+
+No es posible utilizarlo porque la matriz de disimilitud que es necesario construir excede al máximo permitido en R de forma estándar, de **65536** filas.
+
+
+
+## Clara. Clustering Large Applications
+
+Clara es la versión de **PAM** para grandes conjuntos de datos cuyas dimensiones exceden a la capacidad de PAM.
+**Clara** realiza múltiples cálculos con muestreos reducidos del conjunto que después son integrados para detectar los meoides globales.
+Así, el límite de los subconjuntos equivale al máximo de posible a través de PAM.
+
+Durante sucesivas pruebas manuales se establece que para un ordenador de 32GB de RAM, el límite práctico se sitúa entre $10^4$ y $5·10^4$. 
+
+> Desarrollo de función para la determinación de parámetros de muestreos en funciones Clara, *sampling*.
+
+```{r}
+met <- "clara"
+
+classtime[[met]] <- system.time({
+  classout <- cluster::clara(x = smu$smu1, k = search_space, metric = "euclidean", stand = FALSE, 
+                          samples = smp$s, sampsize = round(nrow(smu$smu1)*smp$p), 
+                          keep.data = FALSE, rngR = TRUE, pamLike = TRUE )
+})
+
+classout$diss <- NULL
+
+saveRDS(classout, file = path(proj$res, paste("class", met, sep="-"), ext = "rds"))
+```
+
+Durante la ejecución, se produce un uso de memoria RAM medio (~4GB) y de CPU reducido (~9%).
+
+```{r}
+clusterast(classout$clustering, .pth = path(proj$met, paste("class", met, sep = "-"), ext = "tiff"))
+rm(classout)
+```
+
+
+
+## Clara with Euclidean distance
+
+Método Clara que, a diferencia del anterior, calcula la disimilitud mediante la distancia de Mahalanobis y permite la paralelización del proceso.
+
+```{r}
+met <- "Clara_Medoids_euc"
+
+classtime[[met]] <- system.time({
+  classout <- ClusterR::Clara_Medoids(data = smu$smu1, clusters = search_space, samples = smp$s, sample_size = smp$p, 
+                                      distance_metric = "euclidean", threads = 12, swap_phase = TRUE, fuzzy = TRUE) 
+})
+
+print(object.size(classout), units="auto")
+classout$dissimilarity_matrix <- NULL
+
+saveRDS(classout, file = path(proj$res, paste("class", met, sep="-"), ext = "rds"))
+```
+
+Durante la ejecución, se produce un uso de memoria RAM bajo (~3.5GB) y de CPU total si se paraleliza con todos lo núcleos (~100%).
+
+```{r}
+clusterast(classout$clusters, .pth = path(proj$met, paste("class", met, sep = "-"), ext = "tiff"))
+rm(classout)
+```
+
+
+
+
+## Clara with Mahalanobis distance
+
+Método Clara que, a diferencia del anterior, calcula la disimilitud mediante la distancia de Mahalanobis y permite la paralelización del proceso.
+
+```{r}
+met <- "Clara_Medoids_maha"
+
+classtime[[met]] <- system.time({
+  classout <- ClusterR::Clara_Medoids(data = smu$smu1, clusters = search_space, samples = smp$s, sample_size = smp$p, 
+                                      distance_metric = "mahalanobis", threads = 12, swap_phase = TRUE, fuzzy = TRUE)
+})
+
+print(object.size(classout), units="auto")
+classout$dissimilarity_matrix <- NULL
+
+saveRDS(classout, file = path(proj$res, paste("class", met, sep="-"), ext = "rds"))
+```
+
+Durante la ejecución, se produce un uso de memoria RAM bajo (~3.5GB) y de CPU total si se paraleliza con todos lo núcleos (~100%).
+
+```{r}
+clusterast(classout$clusters, .pth = path(proj$met, paste("class", met, sep = "-"), ext = "tiff"))
+rm(classout)
+```
+
+
+
+## Fanny 
+
+Comparado con otros métodos de clasificación *fuzzy*, **fanny** i) acepta matrices de disimilitud; ii) es más robusta frente a la asunsión de esfericidad de los grupos; y iii) permite analizar sus datos mediante la gráfica de la silueta *silhouette plot*.
+
+```{r}
+met <- "fanny"
+
+classtime[[met]] <- system.time({
+  classout <- cluster::fanny(x = smu1_proc, k = search_space, diss = FALSE, metric = "euclidean", memb.exp = 1.3, 
+                             stand = FALSE, keep.data = FALSE, keep.diss = TRUE )
+})
+```
+
+> Error: vector memory exhausted (limit reached?)
+
+Ocurre el mismo error que con **PAM**, el conjunto de datos excede el máximo procesable.
+
+
+
+## C-Means
+
+**cmeans** es la versión _fuzzy_ del método de clasificación **kmeans**, e incluye también una versión que aplica una actualización directa después de cada inclusión (Unsupervised Fuzzy Competitive learning) **ufcl**.
+
+```{r}
+met <- "cmeans"
+
+classtime[[met]] <- system.time({
+  classout <- e1071::cmeans(x = smu$smu1, centers = search_space, iter.max = 200, 
+                            dist = "euclidean", method = "cmeans", m = 1.3  )
+})
+
+print(object.size(classout), units="auto")
+classout$membership <- NULL 
+
+saveRDS(classout, file = path(proj$res, paste("class", met, sep="-"), ext = "rds"))
+```
+
+```{r}
+clusterast(classout$cluster, .pth = path(proj$met, paste("class", met, sep = "-"), ext = "tiff"))
+```
+
+
+
+```{r}
+met <- "ufcl"
+
+classtime[[met]] <- system.time({
+  classout <- e1071::cmeans(x = smu$smu1, centers = search_space, iter.max = 200, 
+                            dist = "euclidean", method = "ufcl", m = 1.3  )
+})
+
+print(object.size(classout), units="auto")
+classout$membership <- NULL 
+
+saveRDS(classout, file = path(proj$res, paste("class", met, sep="-"), ext = "rds"))
+```
+
+```{r}
+clusterast(classout$cluster, .pth = path(proj$met, paste("class", met, sep = "-"), ext = "tiff"))
+```
+
+Durante la ejecución de ambos se produce un uso de CPU de un sólo núcleo (~9%) y de un uso inapreciable de memoria RAM.
+
+
+
+
+## k-Means (Arma)
+
+Implementación en R del algoritmo k-means de la biblioteca **armadillo**.
+
+```{r}
+met <- "KMeans_arma"
+
+classtime[[met]] <- system.time({
+  classout  <- ClusterR::KMeans_arma (data = smu$smu1, clusters = search_space, n_iter = 25, seed_mode = "random_subset", 
+                                         seed = 1234)
+})
+
+print(object.size(classout), units="auto")
+
+saveRDS(classout, file = path(proj$res, paste("class", met, sep="-"), ext = "rds"))
+```
+
+La ejecución es prácticamente instantánea, se produce un uso de CPU de un sólo núcleo (~6%) y de un uso inapreciable de memoria RAM.
+
+```{r}
+classout_clusters <-  ClusterR::predict_KMeans(smu$smu1, classout)
+clusterast(classout_clusters, .pth = path(proj$met, paste("class", met, sep = "-"), ext = "tiff"))
+rm(classout, classout_clusters)
+```
+
+
+
+
+## Fuzzy k-Means (Rcpp)
+
+A diferencia de la función anterior, esta emplea el paquete **RcppArmadillo**.
+El tiempo de ejecución es superior frente a **kmeans_arma**, pero a costa de extender su funcionalidad.
+Así, i) permite por múltiples inicializaciones; y ii) es capaz de devolver una clasificación *fuzzy*.
+
+```{r}
+met <- "KMeans_rcpp"
+
+classtime[[met]] <- system.time({
+  classout <- ClusterR::KMeans_rcpp(data = smu$smu1, clusters = search_space, num_init = 25, max_iters = 100, 
+                                    initializer = "kmeans++", fuzzy = TRUE)
+})
+
+print(object.size(classout), units="auto")
+classout$fuzzy_clusters <- NULL
+
+saveRDS(classout, file = path(proj$res, paste("class", met, sep="-"), ext = "rds"))
+```
+
+Durante la ejecución se produce un uso de CPU de un sólo núcleo (~12%) y de un uso inapreciable de memoria RAM (~2GB).
+
+```{r}
+clusterast(classout$clusters, .pth = path(proj$met, paste("class", met, sep = "-"), ext = "tiff"))
+rm(classout)
+```
+
+
+
+## Fuzzy k-Means Mini-batch
+
+Toma como base la función anterior, si bien fue desarrollada considerando su aplicación sobre grandes conjuntos de datos, realizando muestreos aleatorios en lugar de usar el total de los datos.
+También permite una salida *fuzzy*.
+
+```{r}
+met <- "MiniBatchKmeans"
+
+classtime[[met]] <- system.time({
+  classout <- ClusterR::MiniBatchKmeans(data = smu$smu1, clusters = search_space, batch_size = nrow(smu$smu1)*0.25, num_init = 30, 
+                                        max_iters = 100, initializer = "kmeans++")
+})
+
+print(object.size(classout), units="auto")
+
+saveRDS(classout, file = path(proj$res, paste("class", met, sep="-"), ext = "rds"))
+```
+
+Durante la ejecución se produce un uso de CPU de un sólo núcleo (~12%) y de un uso inapreciable de memoria RAM (~2GB).
+
+```{r}
+classout_clusters <- ClusterR::predict_MBatchKMeans(smu$smu1, classout$centroids, fuzzy = TRUE)
+clusterast(classout_clusters$clusters, .pth = path(proj$met, paste("class", met, sep = "-"), ext = "tiff"))
+rm(classout, classout_clusters)
+```
+
+
+
+## Fuzzy k-means Gustafson, Kessel and Babuska with entropy regulation
+
+```{r}
+met <- "FKMgkbent"
+
+classtime[[met]] <- system.time({
+  classout <- fclust::FKM.gkb.ent(X = smu1_proc, k = search_space, ent = 1, RS = 1, stand = 0, maxit = 100 )
+})
+```
+
+Es posible ejecutar la función, pero en una hora aún no ha finalizado. 
+Se pospone para futuros estudios.
+
+
+
+## Fuzzy k-means Gustafson, Kessel and Babuska
+
+```{r}
+met <- "FKMgkb"
+
+classtime[[met]] <- system.time({
+  classout <- fclust::FKMgkb(X = smu1_proc, k = search_space, ent = 1, RS = 1, stand = 0, maxit = 100 )
+})
+```
+
+Es posible ejecutar la función, pero en una hora aún no ha finalizado. 
+Se pospone para futuros estudios.
+
+
+
+## Fuzzy k-medoids
+
+```{r}
+met <- "FKMgkb"
+
+classtime[[met]] <- system.time({
+  classout <- fclust::FKM.med (X = smu1_proc, k = search_space, m = 1.3, RS = 1, stand = 0, maxit = 100)
+})
+```
+
+Es posible ejecutar la función, pero en una hora aún no ha finalizado. 
+Se pospone para futuros estudios.
+
+
+```{r}
+saveRDS(classtime, path(proj$res, "classtime-list", ext = "rds"))
+```
+
+
+
+
+# Comparativa
+
+De entre todos los métodos señalados sólo ha sido posible ejecturar seis: **Kmeans con armadillo**; **Fuzzy k-Means con RcppArmadillo** en dos variantes, completa y por lotes; **C-Means** en dos variantes también; **Clara**; **Clara con distancia euclídea** y **Clara con distancia de Mahalanobis**.
+Estas serán las funciones comparadas definitivamente.
+
+
+## Tiempos de ejecución
+
+```{r}
+classtime <- readRDS(path(proj$res, "classtime-list", ext = "rds"))
+```
+
+
+```{r}
+# From list to table of results
+classtime <- map(classtime, matrix, ncol = 5) %>% 
+  bind_rows() %>% 
+  t() %>% 
+  as_tibble(rownames = "clastp") %>% 
+  select(clastp, user = V1, sytem = V2, elapsed = V3)
+
+saveRDS(classtime, path(proj$res, "classtime", ext = "rds"))
+```
+
+```{r}
+# Tabla formatting
+classtime %>% 
+  knitr::kable(caption = "Los tiempos de ejecución de los diferentes métodos son dispares, kmeans_arma es casi instantáneo frente a los 25 minutos de Clara",
+               digits = 2, col.names = c("Método", "user", "system", "elapsed"), align = c("lccc") ) %>% 
+  kable_styling(bootstrap_options = c("striped"), full_width = TRUE, position = "center")
+```
+
+
+```{r}
+# Plotting the same results
+fig <- classtime %>% 
+  mutate(clastp = factor(clastp), 
+         clastp = factor(clastp, levels = rev(levels(clastp))) ) %>% 
+ggplot() +
+  geom_bar(aes(clastp, elapsed), stat = "identity") +
+  labs(x = "Método de clasificación", y = "Tiempo (s)") +
+  coord_flip()
+
+ggsave(filename = path(proj$img, "classtime", ext = "svg"), plot = fig)
+```
+
+```{r, eval=TRUE, echo=FALSE, fig.cap='C-Means es el método más rápido de clasificación no supervisado.'}
+knitr::include_graphics( path_wd(proj$img, "classtime", ext = "svg") )
+```
+
+Los tiempos de ejecución de los diferentes métodos son muy dispares entre sí, **kmeans_arma** es casi instantáneo frente a los 25 minutos de **Clara** sin paralelización. 
+
+En primer lugar, **cmeans** y **KMeans_arma** cuentan con tiempos de ejecución muy rápidos, prácticamente inapreciables. 
+Un segundo grupo compuesto por las versiones de **KMeans con Armadillo** y **ufcl**, la variante online de *cmeans*, se computaron en un rango de entre 1 y 3 minutos. 
+En este caso, las dos versiones de **KMeans con RcppArmadillo** tienen resultados y un uso de recursos muy parejos, por lo que la versión en lotes en este caso no supondría una ventaja añadida.
+
+Por último, las diferentes versiones de **Clara**, donde todas tuvieron tiempos por encima de los 6 minutos y hasta las 25 minutos para el mismo área. 
+Las versiones más eficientes son las recogidas en el paquete **ClusterR**, que permite su paralelización, y que se aprecia notablemente. 
+
+
+## Visualización 
+
+También se consdiera el análisis visual de los grupos y su sentido espacial y edafológico para cada función aplicada y que se realiza a través de *QGIS*.
+Para ello, se han coloreado los grupos con patrones similares con los mismos colores, buscando facilitar las comparativas.
+
+Lo primero que llama la atención es cómo los grupos de funciones de tiempos similares de cálculo han devuelto resultados gráficos muy similares en cuanto al patrón. 
+
+Por un lado estarían las dos variantes **Kmeans con RcppArmadillo**, con un resultado prácticamente idéntico, y **ufcl** muy similar aunque menos uniforme. 
+En todas ellas, el sentido edáfico es muy limitado ya que i) otorga una gran homogeneidad para zonas visiblemente diferentes y ii) además, no se detectan correctamente suelos descabezados.
+Por todo ello, no parece recomendable su uso.
+
+Después el grupo de **cmeans** y **Kmeans Armadillo**, que cuentan con un patrón espacial mejor definido y mayor detalle, aunque también ciertas limitaciones edafológicas. 
+Resulta llamativo el cambio tan drástico del patrón espacial respecto al grupo anterior, siendo este calculado en mucho menos tiempo.
+Este grupo, además, actúa de unión con el siguiente grupo considerando sus patrones espaciales, pues guardan ciertas similitudes.
+
+Por último, el grupo **Clara** en general da lugar a una progresión de patrones más complejos y, a priori, algo más cercanos a la realidad material. 
+Esto podría relacionarse con el uso de meoides, a diferencia de los otros grupos o con las distancias establecidas para el cálculo.
+Dentro del grupo **Clara** y **Clara con distancia euclídea** devuelven resultados muy similares, lo cual tendría sentido en la medida en que ambos se calculan con la misma distancia aunque mediante paquetes diferentes.
+**Clara con distancia de Mahalanobis** es quizás quien devulve un patrón más complejo y detallado, si bien no llegaría a ser considerado ruido y su uso parecería interesante.
+
+
+```{r}
+# Plotting the rasters
+classplot <- foreach(i = classtime$clastp) %do% {
+    ctl <- raster( path(proj$met, paste("class", i, sep = "-"), ext = "tif") )
+    
+    ctl <- tm_shape(ctl) +
+      tm_grid(alpha = 0.25, labels.inside.frame = FALSE) +
+      tm_raster(palette = "Set1", style = "cat", title = " ") +
+      tm_layout(main.title = i, inner.margins = rep(0.05, 2), outer.margins = c(0.01, 0.08, 0.01, 0.04),
+                legend.position = c("left", "top"), bg.color = "grey85")  +
+      tm_scale_bar(width = 0.15, position = c("left", "bottom")) +
+      tm_compass(type = "arrow", position = c("right", "top"))
+    
+    ctl
+  }
+
+classfig <- classtime %>%
+  mutate(fig = path(proj$img, paste("class", clastp, sep = "-"), ext = "png")) %>% 
+  select(fig) %>% 
+  flatten_chr()
+
+walk2(classplot, classfig, tmap_save) # Walk doesn't give any result, compared to map.
+```
+
+
+```{r}
+# Cropping images usign Image Magick pack
+for (f in classfig) {
+  glue("convert {path_wd(f)} -shave 85x60 {path_wd(f)}") %>% # Width x height
+    system()
+}
+
+blocks <- split(classtime$clastp, rep(1:4, each = 2))
+
+# Appending both images side by side
+for (i in seq_along(blocks)) {
+  glue("convert {img} +append {out}",
+       img = paste( path_wd(proj$img, paste("class", blocks[[i]], sep = "-"), ext = "png"), collapse = " " ),
+       out = path_wd(proj$img, paste("class", i, sep = "-"), ext = "png") ) %>%
+    system()
+}
+
+glue("convert {img} -append {out}",
+       img = paste( path_wd(proj$img, paste("class", c(1:length(blocks)), sep = "-"), ext = "png"), collapse = " " ),
+       out = path_wd(proj$img, "classtp", ext = "png") ) %>%
+    system()
+```
+
+
+```{r}
+# Deleting unnecessary files
+classfig %>% 
+  append(paste( path_wd(proj$img, paste("class", c(1:length(blocks)), sep = "-"), ext = "png"))) %>% 
+  file_delete()
+```
+
+```{r, eval=TRUE, echo=FALSE, out.width='100%', fig.cap='Expresión espacial de las clasificaciones seleccionadas en la SMU J25C.'}
+knitr::include_graphics( path_wd(proj$img, "classtp", ext = "png"))
+```
+
+
+## Selección
+
+Considerando los juicios establecidos respecto los tiempos de ejecución de las funciones así como sobre la visualización de los grupos delineados, se preferiría el empleo de las funciones **ClusterR::Clara_Meoids** con sus variables de distancias y **cmeans**.
+
+Entre ellos, se ha observa que **cmeans** y **Clara con distancia euclídea** crean grupos más gruesos y aparentemente con menos detalle frente a **Clara con distancia de Mahalanobis**.
+Considerando que las dos primeras están caracterizadas por la **distancia euclídea**, cabría entender que la distancia entre los individuos-píxeles tiene un peso mayor que el empleo de *centroides* o *meoides*, si bien la diferencia entre estos algorítmos siempre es a favor de *Clara*
+
+Por otro lado, **Clara con distancia de Mahalanobis** es uno de los métodos más pesados de computación incluso con paralelización. 
+La clasificación es el núcleo central de la desagregación y se ejecuta una única vez por cada SMU, por lo que se entiende es preferible favorecer la visualiación sobre el tiempo de cálculo. 
+En definitiva, el resultado final tendrá una duración mucho mayor que el proceso de cálculo y justificaría ese tiempo extra.
+
+Por todo ello, se opta por **Clara con distancia de Mahalanobis** como método.
+
+
+
+
+
+# Metodología de implementación
+
+A continuación se estudia la implementación de la función `ClusterR::Clara_Medoids`, siguiendo los pasos de aplicación recomendados [@Kassambara2017PracticalGuideCluster].
+
+
+## Tendencía de agrupamiento
+
+En primer lugar, se realiza un análisis visual preliminar que busca encontrar tendencias de agrupamiento. 
+Las fórmulas disponibles para aplicar dichas técnicas están limitadas por el tamaño máximo de matriz capaz de analizar. 
+Por eso, se reduce su tamaño al 1% (~2700pix).
+
+```{r}
+smp <- sampling(smu$smu1)
+```
+
+```{r}
+set.seed(5432)
+smu[["sub"]] <- smu$smu1[sample(x = 1:nrow(smu$smu1), size = (nrow(smu$smu1)*smp$p/10), replace = FALSE ), ]
+```
+
+```{r}
+#fclust::VAT(smu$sub)
+
+# Run-time: Instantaneous + 20s of plotting
+set.seed(5432)
+pic <- factoextra::fviz_dist(dist(smu$sub, method = "euclidean"), 
+                      show_labels = FALSE) +
+   labs(title = "VAT. Euclidean distance")
+
+pth <- path(proj$img, "vat", ext = "png")
+ggsave(filename = pth, plot = pic)
+```
+
+```{r}
+# Appending both images side by side
+glue("convert {img} -filter Lanczos -resize 50% {out}",
+     img = path_wd(pth),
+     out = path_wd(pth)) %>%
+  system()
+```
+
+
+```{r, eval=TRUE, echo=FALSE, fig.cap='Se intuye la tendencia de agrupamiento de un subconjunto de los datos, formando entre 4 y 5 bloques.'}
+knitr::include_graphics( path_wd(proj$img, "vat", ext = "png"))
+```
+
+Se puede intuir la formación de entre **4~5** bloques en el gráfico de distancias.
+En cualquier caso, se continua con la metodología.
+
+
+
+## Número óptimo de grupos (Validación interna)
+
+Los [test de validación][optmet] se basan en la clasificación sobre un rango de número de agrupaciones posibles y analizando a posteriori diferentes métricas y métodos. 
+
+[optmet]: <https://www.datanovia.com/en/lessons/determining-the-optimal-number-of-clusters-3-must-know-methods/>
+
+Con el fin de optimizar y hacer más eficiente la búsqueda, se determinar ese rango inicial en base al número y las proporciones de las STU descritas en cada SMU de la leyenda del mapa.
+
+```{sql, connection=con, output.var="range"}
+-- Number of inclusions and its areal proportion within the SMU
+WITH inc AS (
+  SELECT smu1_id, count(*) as ninc
+  FROM smu1_stu
+  WHERE stupc IS NOT NULL AND smu1_id ILIKE ?smu1_tb
+  GROUP BY smu1_id
+), j AS (
+  SELECT smu1_id, count(*) as nstu
+  FROM smu1_stu
+  WHERE stupc IS NOT NULL AND smu1_id ILIKE ?smu1_tb
+  GROUP BY smu1_id
+)
+SELECT smu1_id, ninc, nstu
+FROM j LEFT JOIN inc USING (smu1_id)
+```
+
+Así, **el número mínimo de grupos a evaluar equivaldrá al número de STU y el máximo será la unión entre STU e inclusiones**.
+
+```{r}
+search_space = as.integer(seq(range$nstu, (range$nstu+range$ninc+1)))
+```
+
+
+### Test visuales 
+
+Una alternativa sería generar contrastes visuales mediante gráficas.
+
+#### Test del codo (*Elbow test*)
+
+Por ejemplo, *el método del codo* que analiza la varianza explicada entre cada grupo.
+Se busca un punto de inflexión en la representación de la variación intra-cluster, que mide la compactación de los agrupamientos.
+
+```{r}
+set.seed(5432)
+smu[["sub"]]  <- smu$smu1[sample(x = 1:nrow(smu$smu1), size = (nrow(smu$smu1)*smp$p), replace = FALSE ), ]
+```
+
+```{r}
+# Run-time: ~3min for 0.07 (10^4*1.75)
+# Elbow method
+set.seed(1234)
+pic <- factoextra::fviz_nbclust(smu$sub, cluster::clara, k.max = max(search_space), method = "wss") 
+ggsave(filename = path(proj$img, "elbow_test", ext = "svg"), plot = pic)
+
+pic <- pic +
+  geom_vline(xintercept = 4, linetype = 2) +
+  labs(subtitle = "Elbow method")
+ggsave(filename = path(proj$img, "elbow_test", ext = "svg"), plot = pic)
+```
+
+```{r, eval=TRUE, echo=FALSE, fig.cap='Se produce un punto de inflexión en el valor 4, que se toma como referencia.'}
+knitr::include_graphics( path_wd(proj$img, "elbow_test", ext = "svg"))
+```
+
+Para este caso, este punto estaría en torno a **4**, lo que además guarda relación con el test de tendencia de agrupamiento.
+
+#### Método de la silueta (*Silhouette method*)
+
+Este método valora la calidad del agrupamiento al determinar lo bien que un individuo es recogido en un grupo.
+Esta será mejor cuanto mayor sea la media del ancho de silueta.
+Así, el número óptimo de grupos será aquel que maximice este valor sobre el rango de todos los grupos posibles.
+
+```{r}
+# Run-time: ~30s
+# Silhouette method
+set.seed(5432)
+pic <- factoextra::fviz_nbclust(smu$sub, cluster::clara, k.max = max(search_space), method = "silhouette") +
+  labs(subtitle = "Silhouette method")
+ggsave(filename = path(proj$img, "silhouette_method", ext = "svg"), plot = pic)
+
+pic <- pic +
+  geom_vline(xintercept = 6, linetype = 2)
+ggsave(filename = path(proj$img, "silhouette_method", ext = "svg"), plot = pic)
+```
+
+```{r, eval=TRUE, echo=FALSE, fig.cap='Un máximo en 2, con otro más reducido en torno a 6, que sería el elegido.'}
+knitr::include_graphics( path_wd(proj$img, "silhouette_method", ext = "svg"))
+```
+
+En este caso, el valor determinado es **2** y segunda instancia **6**, ligeramente diferente a los test previos.
+
+#### Estadístico gap (**Gap statistic**)
+
+El **estadístico gap** compara la varianción total intra-cluster para diferentes números de grupos con sus respectivos valores con distribuciones aleatorias, esto es, donde la estructura de los clusters esté lo más alejada de una distribución uniforme aleatoria.
+El número óptimo será aquel donde el estadístico se maximice.
+
+```{r}
+# Run-time: ~5min for nboot 10
+
+# Gap statistic
+# nboot = 50 to keep the function speedy. 
+# recommended value: nboot= 500 for your analysis.
+# Use verbose = FALSE to hide computing progression.
+set.seed(5432)
+pic <- factoextra::fviz_nbclust(smu$sub, cluster::clara, k.max = max(search_space), method = "gap_stat", nboot = 10) +
+  labs(subtitle = "Gap statistic method")
+ggsave(filename = path(proj$img, "gap_statistic", ext = "svg"), plot = pic)
+
+pic <- pic + 
+  geom_vline(xintercept = 4, linetype = 2)
+
+ggsave(filename = path(proj$img, "gap_statistic", ext = "svg"), plot = pic)
+```
+
+```{r, eval=TRUE, echo=FALSE, fig.cap='4 resulta el de mayor valor y punto de inflexión '}
+knitr::include_graphics( path_wd(proj$img, "gap_statistic", ext = "svg"))
+```
+
+**4** resulta el de mayor valor y punto de inflexión, si bien no es claro y guarda distancia con los análisis previos, y sería el elegido.
+
+#### Resumen
+
+Los índices no tienen porqué coincidir y queda a disposición del analista-cartógrafo el sentido real. 
+En este caso, los valores más repetidos son **5** y **4**, que serán los números de grupos considerados durante el resto de pruebas.
+
+
+### Índices numéricos
+
+Otra opción es el uso de múltiples índices numéricos simultáneamente, decidiendo el número de grupos por mayoría. 
+Existen diferentes funciones que compilan diversos índices.
+
+> Más métodos 
+
+```{r}
+ClusterR::Optimal_Clusters_Medoids()
+```
+
+
+```{r}
+# Run-time: ~3 min
+set.seed(5432)
+smu[["sub"]] <- smu$smu1[sample(x = 1:nrow(smu$smu1), size = (nrow(smu$smu1)*smp$p/5), replace = FALSE ), ]
+
+# NbClust
+set.seed(5432)
+clt_num <- NbClust::NbClust(data = smu$sub, method = "kmeans", min.nc = min(search_space), max.nc = max(search_space))
+
+saveRDS(clt_num, path(proj$res, "nbclust", ext = "rds"))
+```
+
+
+```{r}
+clt_num$Best.nc[1,] %>% 
+  table() %>% 
+  .[names(.) != 0] %>%
+  as_tibble() %>%
+  mutate(k = as.numeric(.), 
+         n = ifelse(k == 5, n+2, n)) %>% 
+  select(k, n) %>% 
+  knitr::kable(caption = "El número de grupos señalado con mayor frecuencia por los índices numéricos es 3, seguido de 5.", 
+                digits = 0, col.names = c("Grupo", "Frecuencia"), align = c("c") ) %>%
+  row_spec(c(1, 3), bold = TRUE, background = RColorBrewer::brewer.pal(9, "OrRd")[1]) %>% 
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+En este caso, el número de grupos señalado con mayor frecuencia por los índices numéricos es 3, seguido de 5.
+Este valor vuelve a guardar consonancia con los visuales, que señalaban **5** como el número de grupos óptimos 
+
+
+### Regla empírica
+
+Por último, cuando no se dispusiese de comprobaciones visuales o índices, se podría optar por utilizar una regla predefinida en base a las STU descritos en la leyenda del mapa. 
+Por ejemplo, el número de grupos vendría determinado por el número de STU más cierto número determinado por las características de las inclusiones. Por ejemplo,
+
+1. Cuando el porcentaje es inferior al 10%, ningún grupo extra (<10% = 0).
+
+1. Cuando el porcentaje es superior o igual al 10%, 1 grupo extra (≥10% = 1)
+
+```{r}
+as.integer(sstu$n + ifelse(sinc$stupcinc < 10, 0, 1))
+```
+
+
+### Número de grupos definitivo
+
+Se han considerado los valores de los índices visuales y numéricos para determinar el número de grupos definitivo, que será **5**.
+
+
+## Clasificación
+
+Se ejecuta la clasificación mediante **Clara con distanciad de Mahalanobis**, en su modadlidad **fuzzy**, buscando el número de grupos determiando previamente. 
+El resultado final será un raster con dichos grupos delineados.
+
+```{r}
+# Samples size is given in percentage, so it should be calculated before hand to not to exceede maximum. 
+smp <- sampling(smu$smu1)
+smp[["s"]] <- 8
+
+# Run-time: ~8min for half of the samples
+classout <- ClusterR::Clara_Medoids(data = smu$smu1, clusters = 5, samples = smp$s, sample_size = smp$p, 
+                                   distance_metric = "mahalanobis", threads = 12, swap_phase = TRUE, fuzzy = TRUE)
+
+print(object.size(classout$dissimilarity_matrix), units="auto")
+classout$dissimilarity_matrix <- NULL
+gc()
+```
+
+```{r}
+clusterast(classout$clusters, .pth = path("gis", "class", ext = "tif"))
+```
+
+
+```{r}
+clt <- raster(path("gis", "class", ext = "tif"))
+
+clt <- tm_shape(ctl) +
+  tm_grid(alpha = 0.25, labels.inside.frame = FALSE) +
+  tm_raster(palette = "Set3", style = "cat", title = " ") +
+  tm_layout(main.title = paste0("SMU ", smu1_sel, " division"), inner.margins = rep(0.05, 2), outer.margins = c(0.01, 0.08, 0.01, 0.04),
+            legend.position = c("left", "top"), bg.color = "grey85")  +
+  tm_scale_bar(width = 0.15, position = c("left", "bottom")) +
+  tm_compass(type = "arrow", position = c("right", "top"))
+
+pth <- path(proj$img, "class", ext = "png") 
+tmap_save(clt, filename = pth )
+```
+
+## Validación externa
+
+Una vez se ha calculado la clasificación, guiada por los diferentes índices, es posible evaluar su calidad a posteriori mediante índices de validación externa. 
+Estos permiten contrastar los grupos con diferentes métricas, así como incorporar categorías conocidas a los individuos y compararlas con los grupos asignados. 
+
+### Confusion Index
+
+El **Índice de confusión** cuantifica el grado de incertidumbre en la clasificación.
+Se calcula a través de la diferencia entre los dos grupos con mayores probabilidades para cada individuo con lo que se establece un índice entre 0 y 1, donde 0 es incertidumbre casi nula y 1 es incertidumbre máxima.
+Por este motivo, esta sección sólo puede aplicarse cuando la función devuelve una matríz con porcentajes de participación en los grupos definidos.
+Como la función seleccionada para la clasificación incluye la modalidad *fuzzy*, es posible generar una salida con el **Índice de confusión** sobre la clasificación.
+
+```{r}
+classout_ci <- ci(classout$fuzzy_probs)
+
+clusterast(classout_ci, .pth = path("gis", paste("class", "ci", sep = "-"), ext = "tif"))
+```
+
+> La funciones diseñada está alojada en la sección de **Raster statistics** de las funciones sobre rasters.
+
+```{r}
+clt <- raster(path("gis", paste("class", "ci", sep = "-"), ext = "tif"))
+
+clt <- tm_shape(ctl) +
+  tm_grid(alpha = 0.25, labels.inside.frame = FALSE) +
+  tm_raster(palette = "viridis", style = "cont", contrast = c(0, 0.9), title = " ") +
+  tm_layout(main.title = paste0("SMU ", smu1_sel, ". Confusion Index"), inner.margins = rep(0.05, 2), outer.margins = c(0.01, 0.08, 0.01, 0.04),
+            legend.position = c("left", "top"), bg.color = "grey85")  +
+  tm_scale_bar(width = 0.15, position = c("left", "bottom")) +
+  tm_compass(type = "arrow", position = c("right", "top"))
+
+pth[2] <- path(proj$img, paste("class", "ci", sep = "-"), ext = "png") 
+tmap_save(clt, filename = pth[2] )
+```
+
+
+# Conclusión
+
+Se han buscado y probado diferentes métodos y funciones de clasificación no supervisada de partición con la que realizar la división de las SMU.
+De estos, se ha seleccionado el algorítmo **Clara con distancia de Mahalanobis** para su aplicación dada sus características: genera un patrón con sentido espacial y de calidad, y su tiempo de ejecución es bajo y optimizado mediante paralelización de cálclulos.
+Además, se ha desarrollado la metodología de implementación que incorpora estudios a priori de la tendencia de agrupamiento y el número óptimos de grupos, así como estudios a posteriori de validación externa.
+
+```{r}
+# Cropping images usign Image Magick pack
+for (f in pth) {
+  glue("convert {path_wd(f)} -shave 0x275 {path_wd(f)}") %>%
+    system()
+}
+
+# Appending both images side by side
+glue("convert {img} +append {out}",
+     img = paste(path_wd(pth), collapse = " "),
+     out = path(proj$img, paste0("class-final"), ext = "png")) %>%
+  system()
+
+# Deleting unnecessary files
+file_delete(pth)
+```
+
+```{r, eval=TRUE, echo=FALSE, out.width='92%', fig.cap='Expresión espacial de las clasificaciones seleccionadas en la SMU J25C'}
+knitr::include_graphics( path_wd(proj$img, "class-final", ext = "png"))
+```
+
+
+
+# Bibliografía
+
+::: {#refs}
+:::

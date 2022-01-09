@@ -1,0 +1,1188 @@
+---
+title: "SMU unsupervised division: a first disaggregation step"
+author: "Alberto Lázaro-López"
+date: "8/11/2019"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+abstract: The ultimate goal of the disaggregation project is to develop a high detailed soil mapping taking advantage of the current conventional soil map through the disaggregation of its SMU into homogenous ones. This document tackles the core part which covers the unsupervised classification.
+bibliography: ../ref/dicsm.bib
+---
+
+```{r core, include=FALSE }
+for (.i in paste0("src/", c("spatial", "dbms", "core", "raster"), ".R" ) ) source(.i)
+
+proj <- dir_ls(regexp = "division") %>% 
+  .proj_subdir()
+```
+
+
+# Introducción
+
+El objetivo último del proyecto es desarrollar una cartografía de suelos de alta resolución aprovechando un mapa de suelos convencional semi-detallado ya elaborado y mediante la desagregación de sus SMU politáxicas en monotáxicas.
+Utilizando el concepto del modelo suelo~paisaje, proponemos buscar áreas potencialmente homogéneas que se relacionen posteriormente con clases de suelos mediante métodos de clasificación no supervisados, partiendo de las SMU de un mapa de suelos convencional.
+
+La búsqueda de estás áreas potenciales se ajustaría a los límites de las SMU primarias, buscando el beneficio del trabajo de integración de variables realizado por el cartógrafo y para reducir la variabilidad a organizar. 
+Así, se aplicaría el método de clasificación no supervisado **Clara con distancia de Mahalanobis** por cada grupo de delineaciones pertenecientes a una SMU primaria del **mapa de suelos refinado** y sobre el conjunto de covariables que ha sido definido previamente para el proyecto.
+La elección de este método de clasificación específico está recogida en detalle en el anexos correspondiente, **clasificación no supervisada por partición**.
+
+El resultado serán polígonos vectoriales que delimitarán las nuevas áreas potencialmente homogéneas asociados a las SMU primarias, pero sin ser asociaciados con las STU. 
+
+En definitiva, se trata de una propuesta metodológica altamente adaptada a cada unidad cartográfica, que recoge los características concretas y busca explotarlas en la clasificación de la variabilidad intrínseca de las SMU.
+
+
+
+# Consideraciones previas
+
+## Parámetros de la clasificación
+
+Durante la fase de división se aplica el método de clasificación no supervisado seleccionado durante las pruebas recogidas en el anexo específico, **Clara con distancia de Mahalanobis**, sobre el conjunto de variables número **2** por cada una de las SMU primarias.
+
+```{r, eval=TRUE}
+div <- list("met" = "clara", 
+            "sel" = 2)
+
+proj[["data"]] <- path("data", paste0("division-", paste(div$met, div$sel, sep = "_")))
+``` 
+
+## SMUs 
+
+Como primera aproximación se ha considerado aplicar esta metodología en un conjunto reducido de SMU primarias con una superficie representativa y que cuenten con los recursos suficientes para aplicar la validación posterior consistentemente.
+Por eso, se toma una serie de SMU primarias cuyo número de perfiles totales utilizados sea el máximo posible y, a la vez, representen la mayor superficie del total del mapa.
+
+```{sql, connection=con}
+CREATE MATERIALIZED VIEW IF NOT EXISTS division.smu1_analysis AS
+WITH smu1_pf AS (
+SELECT smu1_id, count(*) AS n
+FROM soil_smu1, pf
+WHERE ST_Covers(soil_smu1.geom, pf.geom)
+GROUP BY smu1_id
+ORDER BY n DESC 
+), smu1_area AS (
+	SELECT smu1_id, (ST_Area(geom)/10^4)::numeric(7,2) as area
+	FROM soil_smu1
+), smu1_ratio AS (
+	SELECT smu1_id, area, (area/n)::numeric(7,2) as ratio, n, sum(area) over () as area_tot
+	FROM smu1_area LEFT JOIN smu1_pf USING (smu1_id)
+	ORDER BY ratio ASC
+)	
+
+SELECT smu1_id, area, (area/area_tot)::numeric(7,2) as area_per, n, ratio, sum(area/area_tot) over (order by n DESC NULLS LAST)::numeric(7,2) as per_acum
+FROM soil_smu1 JOIN smu1_ratio USING (smu1_id)
+WHERE smu1_id !~* 'jm.*'
+```
+
+```{r}
+smu1_set <- RPostgres::dbGetQuery(con, "
+  SELECT *
+  FROM division.smu1_analysis
+  ORDER BY smu1_id
+  ") %>% 
+  mutate(smu1_id = tolower(smu1_id))
+```
+
+
+### Conjunto reducido de SMUs
+
+El resultado se expresa en un gráfico de barras con la superficie acumulada representada por las SMU primarias que recogen mayor número de perfiles descritos.
+
+```{r}
+ggplot(data = smu1_set) +
+  geom_col(aes(x = factor(smu1_id, levels = smu1_set$smu1_id), 
+               y = per_acum))
+```
+
+A partir de él, se observa como las primeras 4 SMU superan el 25% del total de la superficie del mapa y las 10 primeras, el 50%. 
+Además, se visualiza su localización a través de QGIS.
+
+Se considera adecuado utilizar las 10 SMU primarias que acumulan el **50%** de la superficie del mapa y que, a la vez, sólo representan el **23%** del número total de SMU primarias.
+
+```{sql, connection=con}
+CREATE OR REPLACE VIEW division.smu1_set AS
+WITH smu1set AS /*MATERIALIZED*/ (SELECT *
+FROM smu1_analysis
+LIMIT 10)
+
+SELECT smu1_id 
+from smu1set
+```
+
+```{r, eval=TRUE}
+smu1_set <- smu1_set %>% 
+  slice(1:10) %>% 
+  arrange(smu1_id)
+```
+
+### Resto de SMUs
+
+Cuando se aplica al resto de SMU se excluyen las ya hechas.
+
+```{r, eval=TRUE}
+smu1_set <- smu1_set %>% 
+  slice(-1:-10) %>% 
+  arrange(smu1_id)
+```
+
+
+
+## Preparación de los datos por SMU primarias seleccionadas
+
+Las covariables apiladas y aisladas por SMU se preparan en la base de datos y se exportan para facilitar su manejo a un formato archivo.
+
+```{r}
+# Path to raster files
+smu1_set <- smu1_set %>% 
+  mutate(path = path("tmp", paste("smu1", div$sel, sep = "_"), smu1_id, ext = "tiff") )
+
+dir_create(path_dir(smu1_set$path[[1]]))
+```
+
+
+```{r}
+# Run-time: ~20 min
+# Schema to hold new tables
+sch <- paste("covars", div$sel, sep = "_")
+RPostgres::dbExecute(con, glue_sql("CREATE SCHEMA IF NOT EXISTS {`sch`}", .con = conGIS) )
+RPostgres::dbExecute(con, glue_sql("COMMENT ON SCHEMA {`sch`} IS {comment}",
+                             comment = paste("Covariates of selection", div$sel,"by primary SMU.", sep = " "), .con = conGIS) )
+
+# New raster table for every primary SMU
+db <- foreach(id = smu1_set$smu1_id, .final = function(l) setNames(l, smu1_set$smu1_id) ) %do% {
+  RPostgres::dbExecute(con, glue_sql("CREATE TABLE IF NOT EXISTS {`sch`}.{`id`} (LIKE covars._covar_rast) ", .con = conGIS) )
+}
+
+# db connections to allow parallelisation
+dbconX <- foreach(id = smu1_set$smu1_id, .final = function(l) setNames(l, smu1_set$smu1_id) ) %do% {
+  RPostgres::dbConnect(odbc::odbc(), driver = "PostgreSQL Driver", 
+                      database = "dicsm", UID = keyring::key_list("psql-su")[1,2], PWD = keyring::key_get("psql-su"), host = "localhost", 
+                      port = 5432, bigint = "numeric")
+}
+
+# Arrange SMU so paralellisation is balanced
+smu1_set <- smu1_set %>% 
+  arrange(desc(area))
+
+# Create covariates stack for every primary SMU
+db <- foreach(id = smu1_set$smu1_id, dbcon = dbconX, 
+              .final = function(l) setNames(l, smu1_set$smu1_id),
+              .errorhandling = "pass" ) %dopar% {
+    RPostgres::dbExecute(dbcon, glue_sql(
+    "INSERT INTO {`sch`}.{`id`}
+    WITH selection AS (
+      SELECT covar_id
+      FROM covar_select
+      WHERE select_id = {div$sel}
+    )
+  
+    SELECT row_number() over() as rid, st_addband(NULL, array_agg(rast)) AS rast
+    FROM (SELECT cvb.tableoid::regclass::character varying::text AS covar_id, ST_UpperLeftX(rast) AS upx,
+    			  ST_UpperLeftY(rast) AS upy, st_clip(rast, geom) AS rast
+      	  FROM  _covar_rast AS cvb, soilref_smu1
+      	  WHERE smu1_id ~* {toupper(id)} AND st_intersects(rast, geom)
+      	  ORDER BY upx, upy, covar_id ASC ) AS cv -- ORDER BY to make sure alphabetically bands order
+    WHERE covar_id IN (SELECT * FROM selection)
+    GROUP BY upx, upy", .con = dbconX[[1]]) )
+}
+
+# Create raster constrains for every primary SMU
+db <- foreach(id = smu1_set$smu1_id, dbcon = dbconX, 
+              .final = function(l) setNames(l, smu1_set$smu1_id) ) %dopar% {
+    RPostgres::dbExecute(dbcon, glue_sql("SELECT AddRasterConstraints({sch}::name, {id}::name, 'rast'::name)", .con = dbcon) )
+}
+
+# Release db connections
+db <- foreach(dbcon = dbconX, .final = function(l) setNames(l, smu1_set$smu1_id) ) %do% {
+  RPostgres::dbDisconnect(dbcon)
+}
+rm(dbconX, dbcon)
+
+# Original order
+smu1_set <- smu1_set %>% 
+  arrange(smu1_id)
+```
+
+```{r}
+# Export them
+db <- foreach(id = smu1_set$smu1_id, 
+              .final = function(l) setNames(l, smu1_set$smu1_id) ) %do% {
+  glue('gdal_translate -of GTiff -a_srs EPSG:25830 "{pgis}" {file}',
+       pgis = pgiscon(.tb = id, .sch = paste("covars", div$sel, sep = "_")),
+       file = path_wd(filter(smu1_set, smu1_id == id)$path) ) %>% 
+    system()
+}
+```
+
+```{r}
+# Drop no longer needed stacked raster in the db
+RPostgres::dbExecute(con, glue_sql("DROP SCHEMA IF EXISTS {`sch`} CASCADE",
+                             sch = paste('covars', div$sel, sep = '_'), .con = conGIS) )
+```
+
+
+```{r}
+# Set of stacked covariates 
+covars <- RPostgres::dbGetQuery(con, glue_sql(
+  "SELECT covar_id
+  FROM covar_select
+  WHERE select_id = {div$sel*}
+  ORDER BY covar_id ASC", .con = conGIS) )
+```
+
+
+
+
+
+
+# División de las SMUs en grupos
+
+La división por clasificación contempla diferentes etapas secuenciales, cuya definición e implementación para una SMU primaria queda recogida en el anexo específico de métodos de *clasificación no supervisados de partición*.
+Se decide que la aplicación de esta metodología sobre un grupo de SMU primarias sea en serie por etapas, buscando optimizar los tiempos de ejecución y la definición del código.
+
+Este proceso dará lugar a resultados parciales por cada SMU que incluirán:
+
+* Número de grupos a buscar
+* Raster de grupos asignados con mayor probabilidad.
+* Media y desviación estándar de las covariables por cada SMU primaria.
+* Meoides desescalados
+* Localización de los centroides.
+* Raster de **Índice de Confusión** entre los dos grupos de mayor probabilidad por cada pixel (*Confusion Index*).
+* Las características de la clasificación.
+
+
+## Número de subgrupos 
+
+En primer lugar, se define el número de grupos a hallar durante la clasificación no supervisada. 
+La búsqueda se ejecuta mediante el múltiples índices numéricos simultáneamente que ayudarám a decidir el número de grupos por mayoría. 
+En el documento anexo de **métodos de clasificación no supervisada** se incluye el uso índices visuales también, pero considerando que su valoración es semejante a la obtenida por los índices numéricos, que suponen un número reducido respecto al total calculado, 3 respecto a 30, y su tiempo de ejecución es más elevado, se opta por omitirlos y calcular únicamente los índices numéricos para apoyar la decisión.
+
+Con el fin de optimizar y hacer más eficiente la búsqueda, se determinar el rango inicial en base al número y las proporciones de las STU descritas en cada SMU de la leyenda del mapa.
+Así, **el número mínimo de grupos a evaluar equivaldrá al número de STU y el máximo será la unión entre STU e inclusiones**.
+
+```{sql, connection=con}
+CREATE OR REPLACE VIEW division.smu1_range AS
+-- Number of STU and inclusions in every primary SMU
+WITH inc AS (
+  SELECT smu1_id, count(*) as ninc
+  FROM smu1_stu
+  WHERE stupc IS NULL
+  GROUP BY smu1_id
+), j AS (
+  SELECT smu1_id, count(*) as nstu
+  FROM smu1_stu
+  WHERE stupc IS NOT NULL
+  GROUP BY smu1_id
+)
+SELECT smu1_id, nstu, COALESCE(ninc, 0) AS ninc
+FROM j LEFT JOIN inc USING (smu1_id)
+```
+
+```{r}
+range <- RPostgres::dbGetQuery(conGIS, "
+  SELECT *
+  FROM division.smu1_range
+  ")
+
+# Se the range to search in the unsupervised classification for every primary SMU
+smu1_set <- range %>% 
+  transmute(smu1_id = tolower(smu1_id), 
+         min = nstu,
+         max = ifelse(ninc <= 1, nstu+2, nstu+ninc) ) %>% 
+  right_join(smu1_set, by = "smu1_id")
+
+rm(range)
+```
+
+Posteriormente, se ejecuta la búsqueda.
+
+```{r}
+# Run-time: ~6 min/SMU
+# Loop to calculate _best number of clusters_ fbased on 30 indexes on every primary SMU
+dir_ls(path = path("src"), regexp = "nbc") %>% 
+  source()
+
+smu1_nbclust <- foreach(i = smu1_set$smu1_id, 
+                        .final = function(l) setNames(l, smu1_set$smu1_id),
+                        .errorhandling = "pass") %dopar% {
+  # Get raster from database
+  smu1_tb <- filter(smu1_set, smu1_id == i)
+  
+  smu1 <- smu1_tb$path %>% 
+    path_wd() %>% 
+    brick()
+  
+  # Names of bands ~ covariates
+  names(smu1) <- covars$covar_id
+  
+  # Processing of SMU raster
+  smu <- smuproc(smu1)
+  rm(smu1)
+  gc()
+  
+  # Sub-sample settings
+  smp <- sampling(smu$smu1)
+
+  # Search range
+  search_space = as.integer(seq(smu1_tb$min, smu1_tb$max))
+  
+  # Run-time: ~6 min
+  set.seed(5432)
+  smu[["sub"]] <- smu$smu1[sample(x = 1:nrow(smu$smu1), size = (nrow(smu$smu1)*smp$p/4), replace = FALSE ), ]
+  smu[["smu1"]] <- NULL
+  
+  # NbClust
+  #' It can be parallelized if print device isn't defined.
+  set.seed(5432)
+  clt_num <- NbClustPar(data = smu$sub, method = "kmeans", min.nc = min(search_space), max.nc = max(search_space)+1)
+  
+  #png(filename = path(proj$img, paste("nbclust", div$sel, sep = "_"), paste("nbclust", div$sel, i, "%d.png", sep = "-")) )
+  #set.seed(5432)
+  #clt_num <- NbClust::NbClust(data = smu$sub, method = "kmeans", min.nc = min(search_space), max.nc = max(search_space))
+  #dev.off()
+  
+  # Clean
+  rm(smu, smu1, smu1_tb)
+  
+  clt_num
+}
+```
+
+Y se comprueba si existe algún error. 
+La "J31C" lo ha dado y se elimina. 
+Se trata de la SMU colidante con la presa del noreste de la DO.
+
+```{r}
+# Screaning out any error ####
+for (i in names(smu1_nbclust)) {
+  if(is.null(smu1_nbclust[[i]]$message) == FALSE) {
+    #' Delete result
+    smu1_nbclust[[i]] <- NULL
+    #' Delete register
+    smu1_set <- smu1_set %>% 
+      filter(! smu1_id == i)
+    
+    print(i)
+  }
+}
+```
+
+
+Se guardan las figuras de los análisis visuales realizados.
+
+```{r}
+# Saving figures from analysis ####
+#' Create the directory
+dir_create( path(proj$img, paste("nbclust", div$sel, sep = "_")) )
+
+# Saving plots
+for (i in names(smu1_nbclust)) {
+  #' Save raw images (4)
+  pic <- smu1_nbclust[[i]]$pic
+  pt <- path(proj$img, paste("nbclust", div$sel, sep = "_"), paste("nbclust", div$sel, i, names(pic), sep = "-"), ext = "png")
+  
+  walk2(pt, pic, ggsave)
+
+  #' Get names from indexes and set paths
+  idx <- str_split(names(pic), "_", simplify = TRUE)[, 1] %>% 
+    unique()
+  pt_join <- path(proj$img, paste("nbclust", div$sel, sep = "_"), 
+                     paste("nbclust", div$sel, i, idx, sep = "-"), ext = "png") 
+  
+  #' Append same index images side by side
+  for (j in seq_along(idx)) {
+    glue("convert {img} +append {out}",
+       img = paste(pt[str_detect(pt, idx[j])], collapse = " "),
+       out = pt_join[str_detect(pt_join, idx[j])] ) %>%
+    system()
+  }
+
+  #' Append images top to bottom
+  glue("convert {img} -append {out}",
+     img = paste(pt_join, collapse = " "),
+     out = path(proj$img, paste("nbclust", div$sel, sep = "_"), 
+                     paste("nbclust", div$sel, i, sep = "-"), ext = "png") ) %>%
+  system()
+  
+  #' Delete raw and intermediates
+  c(pt, pt_join) %>% 
+    file_delete()
+}
+rm(pic, pt, pt_join, idx, i, j)
+
+
+for (i in names(smu1_nbclust)) {
+  smu1_nbclust[[i]]$pic <- NULL
+}
+```
+
+
+Después, guardan los resultados.
+
+```{r}
+# Save result ####
+#' Path to link
+pt <- path(proj$res, paste("nbclust", div$sel, "list", sep = "-"), ext = "rds")
+
+#' If 
+if (file_exists(pt) == TRUE) {
+  readRDS(pt) %>% 
+    # Erase previous results
+    subset( ! ( names(.) %in% smu1_set$smu1_id ) ) %>% 
+    # And append news (This could be also done with a loop)
+    append(smu1_nbclust) %>% 
+    # And save it
+    saveRDS(pt)
+} else {
+  saveRDS(smu1_nbclust, pt)
+}
+```
+
+
+Se incluye manualmente los resultados de los índices visuales que devuelve el test.
+
+```{r}
+# From list composed by nbclust output to a tibble
+smu1_nbclust <- readRDS(path(proj$res, paste("nbclust", div$sel, "list", sep = "-"), ext = "rds"))
+
+#' Select best number of cluster by index in every primary SMU
+for (i in names(smu1_nbclust)) {
+  smu1_nbclust[[i]] <- smu1_nbclust[[i]]$Best.nc[1, ]
+}
+
+#' Gathering all tables into one
+smu1_nbclust <- smu1_nbclust %>% 
+  map(table) %>% 
+  map(as.data.frame) %>% 
+  map(as_tibble) %>% 
+  map(mutate, Var1 = as.character(Var1)) %>% 
+  bind_rows(.id = "smu1_id") %>% 
+  filter(Var1 != 0)
+```
+
+> *** : The Hubert index is a graphical method of determining the number of clusters. In the plot of Hubert index, we seek a significant knee that corresponds to a significant increase of the value of the measure i.e the significant peak in Hubert index second differences plot. 
+> 
+> *** : The D index is a graphical method of determining the number of clusters. In the plot of D index, we seek a significant knee (the significant peak in Dindex second differences plot) that corresponds to a significant increase of the value of the measure. 
+ 
+
+```{r}
+# Add graphical indexes to the count
+smu1_nbclust <- smu1_nbclust %>% 
+  mutate(Freq = ifelse(smu1_id == "j01c" & Var1 %in% c(4,5), Freq+1, Freq)) %>% 
+  mutate(Freq = ifelse(smu1_id == "j02c" & Var1 %in% c(5,6), Freq+1, Freq)) %>% 
+  mutate(Freq = ifelse(smu1_id == "j03c" & Var1 %in% c(5), Freq+2, Freq)) %>% 
+  mutate(Freq = ifelse(smu1_id == "j04c" & Var1 %in% c(5), Freq+2, Freq)) %>% 
+  mutate(Freq = ifelse(smu1_id == "j05c" & Var1 %in% c(5,7), Freq+1, Freq)) %>% 
+  mutate(Freq = ifelse(smu1_id == "j06c" & Var1 %in% c(4), Freq+2, Freq)) %>% 
+  mutate(Freq = ifelse(smu1_id == "j07c" & Var1 %in% c(6,8), Freq+1, Freq)) %>% 
+  # ---- Start
+  mutate(Freq = ifelse(smu1_id == "j08c" & Var1 %in% c(5), Freq+2, Freq)) %>% 
+  mutate(Freq = ifelse(smu1_id == "j09c" & Var1 %in% c(6,7), Freq+1, Freq)) %>% 
+  mutate(Freq = ifelse(smu1_id == "j10c" & Var1 %in% c(5), Freq+2, Freq)) %>% 
+  ##
+  mutate(Freq = ifelse(smu1_id == "j11c" & Var1 %in% c(4), Freq+2, Freq)) %>% 
+  mutate(Freq = ifelse(smu1_id == "j12c" & Var1 %in% c(6), Freq+2, Freq)) %>% 
+  # ---- Start
+  mutate(Freq = ifelse(smu1_id == "j13c" & Var1 %in% c(5,6), Freq+1, Freq)) %>% 
+  ##
+  mutate(Freq = ifelse(smu1_id == "j14c" & Var1 %in% c(4), Freq+2, Freq)) %>% 
+  mutate(Freq = ifelse(smu1_id == "j15c" & Var1 %in% c(6,7), Freq+1, Freq)) %>% 
+  # ---- Start
+  mutate(Freq = ifelse(smu1_id == "j16c" & Var1 %in% c(5,6), Freq+1, Freq)) %>% 
+  mutate(Freq = ifelse(smu1_id == "j17c" & Var1 %in% c(5,7), Freq+1, Freq)) %>%
+  ##
+  mutate(Freq = ifelse(smu1_id == "j18c" & Var1 %in% c(5,6), Freq+1, Freq)) %>% 
+  mutate(Freq = ifelse(smu1_id == "j19c" & Var1 %in% c(4,5), Freq+1, Freq)) %>% 
+  mutate(Freq = ifelse(smu1_id == "j20c" & Var1 %in% c(5), Freq+2, Freq)) %>%
+  # ---- Start
+  mutate(Freq = ifelse(smu1_id == "j21c" & Var1 %in% c(5), Freq+2, Freq)) %>% 
+  ##
+  mutate(Freq = ifelse(smu1_id == "j22c" & Var1 %in% c(6,7), Freq+1, Freq)) %>% 
+  # ---- Start
+  mutate(Freq = ifelse(smu1_id == "j23c" & Var1 %in% c(5), Freq+2, Freq)) %>% 
+  ##
+  mutate(Freq = ifelse(smu1_id == "j24c" & Var1 %in% c(4,6), Freq+1, Freq)) %>% 
+  mutate(Freq = ifelse(smu1_id == "j25c" & Var1 %in% c(4,5), Freq+1, Freq)) %>% 
+  mutate(Freq = ifelse(smu1_id == "j26c" & Var1 %in% c(5,6), Freq+1, Freq)) %>% 
+  mutate(Freq = ifelse(smu1_id == "j27c" & Var1 %in% c(5,6), Freq+1, Freq)) %>% 
+  mutate(Freq = ifelse(smu1_id == "j28c" & Var1 %in% c(5), Freq+2, Freq)) %>% 
+  # ---- Start
+  mutate(Freq = ifelse(smu1_id == "j29c" & Var1 %in% c(6), Freq+2, Freq)) %>% 
+  ##
+  mutate(Freq = ifelse(smu1_id == "j30c" & Var1 %in% c(6), Freq+2, Freq)) %>%
+  mutate(Freq = ifelse(smu1_id == "j32c" & Var1 %in% c(5,6), Freq+1, Freq)) %>%
+  mutate(Freq = ifelse(smu1_id == "j33c" & Var1 %in% c(5,6), Freq+1, Freq)) %>%
+  mutate(Freq = ifelse(smu1_id == "j34c" & Var1 %in% c(5,6), Freq+1, Freq)) %>%
+  mutate(Freq = ifelse(smu1_id == "j35c" & Var1 %in% c(4,5), Freq+1, Freq)) %>%
+  mutate(Freq = ifelse(smu1_id == "j36c" & Var1 %in% c(5), Freq+2, Freq)) %>%
+  mutate(Freq = ifelse(smu1_id == "j37c" & Var1 %in% c(4), Freq+2, Freq)) %>%
+  mutate(Freq = ifelse(smu1_id == "j38c" & Var1 %in% c(4,5), Freq+1, Freq)) %>%
+  mutate(Freq = ifelse(smu1_id == "j39c" & Var1 %in% c(5), Freq+2, Freq)) %>%
+  mutate(Freq = ifelse(smu1_id == "j40c" & Var1 %in% c(4), Freq+2, Freq)) %>%
+  mutate(Freq = ifelse(smu1_id == "j41c" & Var1 %in% c(4,5), Freq+1, Freq)) %>%
+  mutate(Freq = ifelse(smu1_id == "j42c" & Var1 %in% c(5), Freq+2, Freq)) %>%
+  # ---- Start
+  mutate(Freq = ifelse(smu1_id == "j43c" & Var1 %in% c(6), Freq+2, Freq)) %>% 
+  ##
+  mutate(Freq = ifelse(smu1_id == "j44c" & Var1 %in% c(4), Freq+2, Freq)) %>%
+  mutate(Freq = ifelse(smu1_id == "j45c" & Var1 %in% c(4), Freq+2, Freq)) %>%
+  mutate(Freq = ifelse(smu1_id == "j46c" & Var1 %in% c(5,), Freq+1, Freq))
+  
+saveRDS(smu1_nbclust, path(proj$res, paste("nbclust", div$sel, sep = "-"), ext = "rds"))
+```
+
+Por último, se presenta una tabla resumen de los números de grupos sugeridos por los índices calculados y la frecuencia de aparición por cada SMU primaria. 
+
+```{r}
+smu1_nbclust <- readRDS(path(proj$res, paste("nbclust", div$sel, sep = "-"), ext = "rds"))
+smu1_nbclust <- smu1_nbclust %>% 
+  filter(smu1_id %in% smu1_set$smu1_id)
+
+# Position of most frequent number of cluster within each primary SMU
+smu1_pos <- smu1_nbclust %>% 
+  group_by(smu1_id) %>%
+  #' Highlighted the largest index for the most frequent recommemded
+  mutate(hl = max.col(matrix(Freq,nrow=1),"last")) %>% 
+  ungroup() %>% 
+  arrange(desc(Freq)) %>% 
+  group_by(smu1_id) %>% 
+  #' Select the most frequent numbers of cluster (can be more than one)
+  top_n(1, Freq) %>% 
+  arrange(desc(Var1)) %>% 
+  #' Choose the highest number of clusters (so it can be manually reduced at the final step)
+  slice(1) 
+
+# Number of elements by each primary SMU
+smu1_pack <- smu1_nbclust %>% 
+  count(smu1_id) %>% 
+  rename(cmax = n)
+
+smu1_pos <- inner_join(smu1_pos, smu1_pack, by = "smu1_id")
+
+
+# Named vector with number of rows for each primary SMU.
+smu1_pack <- smu1_pack %>% 
+  select(cmax) %>% 
+  flatten_int()
+
+smu1_pack <- smu1_pos$smu1_id %>% 
+  unique() %>% 
+  setNames(object = smu1_pack, nm = . )
+
+# Named vector for position of highlighted rows
+hl <- 0
+for (j in seq_along(smu1_pos$smu1_id)) {
+  hl[j] <- sum(smu1_pos$cmax[1:j-1]) + smu1_pos$hl[j]
+}
+names(hl) <- smu1_pos$smu1_id
+
+
+smu1_nbclust %>% 
+  select(-smu1_id) %>% 
+  knitr::kable(caption = "Número de grupos señalados con mayor frecuencia por los índices numéricos es 4, seguido de 6.", 
+                digits = 0, align = c("c") ) %>%
+  pack_rows(index = smu1_pack) %>% 
+  row_spec(hl, bold = TRUE, background = RColorBrewer::brewer.pal(9, "OrRd")[1]) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+
+```{r}
+smu1_set <- smu1_pos %>%
+  ungroup() %>% 
+  transmute(smu1_id,
+            nbclust = as.integer(Var1) ) %>% 
+  inner_join(smu1_set, by = "smu1_id")
+```
+
+
+
+## Clasificación
+
+Se ejecuta la clasificación mediante **Clara con distanciad de Mahalanobis**, en su modadlidad **fuzzy**, usando el número de grupos determinado previamente. 
+Esto dará como resultado: 
+
+* Raster de grupos asignados con mayor probabilidad.
+* Las características de la clasificación.
+
+```{r}
+smu1_set <- smu1_set %>% 
+  mutate(class = path(proj$res, paste("clara", div$sel, sep = "_"), paste("clara", div$sel, smu1_id, sep = "-"), ext = "rds"),
+         grp = path(proj$data, "grp", paste("clara", div$sel, smu1_id, "grp", sep = "-"), ext = "tif") )
+
+c(smu1_set$class[1], smu1_set$grp[1]) %>% 
+  path_dir() %>% 
+  dir_create()
+```
+
+```{r}
+# Run-time: ~5 hours half of the map (30 min/SMU for the first 10th)
+for (i in smu1_set$smu1_id) {
+  # Data from raster ####
+  #' Get raster from database
+  smu1_tb <- filter(smu1_set, smu1_id == i)
+  
+  smu1 <- smu1_tb$path %>% 
+    path_wd() %>% 
+    brick()
+  
+  #' Names of bands ~ covariates
+  names(smu1) <- covars$covar_id
+  
+  #' Processing of SMU raster
+  smu <- smuproc(smu1)
+  rm(smu1)
+  gc()
+  
+  #' Sub-sample settings
+  smp <- sampling(smu$smu1)
+  
+  
+  # Classification ####
+  #' Run-time: ~25min
+  classout <- ClusterR::Clara_Medoids(data = smu$smu1, 
+                                      clusters = smu1_tb$nbclust, 
+                                      samples = smp$s, 
+                                      sample_size = smp$p,
+                                      distance_metric = "mahalanobis", 
+                                      threads = 12, 
+                                      swap_phase = TRUE, 
+                                      fuzzy = TRUE)
+  
+  ## Groups
+  #' Create groups raster
+  clusterast(classout$clusters, .pth = smu1_tb$grp)
+  #' Detele associated data
+  classout$clusters <- NULL
+  
+  
+  # Save ####
+  classout$dissimilarity_matrix <- NULL
+  colnames(classout$medoids) <- covars$covar_id
+  
+  saveRDS(classout, smu1_tb$class)
+  
+  
+  # Clean ####
+  gc()
+  rm(classout, smu1_tb, smu, smp)
+}
+```
+
+
+
+## Centroides desescalados y su localización
+
+En este apartado se obtendrán los siguientes resultados: 
+* Media y desviación estándar de las covariables por cada SMU primaria.
+* Meoides desescalados
+* Localización de los centroides.
+
+### Desgranular los resultados
+
+Covariables de los meoides
+
+```{r}
+medoids <- foreach(
+  i = smu1_set$smu1_id, 
+  .final = function(l) setNames(l, smu1_set$smu1_id),
+  .errorhandling = "pass") %dopar% 
+{
+
+  smu1_set %>% 
+    filter(smu1_id == i) %>% 
+    select(class) %>% 
+    flatten_chr() %>% 
+    readRDS() %>%
+    .$medoids %>% 
+    as_tibble() %>%
+    mutate(grp = row_number()) %>% 
+    select(grp, everything())
+}
+
+medoids <- medoids %>% 
+  map(mutate_if, is.numeric, round, digits = 3)
+```
+
+
+Índice de los meoides
+
+```{r}
+medoids_idx <- foreach(
+  i = smu1_set$smu1_id, 
+  .final = function(l) setNames(l, smu1_set$smu1_id),
+  .errorhandling = "pass") %dopar% 
+{
+    
+  smu1_set %>% 
+    filter(smu1_id == i) %>% 
+    select(class) %>% 
+    flatten_chr() %>% 
+    readRDS() %>%
+    .$medoid_indices %>% 
+    as_tibble() %>% 
+    mutate(grp = row_number()) %>% 
+    transmute(grp, idx = value)
+}
+```
+
+
+### Extraer información del raster
+
+```{r}
+smu1_class <- foreach( 
+  i = smu1_set$smu1_id, 
+  .final = function(l) setNames(l, smu1_set$smu1_id), 
+  .errorhandling = "pass") %dopar% 
+{
+    
+  # Data from raster ####
+  #' Get raster from database
+  smu1_tb <- filter(smu1_set, smu1_id == i)
+  smu1_idx <- medoids_idx[[i]]
+  classout <- vector(mode = "list")
+  
+  smu1 <- smu1_tb$path %>% 
+    path_wd() %>% 
+    brick()
+  
+  #' Names of bands ~ covariates
+  names(smu1) <- covars$covar_id
+  
+  #' Matrix
+  pix <- raster::getValues(smu1)
+  colnames(pix) <- covars$covar_id
+  pix <- pix[complete.cases(pix), ]
+  
+  #' Vector holding positions of filled pixels + new raster for groups
+  vec <- vector(mode = "list")
+  vec[["vref"]] <- vec[["clt"]] <- raster(x = smu1, layer = 1)
+  vec[["vref"]] <- Which(!is.na(vec$vref)) %>% 
+    as.vector()
+  names(vec$clt) <- "grp"
+  
+  
+  # Unscale ####
+  uns <- vector(mode = "list")
+  uns[["mean"]] <- colMeans(pix) %>% enframe() 
+  uns[["sd"]] <-  apply(pix, 2, sd)  %>% enframe()
+
+  uns <- map(uns, pivot_wider, names_from = "name", values_from = "value" ) 
+  classout[["uns"]] <- uns
+  
+  
+  # Location ####
+  vec$idx <- vec$vref[vec$vref == TRUE]
+  vec$idx[TRUE] <- 0
+  vec$idx[smu1_idx$idx] <- smu1_idx$grp
+  
+  vec$vref[vec$vref == TRUE] <- vec$idx
+  vec$vref[vec$vref == 0] <- NA
+  
+  vec$clt <- setValues(x = vec$clt, value = vec$vref)
+  classout[["pnt"]] <- rasterToPoints(vec$clt, spatial = TRUE) %>% 
+    st_as_sf() %>% 
+    st_set_crs(25830) %>% 
+    mutate(smu1_id = i) 
+
+  rm(smu1, pix, vec, uns)
+  gc()
+  
+  classout
+}
+```
+
+
+### Localización de centroides
+
+```{r}
+smu1_idx <- smu1_class %>% 
+  map(magrittr::extract2, c("pnt")) # Magrittr aliases 
+  # bind_rows(.id = "smu1_id") Require: dplyr >= 0.9.0 
+
+smu1_idx <- do.call("rbind", smu1_idx) %>% 
+  as_tibble()
+```
+
+```{r, warning=FALSE}
+tbdef <- paste(div$met, div$sel, "ctd", sep = "_")
+
+RPostgres::dbWithTransaction(conGIS, {
+  RPostgres::dbExecute(conGIS, 
+                       glue_sql("CREATE TABLE IF NOT EXISTS division.{`tbdef`}() INHERITS (division._div_ctd)", 
+                                .con = conGIS) )
+  RPostgres::dbExecute(conGIS, 
+                       glue_sql("ALTER TABLE division.{`tbdef`} ADD PRIMARY KEY (smu1_id, grp)", 
+                                .con = conGIS) )
+  RPostgres::dbExecute(conGIS, 
+                       glue_sql("ALTER TABLE division.{`tbdef`} ADD FOREIGN KEY (smu1_id) REFERENCES smu1(smu1_id)", 
+                                .con = conGIS) )
+  glue_sql("
+  CREATE INDEX ON division.{`tbdef`} USING gist (geom) ;", .con = con) %>% dbExecute(conn = con)
+  
+  RPostgres::dbExecute(conGIS, 
+                       glue_sql("COMMENT ON TABLE division.{`tbdef`} IS {comment}",
+                                comment = paste("Groups centroids of CLARA with Mahalanobis distance",
+                                                "on covariates collection", div$sel),
+                                .con = conGIS) )
+  }
+)
+
+smu1_idx <- smu1_idx %>% 
+  rename(geom = geometry) %>% 
+  mutate(smu1_id = toupper(smu1_id)) %>% 
+  select(geom, smu1_id, grp)
+
+st_write(obj = smu1_idx,
+         dsn = conGIS, 
+         Id(schema="division", table = tbdef), 
+         append = TRUE)
+
+```
+
+
+
+### Centroides desescalados
+
+```{r}
+smu1_uns <- smu1_class %>% 
+  map(magrittr::extract2, c("uns")) # Magrittr aliases 
+  # bind_rows(.id = "smu1_id") Require: dplyr >= 0.9.0 
+```
+
+
+```{r}
+# Run-time: ~5 min
+
+for (i in smu1_set$smu1_id) {
+  # Data for primary SMU ####
+  smu1_tb <- filter(smu1_set, smu1_id == i)
+  uns <- magrittr::extract2(smu1_uns, c(i))
+  
+  #' Classification data 
+  classout <- readRDS(smu1_tb$class)
+  
+  #' Unscale data
+  classout[["medoid_mean"]] <- uns$mean
+  classout[["medoid_sd"]] <- uns$sd
+
+  # Save ####
+  saveRDS(classout, smu1_tb$class)
+}
+
+```
+
+
+
+
+## Validación externa
+
+Una vez se ha calculado la clasificación, guiada por los diferentes índices, es posible evaluar su calidad a posteriori mediante índices de validación externa. 
+Estos permiten contrastar los grupos con diferentes métricas, así como incorporar categorías conocidas a los individuos y compararlas con los grupos asignados. 
+
+```{r}
+smu1_set <- smu1_set %>% 
+  mutate(ci = path(proj$data, "ci", paste("clara", div$sel, smu1_id, "ci", sep = "-"), ext = "tif") )
+
+smu1_set$ci[1] %>% 
+  path_dir() %>% 
+  dir_create()
+```
+
+
+### Confusion Index
+
+Uno de esos índices es el denoninado Índice de Confusión (*Confusion Index*), que cuantifica el grado de incertidumbre en la clasificación. Se calcula a través de la diferencia entre los dos grupos con mayores probabilidades para cada individuo con lo que se establece un índice entre 0 y 1, donde 0 es incertidumbre casi nula y 1 es incertidumbre máxima.
+
+```{r}
+# Run-time: ~5 min
+#' Create FORK cluster limited to 6 cores
+registerDoSEQ()
+cores <- makeCluster(6L, "FORK")
+registerDoParallel(cores)
+
+# Run-time: ~8 minutes
+for (i in smu1_set$smu1_id) {
+  # ---- Matrix from raster
+  ## Get raster from database
+  smu1_tb <- filter(smu1_set, smu1_id == i)
+  
+  smu1 <- smu1_tb$grp %>% 
+    path_wd() %>% 
+    brick()
+  
+  ## Processing of SMU raster
+  smu <- smuproc(smu1) 
+  rm(smu1)
+  gc()
+  
+  # ---- Classification data
+  classout <- readRDS(smu1_tb$class)
+  
+  # ---- Confusion Index
+  classout_ci <- ci(classout$fuzzy_probs)
+
+  # ---- Save
+  clusterast(classout_ci, .pth = smu1_tb$ci)
+  classout$fuzzy_probs <- NULL
+  saveRDS(classout, smu1_tb$class)
+}
+
+# Reset to standard cluster
+parallel::stopCluster(cores)
+registerDoParallel(cores = 6L)
+```
+
+
+
+
+
+
+# Registro en la base de datos
+
+Los rasters de ambos tipos producidos durante la clasificación serán registrados en la base de datos para su posterior análisis.
+
+La lógica de gestión es almacenar los rasters como archivos fuera de la base de datos y registrarlos únicamente, de forma que se consiga un acceso rápido y directo desde diferentes aplicaciones del flujo de trabajo y, a la vez, toda la funcionalidad de **PostGIS**.
+
+Para cumplir con esto, los rasters deberán ser tratados independientemente en tablas individuales, una por cada SMU primaria y por tipo de resultado, clasificación y *Confusion Index*.
+Estas tablas seguirán la lógica de las *covariables*, de forma que tendrán herencia desde una tabla parental y consiguiendo así que su tratamiento conjunto posterior resulte más sencillo.
+
+Dado el elevado número de tablas que dará lugar este modelo de organización en caso de ejecutarse más de un tipo de clasificación, se opta además por construir un esquema específico para los rasters de cada método de clasificación, en la cual estará alojada la tabla parental.
+
+
+## Esquema de método de clasificación
+
+Se crea el esquema específico para el método de clasificación y las tablas patrón.
+
+```{r}
+sch <- paste('division', div$met, div$sel, sep = '_')
+
+# Specific schema for the division method
+RPostgres::dbExecute(con, glue_sql("CREATE SCHEMA IF NOT EXISTS {`sch`}",
+                             .con = conGIS) )
+
+# Comment on schema
+RPostgres::dbExecute(con, glue_sql("COMMENT ON SCHEMA {`sch`} IS {comment}",
+                           comment = paste("Divisions by CLARA with Mahalanobis distance",
+                                           "on covariates collection", div$sel),
+                           .con = conGIS) )
+
+
+
+# Pattern for raster tables of groups and ci of the classification method
+for (j in c("grp", "ci")) {
+  RPostgres::dbExecute(con, glue_sql("CREATE TABLE IF NOT EXISTS {`sch`}.{`tb`} ( LIKE division._div_rast )",
+                             tb = paste("_div", j, sep = "_"),
+                             .con = conGIS) )
+}
+
+# Comments on tables
+RPostgres::dbExecute(con, glue_sql("COMMENT ON TABLE {`sch`}.{`tb`} IS {comment}",
+                           tb = paste("_div", "grp", sep = "_"),
+                           comment = 'Pattern for raster tables of groups within CLARA method.',
+                           .con = conGIS))
+
+RPostgres::dbExecute(con, glue_sql("COMMENT ON TABLE {`sch`}.{`tb`} IS {comment}",
+                           tb = paste("_div", "ci", sep = "_"),
+                           comment = 'Pattern for raster tables of Confusion Index within CLARA method.',
+                           .con = conGIS))
+```
+
+
+## Registro de los rasters
+
+Se crean las tablas individuales para cada SMU primaria y tipo de resultado.
+
+```{r}
+# Create tables to hold rasters of groups and Confusion Index based on a pattern table
+psql <- foreach(i = smu1_set$smu1_id) %:% 
+  foreach(j = c("grp", "ci")) %do% {
+    id = paste(i, j, sep = "_")
+    ptr = paste("_div", j, sep = "_")
+
+    RPostgres::dbWithTransaction(con, {
+      RPostgres::dbExecute(con, glue_sql("CREATE TABLE {`sch`}.{`id`}() INHERITS ({`sch`}.{`ptr`}) ;", .con = conGIS) )
+      RPostgres::dbExecute(con, glue_sql("ALTER TABLE {`sch`}.{`id`} ALTER COLUMN rid ADD GENERATED ALWAYS AS IDENTITY ;", .con = conGIS) )
+      RPostgres::dbExecute(con, glue_sql("ALTER TABLE {`sch`}.{`id`} ADD PRIMARY KEY (rid) ;", .con = conGIS) )
+      }
+    )
+  
+  rm(i, j, id, ptr)  
+}
+```
+
+Después, se registran los rasters.
+
+```{r, eval=FALSE}
+# Run-time: ~5 min
+# Registering rasters
+psql <- foreach(i = seq_along(smu1_set$smu1_id), .final = function(l) setNames(l, smu1_set$smu1_id)) %:% 
+  foreach(j = c("grp", "ci")) %do% {
+    glue('raster2pgsql -a -C -r -s 25830 -t 100x100 -P -R -I -Y {data} {sch}.{tb} | psql -h localhost -U {user} -d dicsm',
+       data = path_wd(select(smu1_set, !! j)[i,]),
+       tb = paste(smu1_set$smu1_id[i], j, sep = "_"),
+       user = keyring::key_list("psql-su")[1,2] ) %>% 
+    system()
+}
+```
+
+
+## Metadatos
+
+Además, se describen y comentan las nuevas tablas generadas en la base de datos.
+
+```{r}
+# Comment new tables
+pgis <- foreach(i = seq_along(smu1_set$smu1_id), .final = function(l) setNames(l, smu1_set$smu1_id) ) %:%
+  foreach(j = c("grp", "ci")) %do% {
+  tb = paste(smu1_set$smu1_id[i], j, sep = "_")
+  tp = ifelse(j == "grp", "groups", "CI")
+  
+  RPostgres::dbWithTransaction(con, {
+    RPostgres::dbExecute(con, glue_sql("COMMENT ON TABLE {`sch`}.{`tb`} IS {comment}",
+                                 comment = paste(toupper(smu1_set$smu1_id[i]),
+                                                 tp,
+                                                 "by CLARA with Mahalanobis distance",
+                                                 "on covariates collection", div$sel),
+                                 .con = conGIS) )
+    RPostgres::dbExecute(con, glue_sql("COMMENT ON COLUMN {`sch`}.{`tb`}.rid IS 'Serial' ;", .con = conGIS) )
+    RPostgres::dbExecute(con, glue_sql("COMMENT ON COLUMN {`sch`}.{`tb`}.rast IS 'Raster' ;", .con = conGIS) )
+    }
+  )
+  
+  rm(tb, tp, j)
+}
+```
+
+
+
+
+# Conversión a geometrías
+
+El proceso de clasificación devuelve como resultado un nuevo raster cuyos píxeles están asociados a diferentes grupos.
+Para el manejo y análisis de estos grupos cuyos límites son discretos es preferible el uso de realidades vectoriales, que facilitan los procesos de intersección y reasignación.
+Por este motivo, se convierten todos los píxeles con un mismo valor de grupo y SMU primaria a polígonos.
+
+```{r}
+vw <- paste(div$met, div$sel, "grp", sep = "_")
+RPostgres::dbExecute(conGIS, glue_sql("CREATE OR REPLACE VIEW division.{`vw`} AS
+                              SELECT  (regexp_match(tableoid::regclass::character varying::text, 'j.*c'))[1] AS smu1_id,
+                                        rast 
+                              FROM {`sch`}._div_grp",
+                              sch =  paste("division", "clara", div$sel, sep = "_"),
+                             .con = conGIS) )
+```
+
+
+```{r}
+# Run-time: ~30 s
+mv <- paste(div$met, div$sel, "grid", sep = "_")
+
+RPostgres::dbExecute(conGIS, glue_sql("CREATE MATERIALIZED VIEW division.{`mv`} AS
+                              SELECT row_number() over() as sid, geom, upper(smu1_id) as smu1_id, val::integer as grp
+                              FROM (	SELECT smu1_id, (ST_DumpAsPolygons(rast)).* 
+                              		    FROM division.{`vw`} ) AS ex",
+                             .con = conGIS) )
+```
+
+```{r}
+# Create index on new table
+RPostgres::dbWithTransaction(con, {
+  RPostgres::dbExecute(conGIS, glue_sql("CREATE INDEX ON {`mv`} USING gist (geom)", 
+                                  .con = conGIS) )
+  RPostgres::dbExecute(conGIS, glue_sql("CREATE INDEX ON {`mv`} (smu1_id) ;", 
+                                  .con = conGIS) )
+  RPostgres::dbExecute(conGIS, glue_sql("CREATE INDEX ON {`mv`} (grp) ;", 
+                                  .con = conGIS) )
+  RPostgres::dbExecute(conGIS, glue_sql("CREATE INDEX ON {`mv`} (smu1_id, grp) ;", 
+                                  .con = conGIS) )
+  }
+)
+```
+
+```{r}
+# Create ultimate table for division polygons
+# Run-time: ~1 min
+tbdef <- paste(div$met, div$sel, "div", sep = "_")
+ptr = paste("_div", "div", sep = "_")
+
+RPostgres::dbWithTransaction(conGIS, {
+  RPostgres::dbExecute(conGIS, glue_sql("CREATE TABLE division.{`tbdef`}() INHERITS (division.{`ptr`})", 
+                                        .con = conGIS) )
+  RPostgres::dbExecute(conGIS, glue_sql("ALTER TABLE division.{`tbdef`} ALTER COLUMN sid ADD GENERATED ALWAYS AS IDENTITY", 
+                                        .con = conGIS) )
+  RPostgres::dbExecute(conGIS, glue_sql("ALTER TABLE division.{`tbdef`} ADD PRIMARY KEY (sid)", 
+                                        .con = conGIS) )
+  }
+)
+
+# Mergen polygons by SMU1 and values, so tiles boundaries are dissolve
+RPostgres::dbExecute(conGIS, 
+  glue_sql("INSERT INTO division.{`tbdef`} (smu1_id, grp, geom)
+            SELECT smu1_id, grp, 
+                    (ST_Dump(
+                      ST_UnaryUnion(
+                        unnest(
+                          ST_ClusterWithin(
+                            geom
+                          , 1)
+                        )
+                      )
+                    )).geom AS geom
+            FROM {`mv`}
+            GROUP BY smu1_id, grp ;",
+           .con = conGIS) )
+```
+
+```{r}
+# Create index on new table
+RPostgres::dbWithTransaction(conGIS, {
+  RPostgres::dbExecute(conGIS, glue_sql("CREATE INDEX ON {`tbdef`} USING gist (geom)", .con = conGIS) )
+  RPostgres::dbExecute(conGIS, glue_sql("CREATE INDEX ON {`tbdef`} (smu1_id) ;", .con = conGIS) )
+  RPostgres::dbExecute(conGIS, glue_sql("CREATE INDEX ON {`tbdef`} (grp) ;", .con = conGIS) )
+  RPostgres::dbExecute(conGIS, glue_sql("CREATE INDEX ON {`tbdef`} (smu1_id, grp) ;", .con = conGIS) )
+  }
+)
+
+RPostgres::dbExecute(conGIS, glue_sql("DROP MATERIALIZED VIEW {`mv`} ;", 
+                                      .con = conGIS) )
+rm(mv)
+```
+
+
+
+## Consolidación de referencias foráneas
+
+Las nuevas unidades cartográficas tienen referencias a las SMU primarias en lugar de a las SMU.
+Por eso, es necesario consolidar las tablas foráneas de SMU primarias en la base de datos de desagregación (DiCSM).
+
+```{r}
+RPostgres::dbExecute(conGIS, glue_sql("ALTER TABLE {`tbdef`} ADD FOREIGN KEY (smu1_id) REFERENCES smu1 (smu1_id) ;", 
+                                      .con = conGIS) )
+rm(tbdef, sch)
+```
+
+
+
+
+
+# Conclusión
+
+A través de un proceso de clasificación no supervisado sobre píxeles que agrupaban variables geomorfométricas, climáticas y de teledetección se han generado nuevos polígonos que delimitan potencialmente zonas ambientalmente homogéneas o similares. 
+Se pretende que dichas zonas sirvan para crear relaciones suelo~paisaje, que serán establecidas en el proceso de correlación de la desagregación.
+
+
+
+
+# Bibliografía
+
+```{r, include=FALSE, eval=FALSE}
+library(ClusterR)
+library(NbClust)
+library(RPostgres)
+knitr::write_bib(file = path("ref", "rpackages", ext = "bib"))
+```
+
+
+::: {#refs}
+:::

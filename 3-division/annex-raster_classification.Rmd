@@ -1,0 +1,241 @@
+---
+title: "Raster classification workflow"
+author: "Alberto Lázaro-López"
+date: "20/07/2019"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+abstract: When considering classifing a raster in a tailored way, we need to convert classic classification outputs into a cartographic object. For this purpose, a specific workflow should be followed to accomplish raster requirements. In this document an efficient workflow to address those issues is sought.
+bibliography: ../ref/dicsm.bib
+---
+
+```{r core, include=FALSE }
+for (.i in paste0("src/", c("spatial", "dbms", "core", "raster"), ".R" ) ) source(.i)
+
+proj <- .proj_envi("covar") %>% 
+  path_file() %>% 
+  .proj_subdir()
+```
+
+# Introducción
+
+Una vez se ejecuta el método de clasificación no supervisado, es necesario traspasar las diferentes clases encontrados a los píxeles correspondientes de forma que puedan ser cartografiadas.
+Para ello es necesario estudiar la vía de aplicación más adecuada sobre el formato raster, es decir, su conversión a raster y su visualización.
+
+
+# Análisis preliminar
+
+Esta metodología se prueba sobre un subconjunto de los datos pertenecientes a la SMU que recoja mayor número de perfiles.
+
+```{sql, connection=con, output.var="smu1_sel"}
+SELECT smu1_id, count(*)
+FROM soil_smu1, pf
+WHERE ST_Covers(soil_smu1.geom, pf.geom)
+GROUP BY smu1_id
+ORDER BY count DESC 
+LIMIT 1;
+```
+
+Se trata de la SMU **J09C**, que además resulta ser una de las SMU de mayores dimensiones.
+
+
+## Selección y carga
+
+Se carga el raster correspondiente a la SMU que se quiere clasificar.
+
+```{r}
+# Get raster from database
+smu1 <- pgiscon("covar_smu1_1", "covar", .where = paste0("smu1_id ~* $$", smu1_sel$smu1_id, "$$" ) ) %>% 
+  pgisrast()
+```
+
+```{sql, connection=con, output.var="covar"}
+SELECT covar_id
+FROM covariates_select
+WHERE select_id = 1
+```
+
+```{r}
+# Names of bands
+names(smu1) <- covar$covar_id
+```
+
+
+## Clasificación
+
+Se preparan los datos para la clasificación y se ejecuta.
+
+```{r}
+# Groups
+## SMU ready for processing: without NA and scaled
+smu1_proc <- smu1 %>% 
+  as.matrix() %>%
+  na.omit() %>% 
+  scale()
+gc()
+
+n <- 1*(10^4)
+```
+
+
+```{r}
+## Clustering
+class <- cluster::clara(x = smu1_proc, k = 3, metric = "manhattan", stand = FALSE, samples = 1, sampsize = n, keep.data = FALSE, rngR = TRUE, pamLike = TRUE )
+
+class$diss <- NULL
+gc()
+```
+
+
+## Traspaso 
+
+El traspaso cuenta con dos fases: una primera donde se transfieren los datos desde la clasificación a un vector de las dimensiones del raster, y una segunda donde se transforma dicha vector al formato raster.
+
+```{r}
+# Cluster raster
+
+## Reference column of pixels with data
+smu1_ref <- raster(x = smu1, layer = 1) %>% 
+  as.data.frame()
+
+## Column with groups
+grp <- rep(NA, length(smu1_ref) )
+grp[ !is.na(smu1_ref) ] <- class$clustering
+```
+
+
+```{r}
+## From column to raster
+clt <- raster(smu1)   # create an empty raster with same extent than "image"  
+clt <- setValues(clt, value = grp) # fill the empty raster with class results
+
+## Plot the result
+plot(clt, col = RColorBrewer::brewer.pal(3, name = "Set3"))
+```
+
+
+# Alternativas
+
+## Traspaso
+
+Otra forma de hacer el traspaso siguiendo la misma lógica, pero utilizando menos recursos y más rápido.
+
+
+```{r}
+vref <- raster(x = smu1, layer = 1)
+vref <- Which(!is.na(v_ref)) %>% 
+  as.vector()
+
+vref[vref == TRUE] <- class$clustering
+vref[vref == 0 ] <- NA
+
+clt <- raster(smu1)  
+clt <- setValues(x = clt, value = vref)
+
+plot(clt, col = RColorBrewer::brewer.pal(3, name = "Set3"))
+```
+
+
+## Flujo eficiente
+
+Uno de los elementos que más memoria ocupan es el raster inicial con todas las bandas, que incluyen multitud de pixeles vacíos _NULL_ (PostGIS) ó _NA_ (R).
+Una opción a considerar sería crear los elementos intermedios necesarios desde un principio y eliminar lo antes posible este objeto.
+Estos elementos corresponderían con: 
+
+* La tabla de datos estandarizados y filtrados previa a la clasificación.  
+* El vector lógico con las referencias a los píxeles con datos.  
+* El nuevo raster que aloja el resultado de la clasificación.  
+
+
+```{sql, connection=con, output.var="covar"}
+SELECT covar_id
+FROM covariates_select
+WHERE select_id = 1
+```
+
+```{r}
+# Get raster from database
+smu1 <- pgiscon("covar_smu1_1", "covar", .where = paste0("smu1_id ~* $$", smu1_sel$smu1_id, "$$" ) ) %>% 
+  pgisrast()
+
+# Names of bands
+names(smu1) <- covar$covar_id
+```
+
+```{r}
+# SMU1 data filtered and scaled
+smu1_proc <- smu1 %>% 
+  as.matrix() %>%
+  na.omit() %>% 
+  scale()
+
+# Vector holding positions of filled pixels
+vref <- raster(x = smu1, layer = 1)
+vref <- Which(!is.na(vref)) %>% 
+  as.vector()
+
+# New raster for groups
+clt <- raster(smu1) 
+
+# Cleaning
+rm(smu1)
+gc()
+```
+
+
+
+```{r}
+## Clustering
+class <- cluster::clara(x = smu1_proc, k = 3, metric = "manhattan", stand = FALSE, samples = 1, sampsize = n, keep.data = FALSE, rngR = TRUE, pamLike = TRUE )
+
+class$diss <- NULL
+gc()
+```
+
+
+
+```{r}
+# Vector with data
+vref[vref == TRUE] <- class$clustering
+vref[vref == 0 ] <- NA
+
+# Filling new raster
+clt <- setValues(x = clt, value = vref)
+```
+
+```{r}
+# Plot (optional) to check the results
+plot(clt, col = RColorBrewer::brewer.pal(3, name = "Set3"))
+
+# Write to file
+writeRaster(clt, path(proj$gis, "rast_class", ext = "tif"),
+            format = "GTiff", overwrite = TRUE, progress = "text")
+```
+
+
+Se comprueba que el resultado obtenido es el mismo, utilizando un código más claro, legible y eficiente.
+Uno de requisitos que fija este modelo es realizar el cálculo y la creación en una misma secuencia, de forma que de querer paralelizarlo, esta sería la unidad mínima de repetición.
+
+
+
+# Funciones
+
+> Las funciones diseñadas están alojadas en la sección de **Raster classification** de las funciones sobre rasters.
+
+
+# Conclusión
+
+El método reflejado en el apartado **Eficiencia** es el adecuado para la clasificación de un raster cuyo resultado sea un nuevo raster con sus pixeles agrupados.
+
+
+
+
+
+
+
+
+
+
+
