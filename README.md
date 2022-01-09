@@ -1,6 +1,6 @@
 <h1 align="center">
   <br>
-  <a href="https://github.com/alazarolop/dicsm"><img src="https://media.githubusercontent.com/media/alazarolop/dicsm/main/4-disaggregation/images/graph_abs.png" alt="DiCSM" width="600"></a>
+  <a href="https://github.com/alazarolop/dicsm"><img src="https://media.githubusercontent.com/media/alazarolop/dicsm/main/4-disaggregation/images/graph_abs.png" alt="DiCSM" width="750"></a>
   <br>
   Disaggregation of Conventional Soil Maps
   <br>
@@ -56,11 +56,11 @@ A digitalized soil map on top of the model for Soil Resource Inventories [(Láza
 
 **Statistics**
 
-The workflow is developed in [#Rstats](https://cran.r-project.org). Main packages are [*Tidyverse*](https://www.tidyverse.org), [*RPostgres*](https://rpostgres.r-dbi.org), [*sf*](https://r-spatial.github.io/sf/), [*raster*](https://github.com/rspatial/raster), [*foreach*](https://github.com/RevolutionAnalytics/foreach), [*bigmemory*](https://github.com/kaneplusplus/bigmemory), [*ClusterR*](https://github.com/mlampros/ClusterR), [*Nbclust*](https://github.com/cran/NbClust) and [*RSAGA*](https://github.com/r-spatial/RSAGA).
+The workflow is developed in [#Rstats](https://cran.r-project.org). Main packages are [Tidyverse](https://www.tidyverse.org), [RPostgres](https://rpostgres.r-dbi.org), [sf](https://r-spatial.github.io/sf/), [raster](https://github.com/rspatial/raster), [foreach](https://github.com/RevolutionAnalytics/foreach), [bigmemory](https://github.com/kaneplusplus/bigmemory), [ClusterR](https://github.com/mlampros/ClusterR), [Nbclust](https://github.com/cran/NbClust) and [RSAGA](https://github.com/r-spatial/RSAGA).
 
 **GIS**
 
-[*SAGA*](http://www.saga-gis.org/en/index.html) and [*QGIS*](https://www.qgis.org/en/site/) for data sources processing.
+[SAGA](http://www.saga-gis.org/en/index.html) and [QGIS](https://www.qgis.org/en/site/) for data sources processing.
 
 ## Feedback
 
